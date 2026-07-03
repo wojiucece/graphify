@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # SessionEnd hook：后台更新 graph.json（不阻塞 Claude Code 退出，带项目级文件锁防并发）
 # 设计：学习 mempalace 的 "background the hook and return immediately" 策略。
 #       update 用 nohup 后台跑，stop 脚本立即返回（<1s），Claude Code 立即退出。
@@ -29,4 +28,3 @@ fi
 
 # 不 kill server（多会话共享，server 常驻）
 # 手动清理用 scripts/kill-graphify-server.sh
-

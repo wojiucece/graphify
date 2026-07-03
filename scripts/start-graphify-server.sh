@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # SessionStart hook：后台启动 graphify HTTP server
 # 幂等：无 graph.json 或 server 已在跑时跳过
 # 设计：hook 立即返回（不等 server 启动），server 在后台冷启动

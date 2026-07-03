@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # PreCompact hook：在 /Compact 前更新 graph.json
 # 与 mempalace 的 PreCompact hook 同时机执行
 # 设计：仅 update（不 kill/start server），server 检测到 graph.json 变化会热重载

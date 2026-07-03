@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -euo pipefail
 echo "=== 你的自定义改动（CUSTOM 标记）==="
 git grep -l "CUSTOM:" || echo "(无标记改动)"
