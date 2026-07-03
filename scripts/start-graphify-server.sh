@@ -18,5 +18,9 @@ cd "$cwd" || exit 0
 [ ! -f "graphify-out/graph.json" ] && exit 0          # 无 graph.json 则跳过
 curl -s http://127.0.0.1:8765/health > /dev/null 2>&1 && exit 0  # 已在跑则跳过
 
-graphify serve --transport http --port 8765 > /tmp/graphify-serve.log 2>&1 &
+# v3 修订：用 nohup + disown 创建独立进程（不随 hook 退出被清理）
+# 注意：$! 是 nohup 的 PID，不是 graphify 的真实 PID
+# stop 脚本用 netstat 找 8765 端口的监听进程，不依赖此 PID 文件
+nohup graphify serve --transport http --port 8765 > /tmp/graphify-serve.log 2>&1 &
+disown
 echo $! > /tmp/graphify-serve.pid

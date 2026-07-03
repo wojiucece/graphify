@@ -21,9 +21,10 @@ if [ -f "$PID_FILE" ] && [ -n "$cwd" ] && [ -d "$cwd/graphify-out" ]; then
 fi
 
 # 2. 停止 server（update 完成后才 kill）
-# 用 taskkill /T /F kill 进程树（graphify serve 会 fork uvicorn 子进程，普通 kill 只杀父进程）
-if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE")
-    taskkill //PID $PID //T //F 2>/dev/null || kill $PID 2>/dev/null
-    rm -f "$PID_FILE"
+# v3 修订：用 netstat 找 8765 端口的监听进程（不依赖 PID 文件，因为 nohup 的 $! 不可靠）
+# 用 taskkill /T /F kill 进程树（graphify serve 会 fork uvicorn 子进程）
+PID=$(netstat -ano 2>/dev/null | grep ":8765" | grep LISTENING | awk '{print $NF}' | head -1)
+if [ -n "$PID" ]; then
+    taskkill //PID $PID //T //F 2>/dev/null
 fi
+rm -f "$PID_FILE"
