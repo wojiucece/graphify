@@ -3,6 +3,7 @@
 # 与 mempalace 的 PreCompact hook 同时机执行
 # 设计：仅 update（不 kill/start server），server 检测到 graph.json 变化会热重载
 # 场景：/Compact 会压缩上下文，压缩后重建时用最新 graph.json
+# 并发保护：项目级文件锁（mkdir 原子操作），防多窗口同时 /Compact 时并发 update
 #
 # === 版本标记 ===
 # 基于 graphify v0.9.5
@@ -16,5 +17,11 @@ cwd=$(echo "$input" | python -c "import json,sys; print(json.load(sys.stdin).get
 cd "$cwd" || exit 0
 [ ! -d "graphify-out" ] && exit 0          # 不是 graphify 项目则跳过
 
-# 更新 graph.json（纯 AST，no LLM）
-graphify update . > /tmp/graphify-precompact-update.log 2>&1
+# 项目级文件锁（mkdir 原子操作，防多窗口并发 update 同一 graph.json）
+LOCK_DIR="/tmp/graphify-update-$(echo "$cwd" | tr '/\\:' '___').lock"
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+    # 获得锁：同步跑 update（PreCompact 需等完成才 Compact），完成后删锁
+    graphify update . > /tmp/graphify-precompact-update.log 2>&1
+    rmdir "$LOCK_DIR" 2>/dev/null
+fi
+# 锁已存在 → 已有 update 在跑，跳过（幂等）
