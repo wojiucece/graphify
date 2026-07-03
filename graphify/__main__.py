@@ -499,6 +499,22 @@ def _claude_pretooluse_hooks() -> "list[dict]":
          "hooks": [{"type": "command", "command": f"{exe} hook-guard read"}]},
     ]
 
+# === CUSTOM: UserPromptSubmit hook begin ===
+_PROMPT_HOOK = {
+    "hooks": [
+        {
+            "type": "command",
+            "command": "graphify prompt-hook",
+            "timeout": 60,  # UserPromptSubmit 默认超时30s，本地加载大图需要更长时间
+            # v3 新增（审核优化 #2）：显示状态消息，用户感知 Hook 在执行
+            # 注意：statusMessage 在 UserPromptSubmit 中的支持性待验证，
+            #       若不支持会被 Claude Code 忽略，不影响功能
+            "statusMessage": "正在搜索 graphify 知识图谱..."
+        }
+    ]
+}
+# === CUSTOM: UserPromptSubmit hook end ===
+
 def _skill_registration(skill_path: str = "~/.claude/skills/graphify/SKILL.md") -> str:
     return (
         "\n# graphify\n"
@@ -2048,12 +2064,21 @@ def _install_claude_hook(project_dir: Path) -> None:
 
     hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
     hooks["PreToolUse"].extend(_claude_pretooluse_hooks())
+    # === CUSTOM: add UserPromptSubmit hook begin ===
+    user_prompt = hooks.setdefault("UserPromptSubmit", [])
+    hooks["UserPromptSubmit"] = [
+        h for h in user_prompt
+        if not ("graphify" in str(h.get("hooks", [{}])[0].get("command", "")))
+    ]
+    hooks["UserPromptSubmit"].append(_PROMPT_HOOK)
+    # === CUSTOM: add UserPromptSubmit hook end ===
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/settings.json  ->  PreToolUse hooks registered (Bash search + Read/Glob)")
+    print(f"  .claude/settings.json  ->  hooks registered (UserPromptSubmit + PreToolUse)")
 
 
 def _uninstall_claude_hook(project_dir: Path) -> None:
-    """Remove graphify PreToolUse hook from .claude/settings.json."""
+    """Remove graphify hooks (PreToolUse + UserPromptSubmit) from .claude/settings.json."""
+    # === CUSTOM: rewrite for audit Bug 1 (original early-returns skipped UserPromptSubmit cleanup) begin ===
     settings_path = project_dir / ".claude" / "settings.json"
     if not settings_path.exists():
         return
@@ -2061,13 +2086,36 @@ def _uninstall_claude_hook(project_dir: Path) -> None:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return
-    pre_tool = settings.get("hooks", {}).get("PreToolUse", [])
-    filtered = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
-    if len(filtered) == len(pre_tool):
+
+    hooks = settings.get("hooks", {})
+    changed = False
+
+    # 清理 PreToolUse（原逻辑）
+    pre_tool = hooks.get("PreToolUse", [])
+    filtered_pre = [
+        h for h in pre_tool
+        if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))
+    ]
+    if len(filtered_pre) != len(pre_tool):
+        hooks["PreToolUse"] = filtered_pre
+        changed = True
+
+    # 清理 UserPromptSubmit（CUSTOM 追加）
+    user_prompt = hooks.get("UserPromptSubmit", [])
+    filtered_up = [
+        h for h in user_prompt
+        if not ("graphify" in str(h.get("hooks", [{}])[0].get("command", "")))
+    ]
+    if len(filtered_up) != len(user_prompt):
+        hooks["UserPromptSubmit"] = filtered_up
+        changed = True
+
+    if not changed:
         return
-    settings["hooks"]["PreToolUse"] = filtered
+    settings["hooks"] = hooks
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/settings.json  ->  PreToolUse hook removed")
+    print(f"  .claude/settings.json  ->  hooks removed (PreToolUse + UserPromptSubmit)")
+    # === CUSTOM: rewrite for audit Bug 1 end ===
 
 
 def uninstall_all(project_dir: Path | None = None, purge: bool = False) -> None:
@@ -2921,6 +2969,14 @@ def main() -> None:
         else:
             print("Usage: graphify hook [install|uninstall|status]", file=sys.stderr)
             sys.exit(1)
+    # === CUSTOM: register new commands begin ===
+    elif cmd == "prompt-hook":
+        from graphify.prompt_hook import prompt_hook_main
+        prompt_hook_main()
+    elif cmd == "serve":
+        from graphify.serve import _main as serve_main
+        serve_main(sys.argv[2:])
+    # === CUSTOM: register new commands end ===
     elif cmd == "query":
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)

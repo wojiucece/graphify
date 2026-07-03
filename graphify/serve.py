@@ -1341,6 +1341,73 @@ def _build_server(graph_path: str):
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
 
+    # === CUSTOM: /query and /health HTTP endpoints for prompt-hook begin ===
+    async def _handle_query(request):
+        """轻量级查询端点，供 prompt-hook 快速调用。
+        定义在 _build_server 闭包内以访问 _ctx_cache、active_graph_path、_select_graph。
+        v3 修订（审核优化 #4）：若 GRAPHIFY_API_KEY 已设置，/query 同样校验。
+        """
+        import os  # 闭包内局部导入（serve.py 顶部未导入 os）
+        from starlette.responses import JSONResponse
+
+        # v3 新增：API Key 校验（若 GRAPHIFY_API_KEY 已设置）
+        api_key = os.environ.get("GRAPHIFY_API_KEY", "").strip()
+        if api_key:
+            auth = request.headers.get("Authorization", "")
+            provided = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else auth
+            if provided != api_key:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        prompt = body.get("prompt", "")
+        if not prompt:
+            return JSONResponse({"error": "no prompt"}, status_code=400)
+
+        project_path = body.get("graph_path") or body.get("project_path")
+        try:
+            depth = int(body.get("depth", os.environ.get("GRAPHIFY_PROMPT_HOOK_DEPTH", "2")))
+            budget = int(body.get("token_budget", os.environ.get("GRAPHIFY_PROMPT_HOOK_BUDGET", "3000")))
+        except (ValueError, TypeError):
+            depth = 2
+            budget = 3000
+
+        # 复用闭包中的 _select_graph（副作用设置 active_graph_path）
+        try:
+            if project_path:
+                _select_graph(project_path)
+            ctx = _ctx_cache.get(active_graph_path) if active_graph_path else None
+            if not ctx:
+                return JSONResponse({"error": "no graph loaded"}, status_code=404)
+            G = ctx["G"]
+        except Exception as e:
+            return JSONResponse({"error": f"graph load failed: {e}"}, status_code=500)
+
+        try:
+            # v3 修订（审核优化 #5）：改用关键字参数
+            result = _query_graph_text(
+                G, question=prompt, mode="bfs", depth=depth,
+                token_budget=budget, context_filters=None,
+            )
+            return JSONResponse({"result": result})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def _handle_health(request):
+        from starlette.responses import JSONResponse
+        return JSONResponse({
+            "status": "ok",
+            "graph_loaded": bool(active_graph_path and active_graph_path in _ctx_cache)
+        })
+
+    # 挂载到 server 对象，供 _build_http_app 取出构建 Route（审核 Bug 3 传递链路）
+    server._graphify_query_handler = _handle_query
+    server._graphify_health_handler = _handle_health
+    # === CUSTOM: /query and /health HTTP endpoints for prompt-hook end ===
+
     return server
 
 
@@ -1495,8 +1562,17 @@ def _build_http_app(
     if api_key:
         middleware.append(Middleware(_ApiKeyMiddleware, api_key=api_key))
 
+    # === CUSTOM: inject /query and /health routes begin ===
+    from starlette.routing import Route as _Route
+    _extra_routes = []
+    if hasattr(server, "_graphify_query_handler"):
+        _extra_routes.append(_Route("/query", server._graphify_query_handler, methods=["POST"]))
+    if hasattr(server, "_graphify_health_handler"):
+        _extra_routes.append(_Route("/health", server._graphify_health_handler, methods=["GET"]))
+    # === CUSTOM: inject /query and /health routes end ===
+
     return Starlette(
-        routes=[Route(path, endpoint=_MCPASGIApp(manager))],
+        routes=[Route(path, endpoint=_MCPASGIApp(manager))] + _extra_routes,  # === CUSTOM: 追加 extra_routes ===
         middleware=middleware,
         lifespan=lifespan,
     )
