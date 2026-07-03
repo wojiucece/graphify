@@ -3,6 +3,13 @@
 # 顺序：graphify update → 等 update 完成 → kill server
 # 设计：update 是纯 AST 提取（no LLM），速度快；update 完成后才 kill server，
 #       确保 graph.json 写入完整，下次会话 SessionStart 启动 server 时加载最新图谱
+#
+# === 版本标记 ===
+# 基于 graphify v0.9.5
+# 依赖 CLI: graphify update .
+# 依赖路径: graphify-out/、/tmp/graphify-serve.pid
+# 依赖命令: taskkill /T /F (Windows 进程树 kill)
+# 上游变动检查: 若 graphify 改 update 命令名，需更新此脚本
 
 input=$(cat)
 cwd=$(echo "$input" | python -c "import json,sys; print(json.load(sys.stdin).get('cwd',''))" 2>/dev/null)

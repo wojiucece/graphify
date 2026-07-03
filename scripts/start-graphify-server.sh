@@ -3,6 +3,13 @@
 # 幂等：无 graph.json 或 server 已在跑时跳过
 # 设计：hook 立即返回（不等 server 启动），server 在后台冷启动
 #       首次 prompt-hook 查询时若 server 未就绪，会 fallback 到本地查询
+#
+# === 版本标记 ===
+# 基于 graphify v0.9.5
+# 依赖 CLI: graphify serve --transport http --port 8765
+# 依赖端点: /health (CUSTOM, serve.py _build_server 闭包)
+# 依赖路径: graphify-out/graph.json
+# 上游变动检查: 若 graphify 改 CLI 命令名或 /health 端点消失，需更新此脚本
 
 input=$(cat)
 cwd=$(echo "$input" | python -c "import json,sys; print(json.load(sys.stdin).get('cwd',''))" 2>/dev/null)

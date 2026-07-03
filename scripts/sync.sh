@@ -93,6 +93,18 @@ else
     log_warn "graphify 未找到"
 fi
 
+# v3 新增：验证 CUSTOM 改动完整
+log_info "验证 CUSTOM 改动完整..."
+bash scripts/check-custom.sh
+
+# v3 新增：prompt-hook 冒烟测试
+log_info "prompt-hook 冒烟测试..."
+if echo '{"prompt":"test","cwd":"/tmp"}' | graphify prompt-hook 2>/dev/null; then
+    log_info "prompt-hook 可用"
+else
+    log_warn "prompt-hook 冒烟测试失败（可能需要重新 graphify claude install）"
+fi
+
 log_info "推送到 fork..."
 git push origin v8-custom --force-with-lease
 
