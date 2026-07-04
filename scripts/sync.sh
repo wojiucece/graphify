@@ -112,6 +112,33 @@ uv tool install --editable ".[mcp]" --force 2>/dev/null || {
     log_warn "刷新失败，请手动运行: uv tool install --editable \".[mcp]\" --force"
 }
 
+# v4 新增：验证全局 hook 配置（SessionStart/SessionEnd/PreCompact 是手动配置的，sync 不覆盖）
+log_info "验证全局 hook 配置完整性..."
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+    # 检查 SessionEnd 是否包含 sessionend-graphify-update.sh
+    if grep -q "sessionend-graphify-update.sh" "$SETTINGS" 2>/dev/null; then
+        log_info "SessionEnd → sessionend-graphify-update.sh 已注册"
+    else
+        log_warn "SessionEnd → sessionend-graphify-update.sh 未注册"
+        log_warn "请手动添加: D:/code/graphify_fork/scripts/sessionend-graphify-update.sh 到 ~/.claude/settings.json 的 SessionEnd hook"
+    fi
+    # 检查 SessionStart 是否包含 start-graphify-server.sh
+    if grep -q "start-graphify-server.sh" "$SETTINGS" 2>/dev/null; then
+        log_info "SessionStart → start-graphify-server.sh 已注册"
+    else
+        log_warn "SessionStart → start-graphify-server.sh 未注册"
+    fi
+    # 检查 PreCompact 是否包含 precompact-graphify-update.sh
+    if grep -q "precompact-graphify-update.sh" "$SETTINGS" 2>/dev/null; then
+        log_info "PreCompact → precompact-graphify-update.sh 已注册"
+    else
+        log_warn "PreCompact → precompact-graphify-update.sh 未注册"
+    fi
+else
+    log_warn "~/.claude/settings.json 不存在，hook 配置未注册"
+fi
+
 echo ""
 log_info "========================================="
 log_info "同步成功！"

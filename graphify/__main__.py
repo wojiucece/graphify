@@ -2047,7 +2047,14 @@ def claude_install(project_dir: Path | None = None) -> None:
 
 
 def _install_claude_hook(project_dir: Path) -> None:
-    """Add graphify PreToolUse hook to .claude/settings.json."""
+    """注册 graphify hook 到 .claude/settings.json。
+
+    仅注入 UserPromptSubmit（prompt-hook）。PreToolUse 注入已禁用——
+    与 context-mode 的 Read/Bash hook 会在同一 tool 调用下双重触发产生冲突
+    （两者都注入 additionalContext，目标不同但指令竞争）。保留 UserPromptSubmit
+    即可：提问时正向注入图谱答案，Read/Bash 时不再双重 nudge。
+    恢复方式：取消函数体中被注释的 PreToolUse 四行即可。
+    """
     settings_path = project_dir / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2060,10 +2067,11 @@ def _install_claude_hook(project_dir: Path) -> None:
         settings = {}
 
     hooks = settings.setdefault("hooks", {})
-    pre_tool = hooks.setdefault("PreToolUse", [])
-
-    hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
-    hooks["PreToolUse"].extend(_claude_pretooluse_hooks())
+    # === CUSTOM: PreToolUse hook 注入已禁用（与 context-mode 的 Read/Bash hook 冲突）begin ===
+    # pre_tool = hooks.setdefault("PreToolUse", [])
+    # hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
+    # hooks["PreToolUse"].extend(_claude_pretooluse_hooks())
+    # === CUSTOM: PreToolUse hook 注入已禁用 end ===
     # === CUSTOM: add UserPromptSubmit hook begin ===
     user_prompt = hooks.setdefault("UserPromptSubmit", [])
     hooks["UserPromptSubmit"] = [
@@ -2073,7 +2081,7 @@ def _install_claude_hook(project_dir: Path) -> None:
     hooks["UserPromptSubmit"].append(_PROMPT_HOOK)
     # === CUSTOM: add UserPromptSubmit hook end ===
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/settings.json  ->  hooks registered (UserPromptSubmit + PreToolUse)")
+    print(f"  .claude/settings.json  ->  hooks registered (UserPromptSubmit only; PreToolUse disabled)")
 
 
 def _uninstall_claude_hook(project_dir: Path) -> None:
