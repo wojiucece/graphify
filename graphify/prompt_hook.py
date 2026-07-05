@@ -245,10 +245,9 @@ def prompt_hook_main() -> None:
 
     # 输出纯文本 → Claude Code 自动追加到上下文
     # v3 修订（审核优化 #6）：用 XML 标签让模型更易识别结构边界
-    note = (
-        "以下内容来自 graphify 知识图谱预查询结果。"
-        "请直接基于此上下文回答，无需再 grep/read 源代码文件。"
-    )
+    # === CUSTOM: 引导句改英文省 token（41→13 token，-68%）begin ===
+    note = "graphify graph pre-query. Use directly, skip grep/read."
+    # === CUSTOM: 引导句改英文省 token end ===
     sys.stdout.write(f"<graphify_context>\n{note}\n{body}\n</graphify_context>\n")
 
 
