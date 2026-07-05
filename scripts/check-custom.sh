@@ -9,7 +9,7 @@ echo "=== 修改的上游文件 ==="
 git diff --name-status upstream/v8...HEAD | grep "^M" | awk '{print $2}' || true
 echo ""
 echo "=== 新增文件存在性检查 ==="
-for f in graphify/prompt_hook.py scripts/sync.sh scripts/start-graphify-server.sh scripts/stop-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh; do
+for f in graphify/prompt_hook.py scripts/sync.sh scripts/start-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh; do
     [ -f "$f" ] && echo "✓ $f" || echo "✗ $f 缺失"
 done
 
