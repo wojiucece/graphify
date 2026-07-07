@@ -9,19 +9,31 @@ echo "=== 修改的上游文件 ==="
 git diff --name-status upstream/v8...HEAD | grep "^M" | awk '{print $2}' || true
 echo ""
 echo "=== 新增文件存在性检查 ==="
-for f in graphify/prompt_hook.py scripts/sync.sh scripts/start-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh; do
+for f in graphify/prompt_hook.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh; do
     [ -f "$f" ] && echo "✓ $f" || echo "✗ $f 缺失"
 done
 
 echo ""
 echo "=== PreToolUse 注入禁用检查（避免与 context-mode 的 Read/Bash hook 冲突）==="
 # _install_claude_hook 中 PreToolUse 注入应被注释掉，只保留 UserPromptSubmit
-# 恢复方式：取消 _install_claude_hook 函数中被注释的 PreToolUse 四行
-if grep -q '^    # hooks\["PreToolUse"\].append(_SETTINGS_HOOK)' graphify/__main__.py 2>/dev/null; then
-    echo "✓ PreToolUse 注入已禁用（_install_claude_hook 中 _SETTINGS_HOOK append 被注释）"
+# 上游 0.9.8 重构：PreToolUse 注入从 append(_SETTINGS_HOOK) 改为 extend(_claude_pretooluse_hooks())
+# 恢复方式：取消 _install_claude_hook 函数中被注释的 extend(_claude_pretooluse_hooks()) 行
+if grep -q '^    # hooks\["PreToolUse"\].extend(_claude_pretooluse_hooks())' graphify/__main__.py 2>/dev/null; then
+    echo "✓ PreToolUse 注入已禁用（_install_claude_hook 中 _claude_pretooluse_hooks() extend 被注释）"
 else
-    echo "✗ PreToolUse 注入未禁用：graphify/__main__.py 中 _SETTINGS_HOOK append 未被注释"
-    echo "  应在 _install_claude_hook 函数中注释掉 PreToolUse 注入逻辑（与 context-mode 冲突）"
+    echo "✗ PreToolUse 注入未禁用：graphify/__main__.py 中 _claude_pretooluse_hooks() extend 未被注释"
+    echo "  应在 _install_claude_hook 函数中注释掉 hooks[\"PreToolUse\"].extend(_claude_pretooluse_hooks()) 行（与 context-mode 冲突）"
+fi
+
+echo ""
+echo "=== UserPromptSubmit 注入检查（prompt-hook 是 fork 核心，必须启用）==="
+# _install_claude_hook 中 UserPromptSubmit 注入必须存在且未注释
+# rebase 时若这段被上游覆盖，prompt-hook 失效但其他检查全绿——隐性丢功能
+if grep -q '^    hooks\["UserPromptSubmit"\].append(_PROMPT_HOOK)' graphify/__main__.py 2>/dev/null; then
+    echo "✓ UserPromptSubmit 注入存在（_PROMPT_HOOK append 未注释，prompt-hook 生效）"
+else
+    echo "✗ UserPromptSubmit 注入缺失：graphify/__main__.py 中 _PROMPT_HOOK append 未找到或被注释"
+    echo "  应在 _install_claude_hook 函数中保留 hooks[\"UserPromptSubmit\"].append(_PROMPT_HOOK)（CUSTOM: add UserPromptSubmit hook 段）"
 fi
 
 echo ""
@@ -82,7 +94,7 @@ echo "=== 全局 hook 配置检查（~/.claude/settings.json 的生命周期 hoo
 SETTINGS="$HOME/.claude/settings.json"
 if [ -f "$SETTINGS" ]; then
     checks=(
-        "SessionStart:start-graphify-server.sh:start-graphify-server.sh"
+        "SessionStart:sessionstart-graphify-server.sh:sessionstart-graphify-server.sh"
         "SessionEnd:sessionend-graphify-update.sh:sessionend-graphify-update.sh"
         "PreCompact:precompact-graphify-update.sh:precompact-graphify-update.sh"
     )

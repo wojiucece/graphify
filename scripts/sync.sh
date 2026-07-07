@@ -123,11 +123,11 @@ if [ -f "$SETTINGS" ]; then
         log_warn "SessionEnd → sessionend-graphify-update.sh 未注册"
         log_warn "请手动添加: D:/code/graphify_fork/scripts/sessionend-graphify-update.sh 到 ~/.claude/settings.json 的 SessionEnd hook"
     fi
-    # 检查 SessionStart 是否包含 start-graphify-server.sh
-    if grep -q "start-graphify-server.sh" "$SETTINGS" 2>/dev/null; then
-        log_info "SessionStart → start-graphify-server.sh 已注册"
+    # 检查 SessionStart 是否包含 sessionstart-graphify-server.sh
+    if grep -q "sessionstart-graphify-server.sh" "$SETTINGS" 2>/dev/null; then
+        log_info "SessionStart → sessionstart-graphify-server.sh 已注册"
     else
-        log_warn "SessionStart → start-graphify-server.sh 未注册"
+        log_warn "SessionStart → sessionstart-graphify-server.sh 未注册"
     fi
     # 检查 PreCompact 是否包含 precompact-graphify-update.sh
     if grep -q "precompact-graphify-update.sh" "$SETTINGS" 2>/dev/null; then
