@@ -108,8 +108,8 @@ log_info "推送到 fork..."
 git push origin v8-custom --force-with-lease
 
 log_info "刷新 editable 安装..."
-uv tool install --editable ".[mcp]" --force 2>/dev/null || {
-    log_warn "刷新失败，请手动运行: uv tool install --editable \".[mcp]\" --force"
+uv tool install --editable ".[mcp,openai]" --force 2>/dev/null || {
+    log_warn "刷新失败，请手动运行: uv tool install --editable \".[mcp,openai]\" --force"
 }
 
 # v4 新增：验证全局 hook 配置（SessionStart/SessionEnd/PreCompact 是手动配置的，sync 不覆盖）
