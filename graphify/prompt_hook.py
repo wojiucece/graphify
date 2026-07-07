@@ -245,9 +245,15 @@ def prompt_hook_main() -> None:
 
     # 输出纯文本 → Claude Code 自动追加到上下文
     # v3 修订（审核优化 #6）：用 XML 标签让模型更易识别结构边界
-    # === CUSTOM: 引导句改英文省 token（41→13 token，-68%）begin ===
-    note = "graphify graph pre-query. Use directly, skip grep/read."
-    # === CUSTOM: 引导句改英文省 token end ===
+    # === CUSTOM: 引导句改英文省 token + 三层分流引导 begin ===
+    # 当前（26 token，tiktoken cl100k_base 实测，→ 是 1 token/id=52118）
+    # 三层分流：符号定位→graphify / 字符串模式→grep / 大输出→sandbox 不进 context
+    # 跟 PreToolUse nudge（已禁用）设计哲学统一，未来重新启用时逻辑无缝衔接
+    note = "graphify pre-query: symbols→file+line here; strings/patterns→grep; large output→sandbox not context."
+    # 原方案（13 token，回退参考）：
+    #   note = "graphify graph pre-query. Use directly, skip grep/read."
+    #   缺点：skip grep/read 过度承诺——grep 找字符串/模式时 graphify 帮不上（不索引任意字符串）
+    # === CUSTOM: 引导句改英文省 token + 三层分流引导 end ===
     sys.stdout.write(f"<graphify_context>\n{note}\n{body}\n</graphify_context>\n")
 
 
