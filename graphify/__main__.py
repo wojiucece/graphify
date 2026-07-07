@@ -1544,9 +1544,19 @@ export const GraphifyPlugin = async ({ directory }) => {
       if (input.tool === "bash") {
         // ';' not '&&' — Windows PowerShell 5.1 rejects '&&' as a statement
         // separator, breaking the first bash command of the session (#1646).
+        //
+        // === CUSTOM: 三层分流引导（跟 prompt-hook 哲学统一）begin ===
+        // 28 token（tiktoken cl100k_base 实测），纯 ASCII（OpenCode TUI 渲染零风险）
+        // 三层分流：符号定位→graphify 给 file+line / 字符串模式→grep / 大输出→sandbox 不进 context
+        // 跟 Claude Code 的 prompt-hook（prompt_hook.py:249）设计哲学统一，跨平台逻辑一致
+        // 约束：echo 双引号内禁 backticks/$()/裸双引号/反斜杠（触发 bash 命令替换）；分号在双引号内是字面字符安全
         output.args.command =
-          'echo "[graphify] knowledge graph at graphify-out/. For focused questions, run graphify query with your question (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context." ; ' +
+          'echo "[graphify] pre-query: symbols get file+line here; strings/patterns need grep; large output to sandbox not context." ; ' +
           output.args.command;
+        // 原方案（52 token，回退参考）：
+        //   'echo "[graphify] knowledge graph at graphify-out/. For focused questions, run graphify query with your question (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context." ; '
+        //   缺点：instead of grepping 过度承诺（grep 找字符串时 graphify 帮不上）+ 提两次 GRAPH_REPORT.md 偏离分流主线
+        // === CUSTOM: 三层分流引导（跟 prompt-hook 哲学统一）end ===
         reminded = true;
       }
     },
