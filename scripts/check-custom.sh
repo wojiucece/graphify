@@ -112,3 +112,32 @@ if [ -f "$SETTINGS" ]; then
 else
     echo "✗ ~/.claude/settings.json 不存在"
 fi
+
+echo ""
+echo "=== OpenCode hook 检查（_OPENCODE_PLUGIN_JS 的 before + after）==="
+# OpenCode 走 _OPENCODE_PLUGIN_JS（__main__.py）注册 tool.execute.before/after
+# before：bash 拼 echo（执行前提醒）；after：read/write/edit/glob/grep 改 output.output（执行后提醒）
+# after 是方案 C 新增，rebase 时若被上游覆盖，OpenCode 非 bash 工具不提醒——隐性丢功能
+MAIN_PY="graphify/__main__.py"
+if grep -q '"tool.execute.before"' "$MAIN_PY" 2>/dev/null; then
+    echo "✓ OpenCode before hook 存在（bash 拼 echo）"
+else
+    echo "✗ OpenCode before hook 缺失：$MAIN_PY 中 tool.execute.before 未找到"
+fi
+if grep -q '"tool.execute.after"' "$MAIN_PY" 2>/dev/null; then
+    echo "✓ OpenCode after hook 存在（read/write/edit/glob/grep 改 output.output）"
+else
+    echo "✗ OpenCode after hook 缺失：$MAIN_PY 中 tool.execute.after 未找到（方案 C 丢失，非 bash 工具不提醒）"
+fi
+# after 引导句语气检查：用 run（指令）非 try（建议）
+if grep -q 'next time run graphify' "$MAIN_PY" 2>/dev/null; then
+    echo "✓ after 引导句用 run（指令语气）"
+elif grep -q 'next time try graphify' "$MAIN_PY" 2>/dev/null; then
+    echo "✗ after 引导句用 try（建议语气偏软，应改 run）"
+fi
+# after fail-open guard 检查
+if grep -q 'typeof output.output !== "string"' "$MAIN_PY" 2>/dev/null; then
+    echo "✓ after fail-open guard 存在（output.output 非 string 时跳过，防崩）"
+else
+    echo "✗ after fail-open guard 缺失（output.output 非 string 时会崩）"
+fi
