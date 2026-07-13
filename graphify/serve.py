@@ -285,7 +285,11 @@ def _trigram_candidates(G: nx.Graph, needles: list[str], *, guard_frac: float = 
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
     scored = []
-    norm_terms = [tok for t in terms for tok in _search_tokens(t)]
+    # Dedupe tokens, order-preserving (as _pick_seeds already does): a repeated
+    # query word must not double-count every tier, and with coverage scaling
+    # below it would also inflate the matched-term ratio (#1602).
+    norm_terms = list(dict.fromkeys(tok for t in terms for tok in _search_tokens(t)))
+    n_terms = len(norm_terms)
     idf = _compute_idf(G, norm_terms)
     # Whole-query string for full-label matching (mirrors _find_node's `term`).
     joined = " ".join(norm_terms)
@@ -328,24 +332,68 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
                 or label_tokens.startswith(joined)
             ):
                 score += _PREFIX_MATCH_BONUS * 10 * joined_w
+        # Term coverage (#1602): scale the per-term exact/prefix tiers by the
+        # squared fraction of query terms the node's LABEL matches, so a lone
+        # generic word that happens to equal a short label (query term "home"
+        # vs. a home() leaf) cannot bury nodes that match several of the
+        # query's terms. Squaring matters because the exact tier is 10x the
+        # prefix tier: at linear coverage a 1-of-10-terms exact match still
+        # outscores a 3-of-10 prefix+substring match. Single-term and
+        # full-coverage queries are unchanged (coverage == 1), so identifier
+        # lookups keep exact-match dominance. Source-file hits score but do
+        # not count as coverage: a colliding leaf whose directory shares
+        # tokens with the query (common near the intended target) must not
+        # win back its exact tier via path fragments. The substring/source
+        # bonuses and the full-query tier above stay unscaled.
+        matched = 0
+        tiered = 0.0
         for t in norm_terms:
             w = idf.get(t, 1.0)
             # Three-tier precedence: exact > prefix > substring (take the
             # strongest tier per term so a single term cannot double-count).
             if t == norm_label or t == bare_label:
-                score += _EXACT_MATCH_BONUS * w
+                tiered += _EXACT_MATCH_BONUS * w
+                matched += 1
             elif norm_label.startswith(t) or bare_label.startswith(t):
-                score += _PREFIX_MATCH_BONUS * w
+                tiered += _PREFIX_MATCH_BONUS * w
+                matched += 1
             elif t in norm_label:
                 score += _SUBSTRING_MATCH_BONUS * w
+                matched += 1
             if t in source:
                 score += _SOURCE_MATCH_BONUS * w
+        if tiered:
+            score += tiered * (matched / n_terms) ** 2
         if score > 0:
             scored.append((score, nid))
     # Sort by score desc; break ties toward the shorter label so a concise exact
     # match beats a longer superset that happens to share the same score.
     scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
     return scored
+
+
+def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: str) -> str:
+    """Pick a path endpoint from a _score_nodes result, preferring full-token matches.
+
+    The full-query tier in _score_nodes only fires when the query equals or
+    prefixes a label, so a query that is a token *subset* of the intended label
+    (query "Reject-everything judge" vs. label "Degenerate Reject-Everything
+    Judge") gets no bonus, and a node prefix-matching one rare token (label
+    "Rejection Summary") can out-score it on IDF alone. Committing to scored[0]
+    then anchors the path on an unrelated — often disconnected — node and yields
+    a false "No path found". Scan the score-ordered list and take the first
+    candidate whose label contains EVERY query token; when the top candidate
+    already full-matches, or no candidate does, this is exactly scored[0].
+
+    `scored` must be non-empty (both callers return early on no match).
+    """
+    qtokens = set(_search_tokens(query))
+    if not qtokens:
+        return scored[0][1]
+    for _score, nid in scored:
+        if qtokens <= set(_search_tokens(G.nodes[nid].get("label") or nid)):
+            return nid
+    return scored[0][1]
 
 
 def _pick_seeds(
@@ -378,6 +426,12 @@ def _pick_seeds(
     collision cannot starve out the others. Ties within a term are broken by
     graph degree (structural centrality), so an isolated incidental match
     doesn't out-rank a real, well-connected hub for that term.
+
+    Coverage scaling in _score_nodes (#1602) now dampens a lone collision's
+    exact tier on multi-term queries, which brings label-matching relevant
+    nodes back inside the gap window; this per-term guarantee remains
+    load-bearing for relevant nodes matched only via substrings, whose flat
+    scores a dampened collision can still exceed.
     """
     if not scored:
         return []
@@ -1110,7 +1164,8 @@ def _build_server(graph_path: str):
             return f"No node matching source '{arguments['source']}' found."
         if not tgt_scored:
             return f"No node matching target '{arguments['target']}' found."
-        src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
+        src_nid = _pick_scored_endpoint(G, src_scored, arguments["source"])
+        tgt_nid = _pick_scored_endpoint(G, tgt_scored, arguments["target"])
         # Ambiguity guard: when both queries resolve to the same node, the
         # shortest path is trivially zero hops, which is almost never what the
         # caller wanted (see bug #828).
@@ -1120,8 +1175,13 @@ def _build_server(graph_path: str):
                 f"the same node '{src_nid}'. Use a more specific label or the exact node ID."
             )
         warnings: list[str] = []
-        for name, scored in (("source", src_scored), ("target", tgt_scored)):
-            if len(scored) >= 2:
+        for name, scored, nid in (
+            ("source", src_scored, src_nid),
+            ("target", tgt_scored, tgt_nid),
+        ):
+            # Only meaningful when the raw score head is what got picked — a
+            # full-token override was chosen on token coverage, not score.
+            if len(scored) >= 2 and nid == scored[0][1]:
                 top, runner = scored[0][0], scored[1][0]
                 if top > 0 and (top - runner) / top < 0.10:
                     warnings.append(

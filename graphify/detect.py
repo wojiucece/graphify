@@ -27,7 +27,7 @@ class FileType(str, Enum):
 
 _MANIFEST_PATH = str(out_path("manifest.json"))
 
-CODE_EXTENSIONS = {'.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.ejs', '.ets', '.go', '.rs', '.java', '.groovy', '.gradle', '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cu', '.cuh', '.metal', '.rb', '.swift', '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.luau', '.toc', '.zig', '.ps1', '.psm1', '.psd1', '.ex', '.exs', '.m', '.mm', '.jl', '.vue', '.svelte', '.astro', '.dart', '.v', '.sv', '.svh', '.sql', '.r', '.f', '.F', '.f90', '.F90', '.f95', '.F95', '.f03', '.F03', '.f08', '.F08', '.pas', '.pp', '.dpr', '.dpk', '.lpr', '.inc', '.dfm', '.lfm', '.lpk', '.sh', '.bash', '.json', '.tf', '.tfvars', '.hcl', '.dm', '.dme', '.dmi', '.dmm', '.dmf', '.sln', '.slnx', '.csproj', '.fsproj', '.vbproj', '.xaml', '.razor', '.cshtml', '.cls', '.trigger'}
+CODE_EXTENSIONS = {'.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.ejs', '.ets', '.go', '.rs', '.java', '.groovy', '.gradle', '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cu', '.cuh', '.metal', '.rb', '.rake', '.swift', '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.luau', '.toc', '.zig', '.ps1', '.psm1', '.psd1', '.ex', '.exs', '.m', '.mm', '.jl', '.vue', '.svelte', '.astro', '.dart', '.v', '.sv', '.svh', '.sql', '.r', '.f', '.F', '.f90', '.F90', '.f95', '.F95', '.f03', '.F03', '.f08', '.F08', '.pas', '.pp', '.dpr', '.dpk', '.lpr', '.inc', '.dfm', '.lfm', '.lpk', '.sh', '.bash', '.json', '.tf', '.tfvars', '.hcl', '.dm', '.dme', '.dmi', '.dmm', '.dmf', '.sln', '.slnx', '.csproj', '.fsproj', '.vbproj', '.xaml', '.razor', '.cshtml', '.cls', '.trigger'}
 DOC_EXTENSIONS = {'.md', '.mdx', '.qmd', '.txt', '.rst', '.html', '.yaml', '.yml'}
 PAPER_EXTENSIONS = {'.pdf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
@@ -1065,7 +1065,7 @@ def _resolves_under_root(path: Path, root: Path) -> bool:
     return True
 
 
-def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None) -> dict:
+def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, cache_root: Path | None = None) -> dict:
     root = root.resolve()
     if follow_symlinks is None:
         follow_symlinks = False
@@ -1082,8 +1082,10 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     def _wc(path: Path) -> int:
         # Cache word counts against each file's stat signature so unchanged
         # PDFs/docx aren't re-parsed on every run just to size the corpus (#1656).
+        # cache_root (when given, e.g. from `extract --out`) keeps this cache out
+        # of the scanned corpus (#1747).
         from graphify import cache as _cache
-        return _cache.cached_word_count(path, root, count_words)
+        return _cache.cached_word_count(path, root, count_words, cache_root=cache_root)
 
     skipped_sensitive: list[str] = []
     unclassified: list[str] = []
@@ -1107,9 +1109,29 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     seen: set[Path] = set()
     all_files: list[Path] = []
 
+    # os.walk swallows os.scandir errors by default (no onerror -> the failing
+    # directory subtree is silently skipped). That turns a transient
+    # PermissionError, or a directory created/deleted mid-walk (e.g. concurrent
+    # writes racing the scan), into a partial file list and, downstream, a
+    # silently partial graph.json. Record and surface every skipped directory
+    # so an incomplete enumeration is visible rather than silent.
+    walk_errors: list[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        import sys as _sys
+        target = getattr(err, "filename", None) or "<unknown>"
+        walk_errors.append(f"{target}: {err}")
+        print(
+            f"[graphify] WARNING: could not scan {target} ({err}); "
+            f"its files are missing from this run's enumeration.",
+            file=_sys.stderr,
+        )
+
     for scan_root in scan_paths:
         in_memory_tree = memory_dir.exists() and str(scan_root).startswith(str(memory_dir))
-        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=follow_symlinks):
+        for dirpath, dirnames, filenames in os.walk(
+            scan_root, followlinks=follow_symlinks, onerror=_on_walk_error
+        ):
             dp = Path(dirpath)
             if follow_symlinks and os.path.islink(dirpath):
                 real = os.path.realpath(dirpath)
@@ -1245,6 +1267,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         "warning": warning,
         "skipped_sensitive": skipped_sensitive,
         "unclassified": sorted(unclassified),
+        "walk_errors": walk_errors,
         "graphifyignore_patterns": len(ignore_patterns),
         "scan_root": str(root.resolve()),
     }
