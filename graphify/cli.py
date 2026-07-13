@@ -1301,6 +1301,12 @@ def dispatch_command(cmd: str) -> None:
         # toward graphify when a graph exists; always exits 0 (never blocks a tool).
         _run_hook_guard(sys.argv[2] if len(sys.argv) > 2 else "")
         sys.exit(0)
+    elif cmd == "prompt-hook":
+        # === CUSTOM: UserPromptSubmit 注入端点 ===
+        # 提问时正向注入图谱答案。由 _PROMPT_HOOK（install.py）注册到 .claude/settings.json。
+        from graphify.prompt_hook import prompt_hook_main
+        prompt_hook_main()
+        sys.exit(0)
     elif cmd == "check-update":
         if len(sys.argv) < 3:
             print("Usage: graphify check-update <path>", file=sys.stderr)

@@ -303,6 +303,26 @@ def _claude_pretooluse_hooks() -> "list[dict]":
         {"matcher": "Read|Glob",
          "hooks": [{"type": "command", "command": f"{exe} hook-guard read"}]},
     ]
+
+# === CUSTOM: UserPromptSubmit hook begin ===
+# 提问时正向注入图谱答案。与 PreToolUse(hook-guard) 互斥：
+# context-mode 的 Read/Bash hook 也在同一次 tool 调用注入 additionalContext，
+# 同时启用会双重触发、指令竞争，故 claude_install 只注入 UserPromptSubmit。
+_PROMPT_HOOK = {
+    "hooks": [
+        {
+            "type": "command",
+            "command": "graphify prompt-hook",
+            "timeout": 60,  # UserPromptSubmit 默认超时30s，本地加载大图需要更长时间
+            # v3 新增（审核优化 #2）：显示状态消息，用户感知 Hook 在执行
+            # 注意：statusMessage 在 UserPromptSubmit 中的支持性待验证，
+            #       若不支持会被 Claude Code 忽略，不影响功能
+            "statusMessage": "正在搜索 graphify 知识图谱..."
+        }
+    ]
+}
+# === CUSTOM: UserPromptSubmit hook end ===
+
 def _skill_registration(skill_path: str = "~/.claude/skills/graphify/SKILL.md") -> str:
     return (
         "\n# graphify\n"
@@ -1625,12 +1645,21 @@ def _install_claude_hook(project_dir: Path) -> None:
         settings = {}
 
     hooks = settings.setdefault("hooks", {})
-    pre_tool = hooks.setdefault("PreToolUse", [])
-
-    hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
-    hooks["PreToolUse"].extend(_claude_pretooluse_hooks())
+    # === CUSTOM: PreToolUse 注入已禁用（与 context-mode 的 Read/Bash hook 双重触发冲突）begin ===
+    # pre_tool = hooks.setdefault("PreToolUse", [])
+    # hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
+    # hooks["PreToolUse"].extend(_claude_pretooluse_hooks())
+    # === CUSTOM: PreToolUse 注入已禁用 end ===
+    # === CUSTOM: add UserPromptSubmit hook begin ===
+    user_prompt = hooks.setdefault("UserPromptSubmit", [])
+    hooks["UserPromptSubmit"] = [
+        h for h in user_prompt
+        if not ("graphify" in str(h.get("hooks", [{}])[0].get("command", "")))
+    ]
+    hooks["UserPromptSubmit"].append(_PROMPT_HOOK)
+    # === CUSTOM: add UserPromptSubmit hook end ===
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/settings.json  ->  PreToolUse hooks registered (Bash search + Read/Glob)")
+    print(f"  .claude/settings.json  ->  UserPromptSubmit hook registered (prompt-hook)")
 def _uninstall_claude_hook(project_dir: Path) -> None:
     """Remove the graphify PreToolUse hook from .claude/settings.json and its
     local-only sibling .claude/settings.local.json.
