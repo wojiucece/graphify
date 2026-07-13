@@ -1239,6 +1239,8 @@ import { join } from "path";
 
 export const GraphifyPlugin = async ({ directory }) => {
   let reminded = false;
+  // after hook 每工具首次触发：read/write/edit/glob/grep 各只提醒 1 次
+  const remindedAfter = new Set();
 
   return {
     "tool.execute.before": async (input, output) => {
@@ -1248,12 +1250,48 @@ export const GraphifyPlugin = async ({ directory }) => {
       if (input.tool === "bash") {
         // ';' not '&&' — Windows PowerShell 5.1 rejects '&&' as a statement
         // separator, breaking the first bash command of the session (#1646).
+        //
+        // === CUSTOM: 三层分流引导（跟 prompt-hook 哲学统一）begin ===
+        // 28 token（tiktoken cl100k_base 实测），纯 ASCII（OpenCode TUI 渲染零风险）
+        // 三层分流：符号定位→graphify 给 file+line / 字符串模式→grep / 大输出→sandbox 不进 context
+        // 跟 Claude Code 的 prompt-hook（prompt_hook.py:249）设计哲学统一，跨平台逻辑一致
+        // 约束：echo 双引号内禁 backticks/$()/裸双引号/反斜杠（触发 bash 命令替换）；分号在双引号内是字面字符安全
         output.args.command =
-          'echo "[graphify] knowledge graph at graphify-out/. For focused questions, run graphify query with your question (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context." ; ' +
+          'echo "[graphify] pre-query: symbols get file+line here; strings/patterns need grep; large output to sandbox not context." ; ' +
           output.args.command;
+        // 原方案（52 token，回退参考）：
+        //   'echo "[graphify] knowledge graph at graphify-out/. For focused questions, run graphify query with your question (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context." ; '
+        //   缺点：instead of grepping 过度承诺（grep 找字符串时 graphify 帮不上）+ 提两次 GRAPH_REPORT.md 偏离分流主线
+        // === CUSTOM: 三层分流引导（跟 prompt-hook 哲学统一）end ===
         reminded = true;
       }
     },
+
+    // === CUSTOM: after hook 扩展触发面到 read/write/edit/glob/grep begin ===
+    // 方案 C：tool.execute.after 改 output.output，prepend 提醒到工具结果包装层
+    // 实测验证（read/write/edit/glob/grep 五工具全绿）：
+    //   - output.output 改了生效，注入在包装层（<path> 上方），不污染文件内容
+    //   - 模型识别为"包装信息"非文件内容，理解"本次工具 fine，下次符号查询走 graphify"
+    // 机制对比：bash 走 before 拼 echo（执行前）；read等走 after 改 output（执行后，不阻塞）
+    // 引导句语气：用 run（指令）非 try（建议）——after 虽不能阻止，但模型实测能理解，语气可直接
+    //   不用 MUST——after 拦不住，MUST 会空喊削弱信用；run 是"指令但不强制"的中间档
+    // 每工具首次触发（Set）：read 提醒过不影响 edit，覆盖每种工具首次使用
+    // fail-open：typeof output.output !== "string" 时跳过（防崩），不阻塞工具
+    "tool.execute.after": async (input, output) => {
+      if (!existsSync(join(directory, "graphify-out", "graph.json"))) return;
+      const tool = input.tool;
+      const TARGET_TOOLS = ["read", "write", "edit", "glob", "grep"];
+      if (!TARGET_TOOLS.includes(tool)) return;
+      if (remindedAfter.has(tool)) return;
+      if (typeof output.output !== "string") return;
+      const nudge =
+        "[graphify] next time run graphify query/explain/path first for symbols (file+line here). " +
+        "This tool was fine for the actual edit/string search. " +
+        "Large output to sandbox, not context.";
+      output.output = nudge + "\n\n" + output.output;
+      remindedAfter.add(tool);
+    },
+    // === CUSTOM: after hook 扩展触发面到 read/write/edit/glob/grep end ===
   };
 };
 """
