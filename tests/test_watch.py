@@ -160,6 +160,123 @@ def test_graphify_root_preserves_relative_when_invoked_with_relative_path(tmp_pa
     )
 
 
+def test_rebuild_code_writes_community_name(tmp_path):
+    """#1808: `graphify update` / _rebuild_code must forward community_labels to
+    to_json, so graph.json nodes carry a human-readable community_name (hub-derived
+    for a code-only rebuild) — not just a numeric community id. Before the fix,
+    _rebuild_code called to_json without community_labels, so the labels a
+    cluster-only pass writes were stripped again on every incremental rebuild."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.py").write_text(
+        "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n", encoding="utf-8"
+    )
+    (corpus / "b.py").write_text(
+        "import a\n\ndef gamma():\n    return a.alpha()\n", encoding="utf-8"
+    )
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    clustered = [n for n in graph["nodes"] if n.get("community") is not None]
+    assert clustered, "expected clustered nodes in the rebuilt graph"
+    assert all(n.get("community_name") for n in clustered), (
+        "clustered nodes missing community_name — the update rebuild stripped the "
+        "labels that cluster-only writes (#1808)"
+    )
+
+
+def test_update_rebuilds_with_nested_star_gitignore(tmp_path):
+    """#1880: `graphify update` must not emit 0 nodes (and then refuse to
+    overwrite) just because the source tree has a nested `.gitignore` with a
+    broad pattern. This was the 0.9.15 symptom of the #1847/#1873 subtree-scoping
+    bug: a nested bare `*` zeroed the re-scan, update built 0 nodes, and the
+    shrink-guard refused. With scoping fixed the rebuild sees the real files."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    (corpus / "src").mkdir(parents=True)
+    (corpus / "src" / "a.py").write_text(
+        "from src.b import Base\nclass App(Base):\n    def run(self): return 1\n", encoding="utf-8"
+    )
+    (corpus / "src" / "b.py").write_text("class Base: pass\n", encoding="utf-8")
+    (corpus / "main.py").write_text("def top(): return 2\n", encoding="utf-8")
+    # a common scratch-dir idiom deeper in the tree: ignore everything HERE only
+    (corpus / "scratch").mkdir()
+    (corpus / "scratch" / ".gitignore").write_text("*\n", encoding="utf-8")
+    (corpus / "scratch" / "junk.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    sources = {n.get("source_file", "") for n in graph["nodes"]}
+    assert graph["nodes"], "update produced 0 nodes on a tree with a nested '*' gitignore (#1880)"
+    assert any("src/a.py" in s for s in sources) and any("main.py" in s for s in sources)
+    # the nested-ignored scratch file stays out (scoped correctly, not tree-wide)
+    assert not any("scratch/junk.py" in s for s in sources)
+
+
+def test_update_discovers_newly_added_files_and_dirs(tmp_path):
+    """#1837: after an initial build, a plain `graphify update` (full re-scan, no
+    change-list) must discover brand-new files AND new directories. The reported
+    silent no-op was the #1873 nested-gitignore scoping bug zeroing the re-scan;
+    this pins the build -> add -> update -> discovered sequence the earlier test
+    (single build) did not cover, with a nested `*` scratch dir as a guard."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    (corpus / "src").mkdir(parents=True)
+    (corpus / "src" / "a.py").write_text("def alpha(): return 1\n", encoding="utf-8")
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    # Add a brand-new file and a brand-new nested directory after the first build,
+    # plus a scratch dir that ignores only itself.
+    (corpus / "src" / "new.py").write_text("def added(): return 2\n", encoding="utf-8")
+    (corpus / "monitor").mkdir()
+    (corpus / "monitor" / "dash.py").write_text("def board(): return 3\n", encoding="utf-8")
+    (corpus / "scratch").mkdir()
+    (corpus / "scratch" / ".gitignore").write_text("*\n", encoding="utf-8")
+    (corpus / "scratch" / "junk.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    sources = {n.get("source_file", "") for n in
+               json.loads((corpus / "graphify-out" / "graph.json").read_text())["nodes"]}
+    assert any("src/new.py" in s for s in sources), "new file not discovered by update (#1837)"
+    assert any("monitor/dash.py" in s for s in sources), "new directory not discovered (#1837)"
+    assert not any("scratch/junk.py" in s for s in sources)
+
+
+def test_rebuild_honors_persisted_excludes(tmp_path):
+    """#1886: `--exclude` recorded at extract time must survive into update/watch/
+    hook rebuilds. Before the fix only the initial scan applied the excludes, so
+    the first rebuild silently re-indexed the excluded paths. _rebuild_code now
+    reads the persisted build config and re-applies them."""
+    import json
+    from graphify.watch import _rebuild_code, _write_build_config
+
+    corpus = tmp_path / "corpus"
+    (corpus / "src").mkdir(parents=True)
+    (corpus / "vendor").mkdir()
+    (corpus / "src" / "app.py").write_text("def keep(): return 1\n", encoding="utf-8")
+    (corpus / "main.py").write_text("def top(): return 2\n", encoding="utf-8")
+    (corpus / "vendor" / "lib.py").write_text("def vendored(): pass\n", encoding="utf-8")
+    _write_build_config(corpus / "graphify-out", excludes=["vendor"])
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    sources = {n.get("source_file", "") for n in graph["nodes"]}
+    assert any("src/app.py" in s for s in sources) and any("main.py" in s for s in sources)
+    assert not any("vendor/lib.py" in s for s in sources), (
+        "rebuild silently re-included an excluded path (#1886)"
+    )
+
+
 def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
     """When the caller supplies an absolute path, ``.graphify_root`` stores
     that absolute form verbatim — preserving explicit-absolute intent."""
@@ -325,6 +442,72 @@ def test_rebuild_code_preserves_hyperedges_for_rebuilt_surviving_source(
         "confidence_score": 1.0,
         "source_file": "doc.md",
     }]
+
+
+@pytest.mark.parametrize(
+    "changed_paths",
+    [None, [Path("auth.md")]],
+    ids=["full-update", "incremental-doc-update"],
+)
+def test_rebuild_code_preserves_semantic_edges_from_reextracted_doc(
+    tmp_path, changed_paths
+):
+    """#1865: AST-only updates must not evict semantic edges whose source_file
+    is a re-extracted document; only that source's AST-tier edges are replaced."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "auth.md").write_text(
+        "# Token Validation\n\nVerifies bearer tokens.\n", encoding="utf-8"
+    )
+    (corpus / "login.md").write_text(
+        "# Session Verification\n\nVerifies login sessions.\n", encoding="utf-8"
+    )
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    node_ids = {n["id"] for n in data["nodes"]}
+    assert {"auth_token_validation", "login_session_verification"} <= node_ids
+
+    data["links"].extend([
+        {
+            "source": "auth_token_validation",
+            "target": "login_session_verification",
+            "relation": "semantically_similar_to",
+            "confidence": "INFERRED",
+            "source_file": "auth.md",
+        },
+        # A stale AST-tier edge of the same source must still be evicted.
+        {
+            "source": "auth_token_validation",
+            "target": "login_session_verification",
+            "relation": "references",
+            "_origin": "ast",
+            "source_file": "auth.md",
+        },
+    ])
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert _rebuild_code(
+        corpus,
+        changed_paths=changed_paths,
+        no_cluster=True,
+        acquire_lock=False,
+    ) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    relations = {
+        (e.get("source"), e.get("target"), e.get("relation"))
+        for e in after["links"]
+    }
+    assert (
+        "auth_token_validation", "login_session_verification", "semantically_similar_to"
+    ) in relations, "semantic edge from a re-extracted doc must survive an AST-only update"
+    assert (
+        "auth_token_validation", "login_session_verification", "references"
+    ) not in relations, "stale AST-tier edge of a re-extracted source must be evicted"
 
 
 @pytest.mark.parametrize(
