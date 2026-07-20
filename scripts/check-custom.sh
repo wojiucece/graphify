@@ -18,10 +18,10 @@ echo "=== PreToolUse 注入禁用检查（避免与 context-mode 的 Read/Bash h
 # _install_claude_hook 中 PreToolUse 注入应被注释掉，只保留 UserPromptSubmit
 # 上游 0.9.8 重构：PreToolUse 注入从 append(_SETTINGS_HOOK) 改为 extend(_claude_pretooluse_hooks())
 # 恢复方式：取消 _install_claude_hook 函数中被注释的 extend(_claude_pretooluse_hooks()) 行
-if grep -q '^    # hooks\["PreToolUse"\].extend(_claude_pretooluse_hooks())' graphify/__main__.py 2>/dev/null; then
+if grep -q '^    # hooks\["PreToolUse"\].extend(_claude_pretooluse_hooks())' graphify/install.py 2>/dev/null; then
     echo "✓ PreToolUse 注入已禁用（_install_claude_hook 中 _claude_pretooluse_hooks() extend 被注释）"
 else
-    echo "✗ PreToolUse 注入未禁用：graphify/__main__.py 中 _claude_pretooluse_hooks() extend 未被注释"
+    echo "✗ PreToolUse 注入未禁用：graphify/install.py 中 _claude_pretooluse_hooks() extend 未被注释"
     echo "  应在 _install_claude_hook 函数中注释掉 hooks[\"PreToolUse\"].extend(_claude_pretooluse_hooks()) 行（与 context-mode 冲突）"
 fi
 
@@ -29,10 +29,10 @@ echo ""
 echo "=== UserPromptSubmit 注入检查（prompt-hook 是 fork 核心，必须启用）==="
 # _install_claude_hook 中 UserPromptSubmit 注入必须存在且未注释
 # rebase 时若这段被上游覆盖，prompt-hook 失效但其他检查全绿——隐性丢功能
-if grep -q '^    hooks\["UserPromptSubmit"\].append(_PROMPT_HOOK)' graphify/__main__.py 2>/dev/null; then
+if grep -q '^    hooks\["UserPromptSubmit"\].append(_PROMPT_HOOK)' graphify/install.py 2>/dev/null; then
     echo "✓ UserPromptSubmit 注入存在（_PROMPT_HOOK append 未注释，prompt-hook 生效）"
 else
-    echo "✗ UserPromptSubmit 注入缺失：graphify/__main__.py 中 _PROMPT_HOOK append 未找到或被注释"
+    echo "✗ UserPromptSubmit 注入缺失：graphify/install.py 中 _PROMPT_HOOK append 未找到或被注释"
     echo "  应在 _install_claude_hook 函数中保留 hooks[\"UserPromptSubmit\"].append(_PROMPT_HOOK)（CUSTOM: add UserPromptSubmit hook 段）"
 fi
 
@@ -118,7 +118,7 @@ echo "=== OpenCode hook 检查（_OPENCODE_PLUGIN_JS 的 before + after）==="
 # OpenCode 走 _OPENCODE_PLUGIN_JS（__main__.py）注册 tool.execute.before/after
 # before：bash 拼 echo（执行前提醒）；after：read/write/edit/glob/grep 改 output.output（执行后提醒）
 # after 是方案 C 新增，rebase 时若被上游覆盖，OpenCode 非 bash 工具不提醒——隐性丢功能
-MAIN_PY="graphify/__main__.py"
+MAIN_PY="graphify/install.py"
 if grep -q '"tool.execute.before"' "$MAIN_PY" 2>/dev/null; then
     echo "✓ OpenCode before hook 存在（bash 拼 echo）"
 else
