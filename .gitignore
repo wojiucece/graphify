@@ -43,6 +43,5 @@ paper/
 
 # === CUSTOM: v3 实施测试产物和方案文档（不 push 到 fork）===
 serve.log
-CLAUDE.md
 graphify-complete-plan-*.md
 方案审核报告.md
