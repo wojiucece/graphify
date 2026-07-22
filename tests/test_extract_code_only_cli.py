@@ -56,6 +56,54 @@ def test_mixed_repo_without_key_errors_and_points_at_code_only(tmp_path):
     assert "--code-only" in r.stderr, "the no-key error must point users at --code-only"
 
 
+def test_extract_usage_advertises_code_only(tmp_path):
+    """#2071: --code-only must be discoverable in the extract usage text, not only
+    by triggering the no-key error. `graphify extract` with no path prints usage."""
+    r = subprocess.run(
+        [PYTHON, "-m", "graphify", "extract"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert r.returncode != 0
+    assert "--code-only" in r.stdout + r.stderr, (
+        "extract usage must advertise --code-only (#2071)"
+    )
+
+
+def _run_relative_out(repo: Path, *extra: str):
+    """Like _run but with a RELATIVE GRAPHIFY_OUT so --out/--output controls the
+    parent dir (an absolute GRAPHIFY_OUT would override the flag)."""
+    env = {k: v for k, v in os.environ.items() if k not in _KEY_VARS}
+    env["GRAPHIFY_OUT"] = "graphify-out"
+    return subprocess.run(
+        [PYTHON, "-m", "graphify", "extract", ".", *extra],
+        cwd=repo, capture_output=True, text=True, env=env,
+    )
+
+
+def test_output_flag_is_alias_of_out(tmp_path):
+    """#2004 part 3: `--output DIR` was silently ignored on extract (output went
+    to the default `<path>/graphify-out/`). It is now an alias of `--out`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def hello():\n    return 1\n")
+    custom = tmp_path / "elsewhere"
+
+    r = _run_relative_out(repo, "--code-only", "--no-cluster", "--output", str(custom))
+    assert r.returncode == 0, r.stderr
+    assert (custom / "graphify-out" / "graph.json").exists(), "--output was ignored (#2004)"
+    assert not (repo / "graphify-out").exists(), "output must not go to the default dir"
+
+
+def test_output_flag_inline_form(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def hello():\n    return 1\n")
+    custom = tmp_path / "out2"
+    r = _run_relative_out(repo, "--code-only", "--no-cluster", f"--output={custom}")
+    assert r.returncode == 0, r.stderr
+    assert (custom / "graphify-out" / "graph.json").exists()
+
+
 def test_no_gitignore_indexes_vcs_ignored_code_but_keeps_graphifyignore(tmp_path):
     repo = tmp_path / "repo"
     generated = repo / "proj" / "deep" / "generated"
@@ -107,3 +155,92 @@ def test_no_gitignore_setting_persists_across_flagless_extract(tmp_path):
     assert any(s.endswith("generated/Gen.py") for s in _sources()), (
         "flag-less re-extract clobbered the persisted --no-gitignore setting (#1971)"
     )
+
+
+def test_exclude_setting_persists_across_flagless_extract(tmp_path):
+    repo = tmp_path / "repo"
+    vendor = repo / "vendor"
+    vendor.mkdir(parents=True)
+    (repo / "app.py").write_text("def app():\n    return 1\n")
+    (vendor / "lib.py").write_text("def vendor():\n    return 2\n")
+
+    def _sources():
+        graph = json.loads((repo / "graphify-out" / "graph.json").read_text())
+        return {
+            Path(str(node.get("source_file", ""))).as_posix()
+            for node in graph["nodes"]
+        }
+
+    first = _run(
+        repo, "--exclude", "vendor", "--code-only", "--no-cluster"
+    )
+    assert first.returncode == 0, first.stderr
+    assert any(source.endswith("app.py") for source in _sources())
+    assert not any(source.endswith("vendor/lib.py") for source in _sources())
+
+    second = _run(repo, "--code-only", "--no-cluster")
+    assert second.returncode == 0, second.stderr
+    assert any(source.endswith("app.py") for source in _sources())
+    assert not any(source.endswith("vendor/lib.py") for source in _sources())
+
+
+def test_explicit_exclude_replaces_persisted_setting_with_custom_out(tmp_path):
+    repo = tmp_path / "repo"
+    vendor = repo / "vendor"
+    generated = repo / "generated"
+    vendor.mkdir(parents=True)
+    generated.mkdir()
+    (repo / "app.py").write_text("def app():\n    return 1\n")
+    (vendor / "lib.py").write_text("def vendor():\n    return 2\n")
+    (generated / "gen.py").write_text("def generated():\n    return 3\n")
+    out_root = tmp_path / "custom-output"
+
+    env = {key: value for key, value in os.environ.items() if key not in _KEY_VARS}
+    env["GRAPHIFY_OUT"] = "graphify-out"
+
+    def _run_extract(*extra: str):
+        return subprocess.run(
+            [
+                PYTHON,
+                "-m",
+                "graphify",
+                "extract",
+                ".",
+                "--out",
+                str(out_root),
+                "--code-only",
+                "--no-cluster",
+                *extra,
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    first = _run_extract("--exclude", "vendor")
+    assert first.returncode == 0, first.stderr
+
+    graph_out = out_root / "graphify-out"
+    def _sources():
+        graph = json.loads((graph_out / "graph.json").read_text())
+        return {
+            Path(str(node.get("source_file", ""))).as_posix()
+            for node in graph["nodes"]
+        }
+
+    persisted = _run_extract("--force")
+    assert persisted.returncode == 0, persisted.stderr
+    assert any(source.endswith("app.py") for source in _sources())
+    assert not any(source.endswith("vendor/lib.py") for source in _sources())
+    assert any(source.endswith("generated/gen.py") for source in _sources())
+
+    replacement = _run_extract("--exclude", "generated", "--force")
+    assert replacement.returncode == 0, replacement.stderr
+    sources = _sources()
+    assert any(source.endswith("app.py") for source in sources)
+    assert any(source.endswith("vendor/lib.py") for source in sources)
+    assert not any(source.endswith("generated/gen.py") for source in sources)
+    assert json.loads((graph_out / ".graphify_build.json").read_text()) == {
+        "excludes": ["generated"]
+    }
