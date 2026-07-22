@@ -25,6 +25,10 @@ Rules:
 - **重装只跑** `uv tool install --editable ".[mcp,openai,sql]" --force`（按需加 sql/dm/terraform extras；不要跑 sync.sh）
 - **命令分离**（上游 0.9.13 重构后）：`graphify install claude`（装用户级 skill `~/.claude/skills/`）vs `graphify claude install`（注入项目级 hooks `.claude/settings.json`，含 UserPromptSubmit）。要刷新某项目 hooks 在该项目目录跑后者
 - **升级后跑 `bash scripts/check-custom.sh` 确认守护有效**（exit 0、无 ✗）。本次 0.9.20 同步发现 check-custom.sh grep 路径过时（查 `__main__.py` 但定制 0.9.13 已迁 `install.py`），5 个假阳性 ✗ 且 exit 0 使守护静默失效--已修路径 + fail-on-✗，但每次升级仍要跑一遍确认无假阳性
+- **merge 前先无副作用预演**（0.9.24 同步经验）：`git merge-tree --write-tree --name-only HEAD upstream/v8` 只读三路合并，不碰工作树。0.9.24 批次（104 文件 +4210 行）预演仅 `pyproject.toml` 冲突，install.py 自动合并--因上游 #2062 改 uninstall 路径（新增 `_remove_marker_section`），fork 定制在 install 路径（hook 注入），**两区域不重叠故 git 能自动合并**（区别于 0.9.20 那次要手动解冲突块）。预演零冲突/单冲突可直接 merge，多冲突再逐文件核
+- **Auto-merging 成功≠定制完整**（0.9.24）：git 只保证文本拼上不保证语义，install.py 自动合并通过后仍 grep 确认 24 处 fork 标记（`_PROMPT_HOOK`/`UserPromptSubmit`/`_OPENCODE_PLUGIN_JS`/`remindedAfter`/`TARGET_TOOLS`/`_claude_pretooluse_hooks`）一个不少
+- **旧图谱兼容新版本 query 无需重建**（0.9.24）：0.9.17 生成的 graph.json 被 0.9.24 query 成功读取（exit 0，195 nodes）。graph.json 是 networkx 标准格式（keys=directed/multigraph/graph/nodes/links/hyperedges，无 version 字段），向后兼容。重建要调 LLM 有费用，升级版本不必重建，代码变了跑 `graphify update .`（AST 增量无费用）即可
+- **GFW 间歇封 github:443**（0.9.24）：push 报 `Could not connect to server`（TCP 握不上，21s 超时）区别于 `Connection reset`（握手后被重置）。前者重试基本无效需换出口/开代理，后者重试能成。探测用 `timeout 12 curl -sI https://github.com`，失败也可能只是当前窗口期，git push 仍可能碰上开放窗口成功
 ### 版本号约定
 - `pyproject.toml` version 必须带 `+fork.N` 后缀（PEP 440 local version，区分上游 graphifyy）
 - 上游升 0.9.8 时本地改 `0.9.8+fork.N`，不要去掉 `+fork`
