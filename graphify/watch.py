@@ -14,6 +14,18 @@ from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 _PENDING_FILENAME = ".pending_changes"
 _PENDING_DRAIN_MAX_PASSES = 20
 
+# CUSTOM: 移植 codegraph 的自适应防抖 + 失败重试上限 + 降级机制
+# 区别于上游：上游 graphify watch 固定 debounce=3s（改一个字符也等 3s），且
+# _rebuild_code 失败时无计数无限重试刷日志；observer.start() 失败直接崩溃。
+# 移植后：≤2 文件走 300ms 快窗、>2 文件走全 debounce；连续失败 5 次降级退出；
+# 失败后指数退避；observer 启动失败降级而非崩溃。
+# Algorithm adapted from codegraph (MIT, Copyright (c) 2026 Colby Mchenry)
+# Source: https://github.com/colbymchenry/codegraph/blob/main/src/sync/watcher.ts
+_QUICK_SYNC_MAX_PENDING = 2      # ≤2 文件走快窗（codegraph QUICK_SYNC_MAX_PENDING）
+_QUICK_SYNC_QUIET = 0.3          # 快窗 300ms（codegraph QUICK_SYNC_QUIET_MS / 1000）
+_MAX_SYNC_FAILURE_RETRIES = 5    # 连续重建失败上限（codegraph MAX_SYNC_FAILURE_RETRIES）
+_MAX_RETRY_BACKOFF = 30.0        # 退避上限 30s（codegraph MAX_RETRY_BACKOFF_MS / 1000）
+
 
 def _queue_pending(out_dir: Path, changed_paths: list[Path]) -> None:
     """Append ``changed_paths`` to ``out_dir/.pending_changes`` (one per line).
@@ -1458,27 +1470,70 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
     # Use polling observer on macOS — FSEvents can miss rapid saves in some editors
     observer = PollingObserver() if sys.platform == "darwin" else Observer()
     observer.schedule(handler, str(watch_path), recursive=True)
-    observer.start()
+    # CUSTOM: observer.start() 失败降级（移植 codegraph degrade 机制）
+    # 上游裸调 observer.start()，watchdog 后端初始化失败（Linux inotify 耗尽 ENOSPC 等）
+    # 会抛异常使 watch 崩溃。失败时降级为提示手动 update，而非崩溃退出。
+    try:
+        observer.start()
+    except Exception as exc:
+        print(f"[graphify watch] File watcher backend failed to start: {exc}")
+        print("[graphify watch] Auto-sync disabled. Run `graphify update` manually after changes.")
+        return
 
     print(f"[graphify watch] Watching {watch_path.resolve()} - press Ctrl+C to stop")
     print(f"[graphify watch] Code changes rebuild graph automatically. "
           f"Doc/image changes require /graphify --update.")
-    print(f"[graphify watch] Debounce: {debounce}s")
+    print(f"[graphify watch] Debounce: {debounce}s (adaptive: {_QUICK_SYNC_QUIET}s quick window "
+          f"for ≤{_QUICK_SYNC_MAX_PENDING} file(s))")
+
+    # CUSTOM: 失败计数 + 指数退避（移植 codegraph MAX_SYNC_FAILURE_RETRIES / MAX_RETRY_BACKOFF_MS）
+    # _rebuild_code 返回 True（成功）/False（失败或锁占用-非阻塞 _rebuild_lock 拿不到也返回 False）。
+    # 失败时计数 + 退避，连续超 _MAX_SYNC_FAILURE_RETRIES 次降级退出；成功重置计数。
+    # 退避 = debounce * 2^(n-1)，封顶 _MAX_RETRY_BACKOFF（30s）。
+    failure_count = 0
+    next_allowed_trigger: float = 0.0
 
     try:
         while True:
             time.sleep(0.5)
-            if pending and (time.monotonic() - last_trigger) >= debounce:
-                pending = False
-                batch = list(changed)
-                changed.clear()
-                print(f"\n[graphify watch] {len(batch)} file(s) changed")
-                has_non_code = _has_non_code(batch)
-                has_code = any(p.suffix.lower() in _CODE_EXTENSIONS for p in batch)
-                if has_code:
-                    _rebuild_code(watch_path)
-                if has_non_code:
-                    _notify_only(watch_path)
+            now = time.monotonic()
+            if not pending or now < next_allowed_trigger:
+                continue
+            # CUSTOM: 自适应防抖（移植 codegraph scheduleSync 的 adaptive delay）
+            # ≤2 文件走 300ms 快窗（单文件保存近实时），>2 文件走全 debounce（批量保存合并）。
+            # 快窗 0.3s < 轮询间隔 0.5s，实际最快触发 ≈0.5s（受轮询分辨率限制，仍远快于固定 3s）。
+            effective_debounce = (
+                _QUICK_SYNC_QUIET if len(changed) <= _QUICK_SYNC_MAX_PENDING else debounce
+            )
+            if (now - last_trigger) < effective_debounce:
+                continue
+            pending = False
+            batch = list(changed)
+            changed.clear()
+            print(f"\n[graphify watch] {len(batch)} file(s) changed")
+            has_non_code = _has_non_code(batch)
+            has_code = any(p.suffix.lower() in _CODE_EXTENSIONS for p in batch)
+            if has_code:
+                # CUSTOM: 失败计数 + 退避/降级（移植 codegraph flush 的 try/finally 退避）
+                ok = _rebuild_code(watch_path)
+                if not ok:
+                    failure_count += 1
+                    backoff = min(debounce * 2 ** max(0, failure_count - 1), _MAX_RETRY_BACKOFF)
+                    next_allowed_trigger = now + backoff
+                    print(f"[graphify watch] Rebuild failed (attempt {failure_count}/"
+                          f"{_MAX_SYNC_FAILURE_RETRIES}); retrying in {backoff:.1f}s")
+                    if failure_count > _MAX_SYNC_FAILURE_RETRIES:
+                        print(f"[graphify watch] Auto-sync disabled after {failure_count} consecutive "
+                              f"failures. Run `graphify update` manually to refresh the graph.")
+                        break
+                    # 退避到期后重试同一批：放回 changed + 重置 pending（codegraph pendingFiles 保留语义）
+                    pending = True
+                    changed.update(batch)
+                else:
+                    failure_count = 0
+                    next_allowed_trigger = 0.0
+            if has_non_code:
+                _notify_only(watch_path)
     except KeyboardInterrupt:
         print("\n[graphify watch] Stopped.")
     finally:
