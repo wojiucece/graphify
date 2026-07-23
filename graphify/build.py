@@ -802,6 +802,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         # dropping it here as well keeps a pre-fix graph's stale absolute hint
         # from surviving an incremental build_merge, which re-serializes base
         # edges through here without re-running disambiguation.
+        # `local_alias` is the same shape of transient hint (#2082): it exists only
+        # for the module arm of _resolve_python_member_calls to match an aliased
+        # import receiver, and extract() already drops it once that pass has run.
+        # Dropping it here too covers a stale pre-fix graph re-serialized through
+        # an incremental build_merge, same rationale as target_file above.
         # Sanitize numeric edge fields (#1960): an explicit ``"weight": null`` in
         # the extraction JSON survives ``.get("weight", 1.0)`` (the key is present,
         # so the default never applies) and reaches Louvain/Leiden as None,
@@ -811,7 +816,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         # strings, NaN/inf, negatives — while numeric strings coerce cleanly.
         # Repair (not drop) the key so graph.json round-trips a clean value and a
         # cluster-only/--update reload never re-ingests the null.
-        attrs = {k: v for k, v in edge.items() if k not in ("source", "target", "target_file")}
+        attrs = {k: v for k, v in edge.items() if k not in ("source", "target", "target_file", "local_alias")}
         for _num_key in ("weight", "confidence_score"):
             if _num_key in attrs:
                 try:
@@ -952,10 +957,11 @@ def build(
         ambiguous pairs in the 75–92 Jaro-Winkler score zone.
     root: if given, absolute source_file paths are made relative to root (#932).
 
-    Extractions are merged in order. For nodes with the same ID, the last
-    extraction's attributes win (NetworkX add_node overwrites). Pass AST
-    results before semantic results so semantic labels take precedence, or
-    reverse the order if you prefer AST source_location precision to win.
+    With dedup disabled, extractions are merged in order and the last node's
+    attributes win (NetworkX add_node overwrites). With dedup enabled, nodes
+    sharing an ID use a deterministic survivor and retain missing attributes
+    from duplicate records of the same source entity. Genuine cross-file ID
+    collisions remain isolated and are reported.
     """
     from graphify.dedup import deduplicate_entities
     combined: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}

@@ -311,9 +311,10 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
         for child in node.children:
             if child.type in ("dotted_name", "aliased_import"):
                 raw = _read_text(child, source)
-                module_name = raw.split(" as ")[0].strip().lstrip(".")
+                raw_module, _, raw_alias = raw.partition(" as ")
+                module_name = raw_module.strip().lstrip(".")
                 tgt_nid = _make_id(module_name)
-                edges.append({
+                edge = {
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
@@ -322,7 +323,14 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
-                })
+                }
+                if raw_alias:
+                    # `import pkg.mod as alias` binds the local name `alias`, not
+                    # `mod`'s own stem, to the module -- stash it so the cross-file
+                    # member-call resolver can match `alias.func()` against this
+                    # edge instead of dropping it (#2082).
+                    edge["local_alias"] = raw_alias.strip()
+                edges.append(edge)
     elif t == "import_from_statement":
         module_node = node.child_by_field_name("module_name")
         if module_node:
@@ -2279,9 +2287,17 @@ def _resolve_python_member_calls(
                     _key(tnode.get("label", "")), []).append(tgt)
                 file_of_node[tgt] = src
     imported_by_filenode: dict[str, set[str]] = {}
+    # Local alias bound by `as` on a specific import edge (#2082): `from pkg import
+    # mod as alias` / `import pkg.mod as alias` bind `alias`, not `mod`'s own stem,
+    # to the module in the importing file. Keyed by (importing file, target module)
+    # so two files aliasing the same module differently each match their own.
+    import_alias_by_filenode: dict[str, dict[str, str]] = {}
     for e in all_edges:
         if e.get("relation") in ("imports", "imports_from"):
             imported_by_filenode.setdefault(e.get("source"), set()).add(e.get("target"))
+            alias = e.get("local_alias")
+            if alias:
+                import_alias_by_filenode.setdefault(e.get("source"), {})[e.get("target")] = _key(alias)
 
     def _module_stem_key(nid: str) -> str:
         n = node_by_id.get(nid)
@@ -2331,11 +2347,15 @@ def _resolve_python_member_calls(
             # Module arm (#1883): a lowercase receiver may be an imported module.
             # Resolve it against the modules imported into the caller's own file
             # (so `self`/`obj`/local instances, which are not imported modules,
-            # never match), then to the single callable that module contains.
+            # never match), then to the single callable that module contains. A
+            # receiver also matches the local alias bound on that import edge
+            # (#2082), so an aliased import resolves the same as the bare name.
             rkey = _key(receiver)
             caller_file = file_of_node.get(caller)
+            file_aliases = import_alias_by_filenode.get(caller_file, {})
             mods = [t for t in imported_by_filenode.get(caller_file, ())
-                    if t in contains_children and _module_stem_key(t) == rkey]
+                    if t in contains_children
+                    and (_module_stem_key(t) == rkey or file_aliases.get(t) == rkey)]
             if len(mods) != 1:  # not an imported module, or ambiguous -> bail
                 continue
             children = contains_children[mods[0]].get(_key(callee), [])
@@ -3561,13 +3581,33 @@ def _xaml_csharp_class_nodes(path: Path) -> dict[str, list[dict]]:
     classes: dict[str, list[dict]] = {}
     patterns = _load_graphifyignore(root)
     ignore_cache: dict[Path, bool] = {}
+    # Prune noise/hidden dirs DURING traversal (not after) so the scan never
+    # descends into node_modules/.venv/.git/build/..., and CAP the number of
+    # directories visited. rglob("*.cs") used to walk the entire tree first,
+    # which on a mis-resolved or huge root (e.g. a .xaml under a shared temp dir
+    # or a giant monorepo, where _xaml_project_root climbs to a broad ancestor)
+    # scanned millions of paths and effectively hung. A real .NET project sits
+    # well under the cap; a runaway root is bounded to a fast, partial scan
+    # instead of hanging.
+    import os as _os
+    _DIR_CAP = 20000
+    cs_files: list[Path] = []
+    visited = 0
     try:
-        cs_files = sorted(root.rglob("*.cs"))
+        for dirpath, dirnames, filenames in _os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames if not d.startswith(".") and not _is_noise_dir(d)
+            ]
+            for fn in filenames:
+                if fn.endswith(".cs"):
+                    cs_files.append(Path(dirpath) / fn)
+            visited += 1
+            if visited >= _DIR_CAP:
+                break
     except OSError:
         return classes
+    cs_files.sort()
     for cs_path in cs_files:
-        if any(_is_noise_dir(part) for part in cs_path.parts):
-            continue
         if patterns and _is_ignored(cs_path, root, patterns, _cache=ignore_cache):
             continue
         result = extract_csharp(cs_path)
@@ -5224,6 +5264,18 @@ def extract(
     for n in all_nodes:
         n.pop("origin_file", None)
         n.pop("_callable", None)  # internal indirect_call marker — never ships to graph.json
+
+    # local_alias is a transient import-resolution hint (#2082), same shape as
+    # target_file (#1814): it exists only so the module arm of
+    # _resolve_python_member_calls (run above via run_language_resolvers) can
+    # match an aliased receiver against the import edge it came from. Nothing
+    # reads it after that pass runs, so drop it here rather than let an internal
+    # local variable name ship into graph.json. Popped post-resolution, unlike
+    # target_file (which _disambiguate_colliding_node_ids pops earlier in the
+    # pipeline) — local_alias must survive until run_language_resolvers has run,
+    # so it cannot be popped at that earlier point without breaking the fix.
+    for e in all_edges:
+        e.pop("local_alias", None)
 
     # Tag AST provenance so the incremental watch rebuild can distinguish
     # AST-extracted nodes from semantic/LLM nodes. On a full re-extraction
