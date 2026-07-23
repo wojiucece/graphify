@@ -739,12 +739,21 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
 
 def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
     # Compute hub threshold: nodes above this degree are not expanded as transit.
-    # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
+    # p99 of degree distribution, floored to avoid over-blocking small graphs.
+    # CUSTOM: floor 50->30（实测调紧 hub 阈值，_bfs 与 _dfs 同步改）
+    # 三图谱实测（graphify_fork 11206n / D:/code全量 14707n / quant-research 1234n）：
+    #   1. hop1 直接邻居零损失（21 query 跨领域全 0）--hub 只挡非 seed 的 transit 扩展，
+    #      seed 自身邻居遍历不受限（L759 `n not in seed_set` 条件保护查询核心）。
+    #   2. 中大子图省 15-44% nodes（token 大头有效减少）；小子图(base<30)0 触发无损。
+    #   3. 高频核心概念(如 quant "因子"query)0% 省（不误伤高密度概念簇）。
+    #   4. 三图谱 p99 degree 均<50(28/23/33)，原 max(50,p99) 恒为 50，p99 分支实为死代码，
+    #      本改动即调这个实际生效的常数。floor:30 保守值（floor:20 对 watch/close/__init__
+    #      等省幅 60-70% 偏激进）。
     degrees = [G.degree(n) for n in G.nodes()]
     if degrees:
         degrees_sorted = sorted(degrees)
         p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
+        hub_threshold = max(30, degrees_sorted[p99_idx])  # CUSTOM: floor 50->30（实测调紧，hop1零损省15-44%）
     else:
         hub_threshold = 50
     seed_set = set(start_nodes)
@@ -772,7 +781,7 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     if degrees:
         degrees_sorted = sorted(degrees)
         p99_idx = int(len(degrees_sorted) * 0.99)
-        hub_threshold = max(50, degrees_sorted[p99_idx])
+        hub_threshold = max(30, degrees_sorted[p99_idx])  # CUSTOM: floor 50->30（实测调紧，hop1零损省15-44%）
     else:
         hub_threshold = 50
     seed_set = set(start_nodes)
