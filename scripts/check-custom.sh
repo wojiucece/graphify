@@ -23,12 +23,13 @@ echo ""
 echo "=== PreToolUse 注入禁用检查（避免与 context-mode 的 Read/Bash hook 冲突）==="
 # _install_claude_hook 中 PreToolUse 注入应被注释掉，只保留 UserPromptSubmit
 # 上游 0.9.8 重构：PreToolUse 注入从 append(_SETTINGS_HOOK) 改为 extend(_claude_pretooluse_hooks())
-# 恢复方式：取消 _install_claude_hook 函数中被注释的 extend(_claude_pretooluse_hooks()) 行
-if grep -q '^    # hooks\["PreToolUse"\].extend(_claude_pretooluse_hooks())' graphify/install.py 2>/dev/null; then
-    echo "✓ PreToolUse 注入已禁用（_install_claude_hook 中 _claude_pretooluse_hooks() extend 被注释）"
+# 上游 0.9.20 给 _claude_pretooluse_hooks() 加了 strict 参数（默认 False），grep 模式不锁死参数
+# 恢复方式：取消 _install_claude_hook 函数中被注释的 extend(_claude_pretooluse_hooks(...)) 行
+if grep -q '^    # hooks\["PreToolUse"\].extend(_claude_pretooluse_hooks' graphify/install.py 2>/dev/null; then
+    echo "✓ PreToolUse 注入已禁用（_install_claude_hook 中 _claude_pretooluse_hooks(...) extend 被注释）"
 else
-    echo "✗ PreToolUse 注入未禁用：graphify/install.py 中 _claude_pretooluse_hooks() extend 未被注释"
-    echo "  应在 _install_claude_hook 函数中注释掉 hooks[\"PreToolUse\"].extend(_claude_pretooluse_hooks()) 行（与 context-mode 冲突）"
+    echo "✗ PreToolUse 注入未禁用：graphify/install.py 中 _claude_pretooluse_hooks(...) extend 未被注释"
+    echo "  应在 _install_claude_hook 函数中注释掉 hooks[\"PreToolUse\"].extend(_claude_pretooluse_hooks(...)) 行（与 context-mode 冲突）"
     FAILS=$((FAILS+1))
 fi
 

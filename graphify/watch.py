@@ -254,11 +254,21 @@ def _apply_resource_limits() -> None:
         pass
 
 
-def _git_head() -> str | None:
-    """Return current git HEAD commit hash, or None outside a repo."""
+def _git_head(cwd: Path | str | None = None) -> str | None:
+    """Return current git HEAD commit hash, or None outside a repo.
+
+    ``cwd`` selects the repository to ask (#2316). Without it the command
+    inherits the caller's working directory, so `graphify update <target>`
+    stamped the *invoking* repo's commit into the target's graph.json — the
+    same CWD-anchoring mistake as the manifest path, but writing wrong
+    provenance rather than a misplaced file.
+    """
     import subprocess as _sp
     try:
-        r = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3)
+        r = _sp.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3,
+            cwd=str(cwd) if cwd is not None else None,
+        )
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
@@ -475,14 +485,37 @@ def _reconcile_existing_graph(
     if not existing_graph.exists():
         return result, existing_graph_data
 
+    # Fail-closed load (#2251): reuse build._load_existing_graph, which raises
+    # ValueError when the file exceeds the size cap and RuntimeError when it
+    # exists but cannot be parsed. Those failures must PROPAGATE to the caller
+    # — swallowing them here left existing_graph_data == {}, which _check_shrink
+    # reads as "no baseline, write allowed", so the hook overwrote a graph it
+    # merely failed to READ. A missing file (None) keeps first-build behavior:
+    # reconcile proceeds with an empty baseline and the write is allowed.
+    from graphify.build import _load_existing_graph
+    if _load_existing_graph(existing_graph) is None:
+        return result, existing_graph_data
+    # Cap + parse validated above. Reload as the full dict — reconcile needs
+    # top-level keys (hyperedges, per-node community for _node_community_map,
+    # topology compare) the (nodes, edges, hyperedges) tuple does not carry.
+    # A failure here (e.g. a race rewriting the file) still propagates,
+    # staying fail-closed.
+    existing = json.loads(existing_graph.read_text(encoding="utf-8"))
+    existing_graph_data = existing
+
+    # Backfill tier provenance on legacy items (#2334), mirroring
+    # build._load_existing_graph (this reconcile path loads the raw dict
+    # separately, so the backfill there does not reach it). Stamping preserved
+    # items means the graph self-heals on this write.
+    from graphify.build import _is_ast_tier
+    for _bucket in ("nodes", "links", "edges"):
+        for _item in existing.get(_bucket, []):
+            if isinstance(_item, dict):
+                _item.setdefault("_origin", "ast" if _is_ast_tier(_item) else "semantic")
+
     try:
         from graphify.build import _norm_source_file as _nsf
         from graphify.extract import _get_extractor
-        from graphify.security import check_graph_file_size_cap
-
-        check_graph_file_size_cap(existing_graph)
-        existing = json.loads(existing_graph.read_text(encoding="utf-8"))
-        existing_graph_data = existing
         source_paths = _StoredSourcePaths(
             existing,
             out=out,
@@ -573,15 +606,20 @@ def _reconcile_existing_graph(
                 "Run a full re-extraction to purge them if the exclusion is intentional."
             )
 
-        # A full re-extraction owns every AST node under watch_root. Incremental
-        # extraction owns only nodes from rebuilt or deleted sources. Semantic
-        # nodes lack the AST origin marker and remain preserved.
+        # A full re-extraction owns the AST nodes of every source it actually
+        # re-extracted (extract_targets, via rebuilt_source_identities) — NOT
+        # every AST node under watch_root: a semantic-backed doc is excluded
+        # from extract_targets (#1915), so its existing AST layer is not
+        # regenerated this run and dropping it would be data loss (#2333,
+        # COEXIST — the AST and semantic layers of a file coexist).
+        # Incremental extraction owns only nodes from rebuilt or deleted
+        # sources. Semantic-tier nodes (per _is_ast_tier) remain preserved.
         preserved_nodes = [
             node
             for node in existing.get("nodes", [])
             if node["id"] not in new_ast_ids
             and not (
-                node.get("_origin") == "ast"
+                _is_ast_tier(node)
                 and (
                     (
                         not node.get("source_file")
@@ -589,7 +627,7 @@ def _reconcile_existing_graph(
                     )
                     or (
                         full_rebuild
-                        and source_paths.in_watch_root(node.get("source_file"))
+                        and source_paths.is_evicted(node, rebuilt_source_identities)
                     )
                 )
             )
@@ -610,7 +648,7 @@ def _reconcile_existing_graph(
             and edge.get("target") in all_ids
             and not source_paths.is_evicted(edge, edge_evicted_source_identities)
             and not (
-                edge.get("_origin") == "ast"
+                _is_ast_tier(edge)
                 and source_paths.is_evicted(edge, rebuilt_source_identities)
             )
         ]
@@ -639,7 +677,16 @@ def _reconcile_existing_graph(
             "input_tokens": 0,
             "output_tokens": 0,
         }, existing_graph_data
-    except Exception:
+    except Exception as exc:
+        # Post-load reconciliation failure: fall back to the fresh extraction
+        # while keeping the loaded baseline, so _check_shrink still guards the
+        # write against a collapse. Say so — this used to be silent (#2251).
+        print(
+            "[graphify watch] reconcile of existing graph failed "
+            f"({exc.__class__.__name__}: {exc}); proceeding with fresh "
+            "extraction only.",
+            file=sys.stderr,
+        )
         return result, existing_graph_data
 
 
@@ -665,6 +712,13 @@ def _node_community_map(graph_data: dict) -> dict[str, int]:
 def _canonical_graph_for_compare(graph_data: dict) -> dict:
     canonical = dict(graph_data)
     canonical.pop("built_at_commit", None)
+    # A missing "directed" key means the same thing as "directed": false
+    # everywhere else in the codebase (#2342's --no-cluster path only started
+    # writing the key once it began inheriting it from the existing graph).
+    # Normalise so an old graph.json without the key doesn't register as
+    # "changed" against a freshly-written candidate that now carries
+    # "directed": false explicitly.
+    canonical["directed"] = bool(canonical.get("directed", False))
     for key in ("nodes", "links", "edges", "hyperedges"):
         if key in canonical and isinstance(canonical[key], list):
             canonical[key] = sorted(
@@ -937,12 +991,16 @@ def _rebuild_code(
             return ok
 
     watch_root = watch_path.resolve()
+    # project_root stays CWD-anchored for a relative invocation on purpose: the
+    # persisted graph rehomes source_file across invocation styles against it
+    # (tests/test_watch.py:1389, :1428). The manifest is a different artifact
+    # with a different anchor — see the save_manifest calls below.
     project_root = Path.cwd().resolve() if not watch_path.is_absolute() else watch_root
     report_root = _report_root_label(watch_path)
     try:
         from graphify.extract import extract, _get_extractor
         from graphify.detect import detect
-        from graphify.build import build_from_json, _norm_source_file as _nsf
+        from graphify.build import build_from_json, _is_ast_tier, _norm_source_file as _nsf
         from graphify.cluster import cluster, remap_communities_to_previous, score_all
         from graphify.analyze import god_nodes, surprising_connections, suggest_questions
         from graphify.report import generate
@@ -977,10 +1035,12 @@ def _rebuild_code(
         # existing graph must not ALSO be AST-quick-scanned — otherwise every
         # rebuild mints heading nodes on top of the preserved semantic nodes
         # and the doc is represented twice (~4x graph bloat vs the CLI update
-        # path, which AST-extracts only code). Semantic supersedes AST per doc
-        # source: the quick-scan stays as a fallback for docs with no semantic
-        # layer (the no-LLM doc-structure feature, #09b33b7) and for brand-new
-        # docs the graph has never seen. These docs stay in ``code_files`` so
+        # path, which AST-extracts only code). A semantic-backed doc is never
+        # re-quick-scanned, and any AST layer it already carries coexists and
+        # is preserved rather than regenerated (#2333, COEXIST); the
+        # quick-scan stays as a fallback for docs with no semantic layer (the
+        # no-LLM doc-structure feature, #09b33b7) and for brand-new docs the
+        # graph has never seen. These docs stay in ``code_files`` so
         # corpus membership (#1795 fail-closed deletion evidence) and the
         # shrink accounting below still cover them — a previously-bloated
         # graph must be allowed to self-heal on a full rebuild without the
@@ -1013,7 +1073,11 @@ def _rebuild_code(
                 # "document" nodes (extractors/markdown.py). "image" stays out.
                 semantic_doc_identities: set[str] = set()
                 for node in prior.get("nodes", []):
-                    if node.get("_origin") == "ast":
+                    # _is_ast_tier, not a raw _origin check (#2334): a legacy
+                    # unstamped AST heading node (source_location "L<n>") must
+                    # not fake a semantic layer, or the doc would be excluded
+                    # from the AST quick-scan forever.
+                    if _is_ast_tier(node):
                         continue
                     if node.get("file_type") not in (
                         "document", "concept", "rationale", "paper", "code"
@@ -1098,13 +1162,14 @@ def _rebuild_code(
             extract_targets = wanted
         else:
             # Full rebuild: skip the AST quick-scan for semantic-backed docs
-            # (#1915). They remain in code_files, so stale _origin=="ast"
-            # heading nodes from a previously-bloated graph are dropped by the
-            # full-rebuild AST ownership rule while the shrink accounting
-            # below still counts the doc as a rebuilt source.
+            # (#1915). They remain in code_files for corpus membership and
+            # shrink accounting, but because they are not extract targets the
+            # full-rebuild AST ownership rule (scoped to
+            # rebuilt_source_identities, #2333 COEXIST) leaves their existing
+            # AST heading layer intact alongside the semantic layer.
             extract_targets = [p for p in code_files if p not in semantic_doc_files]
 
-        commit = _git_head()
+        commit = _git_head(cwd=watch_root)
         result = extract(extract_targets, cache_root=watch_root) if extract_targets else {
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
@@ -1119,18 +1184,29 @@ def _rebuild_code(
         # When the caller supplied changed_paths, also evict preserved nodes whose
         # source_file matches a path that was changed (re-extracted) or deleted —
         # otherwise the old nodes for those files would survive forever.
-        result, existing_graph_data = _reconcile_existing_graph(
-            existing_graph,
-            result,
-            out=out,
-            project_root=project_root,
-            watch_root=watch_root,
-            code_files=code_files,
-            extract_targets=extract_targets,
-            full_rebuild=changed_paths is None,
-            deleted_paths=deleted_paths,
-            deleted_source_identities=deleted_source_identities,
-        )
+        try:
+            result, existing_graph_data = _reconcile_existing_graph(
+                existing_graph,
+                result,
+                out=out,
+                project_root=project_root,
+                watch_root=watch_root,
+                code_files=code_files,
+                extract_targets=extract_targets,
+                full_rebuild=changed_paths is None,
+                deleted_paths=deleted_paths,
+                deleted_source_identities=deleted_source_identities,
+            )
+        except (RuntimeError, ValueError) as exc:
+            # Existing graph present but unreadable — over the size cap
+            # (ValueError) or unparseable JSON (RuntimeError, both via
+            # build._load_existing_graph). Refuse to overwrite a graph we
+            # merely failed to READ (#2251), mirroring the CLI's fail-closed
+            # contract (#2169). --force deliberately does NOT bypass this:
+            # force means "accept a shrink", not "clobber an unreadable
+            # graph".
+            print(f"error: {exc}", file=sys.stderr)
+            return False
 
         _relativize_source_files(result, project_root, scope=watch_root)
         # Source files re-extracted this run — their symbol sets may legitimately
@@ -1157,6 +1233,10 @@ def _rebuild_code(
                 **{k: v for k, v in result.items() if k not in ("edges", "nodes")},
                 "nodes": _dedupe_nodes(result.get("nodes", [])),
                 "links": _dedupe_edges(result.get("edges", [])),
+                # Inherit the existing graph's directed flag (#2342) so
+                # `graphify update --no-cluster` can't silently drop it -
+                # `result` (the raw merged extraction) never carries one.
+                "directed": bool((existing_graph_data or {}).get("directed", False)),
             }
             candidate_graph_text = _json_text(candidate_graph_data)
             same_graph = False
@@ -1164,6 +1244,19 @@ def _rebuild_code(
                 try:
                     check_graph_file_size_cap(existing_graph)
                     existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    # A load failure is NOT "graph changed" (#2251): refuse to
+                    # overwrite a graph we merely failed to read. Normally
+                    # unreachable — the reconcile load above already failed
+                    # closed — but a race rewriting the file can land here.
+                    print(
+                        f"error: Cannot read {existing_graph}: {exc}. "
+                        "Refusing to overwrite; delete the file and run a "
+                        "full rebuild.",
+                        file=sys.stderr,
+                    )
+                    return False
+                try:
                     same_graph = (
                         json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
                         == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
@@ -1177,7 +1270,13 @@ def _rebuild_code(
                     rebuilt_sources=rebuilt_sources,
                 ):
                     return False
-                existing_graph.write_text(candidate_graph_text, encoding="utf-8")
+                from graphify.export import backup_if_protected as _backup
+                _backup(out)
+                # Atomic replace via tmp file, matching the clustered path: a
+                # crash mid-write must not leave a truncated graph.json.
+                graph_tmp = out / ".graph.tmp.json"
+                graph_tmp.write_text(candidate_graph_text, encoding="utf-8")
+                graph_tmp.replace(existing_graph)
 
             # Write the user-supplied path only after the candidate graph is
             # accepted, so a refused shrink cannot mismatch graph and marker.
@@ -1190,7 +1289,8 @@ def _rebuild_code(
                 # scan but still exist on disk (newly excluded) are pruned
                 # instead of surviving as phantom "deleted" entries (#1908).
                 save_manifest(
-                    detected["files"], kind="ast", root=project_root,
+                    detected["files"], manifest_path=str(out / "manifest.json"),
+                    kind="ast", root=watch_root,
                     scan_corpus={f for _fl in detected["files"].values() for f in _fl},
                 )
             except Exception:
@@ -1218,7 +1318,10 @@ def _rebuild_code(
             "total_words": detected.get("total_words", 0),
         }
 
-        G = build_from_json(result)
+        # Inherit the existing graph's directed flag (#2342) so `graphify
+        # update` can't silently downgrade a directed graph to undirected -
+        # build_from_json defaults to directed=False otherwise.
+        G = build_from_json(result, directed=bool((existing_graph_data or {}).get("directed", False)))
         candidate_topology = _topology_from_graph(G)
         if existing_graph_data:
             try:
@@ -1233,7 +1336,8 @@ def _rebuild_code(
                     from graphify.detect import save_manifest
                     # Full-scan save: prune excluded-but-alive rows (#1908).
                     save_manifest(
-                        detected["files"], kind="ast", root=project_root,
+                        detected["files"], manifest_path=str(out / "manifest.json"),
+                        kind="ast", root=watch_root,
                         scan_corpus={f for _fl in detected["files"].values() for f in _fl},
                     )
                 except Exception:
@@ -1252,6 +1356,7 @@ def _rebuild_code(
         gods = god_nodes(G)
         surprises = surprising_connections(G, communities)
         labels_file = out / ".graphify_labels.json"
+        sig_file = out / (".graphify_labels.json" + ".sig")
         try:
             raw = json.loads(labels_file.read_text(encoding="utf-8")) if labels_file.exists() else {}
             # Skip persisted "Community N" placeholders so the hub-fill below
@@ -1263,12 +1368,50 @@ def _rebuild_code(
         except Exception:
             raw = {}
             labels = {}
+        # A saved label belongs to a cid, but re-clustering reassigns cids: after a
+        # rebuild that adds nodes, cid 30 can cover a completely different community
+        # and its old name is then simply wrong. Validate every reused label against
+        # the membership signature saved beside the labels — the same guard the
+        # cluster-only path applies — and drop any whose community changed so the
+        # hub-fill below renames it, deterministically and correct-by-construction.
+        # Without this, an incremental `graphify update` launders stale names into
+        # labels.json as though they were current (#label-stale).
+        from graphify.cluster import community_member_sigs
+        cur_sigs = community_member_sigs(communities)
+        saved_sigs: dict[int, str] = {}
+        if sig_file.exists():
+            try:
+                saved_sigs = {
+                    int(k): v for k, v in
+                    json.loads(sig_file.read_text(encoding="utf-8")).items()
+                    if isinstance(v, str)
+                }
+            except Exception:
+                saved_sigs = {}
+        if saved_sigs:
+            # Precise: the signature tells us exactly which communities changed.
+            stale = {cid for cid in labels if saved_sigs.get(cid) != cur_sigs.get(cid)}
+        else:
+            # No sidecar (labels predate it). A differing community COUNT means the
+            # labels describe a different clustering, so no cid's label is trustworthy;
+            # an equal count is the best available "unchanged" signal.
+            stale = set(labels) if len(raw) != len(communities) else set()
+        for cid in stale:
+            del labels[cid]
         missing = {cid: members for cid, members in communities.items() if cid not in labels}
         if missing:
             # Deterministic hub name (highest-degree member) beats a bare "Community N"
             # placeholder for any community without a saved label.
             from graphify.cluster import label_communities_by_hub
             labels.update(label_communities_by_hub(G, missing))
+        if stale:
+            print(
+                f"[graphify watch] community set changed since labeling "
+                f"({len(raw)} saved labels, {len(communities)} communities now; "
+                f"renamed {len(stale)} community(ies) by their hub). "
+                f"Run `graphify label` to refresh names with the LLM.",
+                file=sys.stderr,
+            )
         questions = suggest_questions(G, communities, labels)
         from graphify.report import load_learning_for_report as _llfr
         report = generate(G, communities, cohesion, labels, gods, surprises, detection,
@@ -1287,6 +1430,20 @@ def _rebuild_code(
             try:
                 check_graph_file_size_cap(existing_graph)
                 existing_payload = json.loads(existing_graph.read_text(encoding="utf-8"))
+            except Exception as exc:
+                # A load failure is NOT "graph changed" (#2251): refuse to
+                # overwrite a graph we merely failed to read. Normally
+                # unreachable — the reconcile load above already failed
+                # closed — but a race rewriting the file can land here.
+                graph_tmp.unlink(missing_ok=True)
+                print(
+                    f"error: Cannot read {existing_graph}: {exc}. "
+                    "Refusing to overwrite; delete the file and run a "
+                    "full rebuild.",
+                    file=sys.stderr,
+                )
+                return False
+            try:
                 same_graph = (
                     json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
                     == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
@@ -1313,6 +1470,12 @@ def _rebuild_code(
             graph_tmp.replace(existing_graph)
             report_path.write_text(report, encoding="utf-8")
             labels_file.write_text(labels_json, encoding="utf-8")
+            # Keep the membership signatures in step with the labels we just wrote.
+            # Skipping this was the other half of the stale-label bug: labels.json
+            # advanced every rebuild while the sidecar kept describing an older
+            # clustering, so the guard above had nothing accurate to check against.
+            sig_file.write_text(
+                json.dumps({str(k): v for k, v in cur_sigs.items()}), encoding="utf-8")
 
         (out / ".graphify_root").write_text(str(watch_path), encoding="utf-8")
 
@@ -1320,24 +1483,47 @@ def _rebuild_code(
             from graphify.detect import save_manifest
             # Full-scan save: prune excluded-but-alive rows (#1908).
             save_manifest(
-                detected["files"], kind="ast", root=project_root,
+                detected["files"], manifest_path=str(out / "manifest.json"),
+                kind="ast", root=watch_root,
                 scan_corpus={f for _fl in detected["files"].values() for f in _fl},
             )
         except Exception:
             pass
 
-        # to_html raises ValueError for graphs > MAX_NODES_FOR_VIZ (5000).
+        # to_html raises ValueError for graphs > the viz node limit.
         # Wrap so core outputs (graph.json + GRAPH_REPORT.md) always land.
         html_written = False
         if not no_change:
+            html_target = out / "graph.html"
             try:
-                to_html(G, communities, str(out / "graph.html"), community_labels=labels or None)
+                to_html(G, communities, str(html_target), community_labels=labels or None)
                 html_written = True
             except ValueError as viz_err:
-                print(f"[graphify watch] Skipped graph.html: {viz_err}")
-                stale = out / "graph.html"
-                if stale.exists():
-                    stale.unlink()
+                # Over the cap. Deleting was defensible on its own — a kept
+                # graph.html would describe an older, smaller graph — but it
+                # leaves a project that crossed the threshold with no
+                # visualization at all, and the file is gone before the user
+                # sees the message. The export path (#1019) already re-renders
+                # the community-aggregation view in exactly this case, so do
+                # the same here: current AND present beats current OR present.
+                from graphify.exporters.html import _viz_node_limit
+                if html_target.exists():
+                    html_target.unlink()
+                limit = _viz_node_limit()
+                if limit <= 0:
+                    # GRAPHIFY_VIZ_NODE_LIMIT=0 means "no HTML viz" (CI runners),
+                    # so honour it rather than aggregating around it.
+                    print(f"[graphify watch] Skipped graph.html: {viz_err}")
+                else:
+                    try:
+                        to_html(G, communities, str(html_target),
+                                community_labels=labels or None, node_limit=limit)
+                        # The aggregator declines to write a single-community
+                        # graph, so trust the file rather than the call.
+                        html_written = html_target.exists()
+                    except Exception as fallback_err:
+                        print(f"[graphify watch] Skipped graph.html: {viz_err} "
+                              f"(aggregated view also failed: {fallback_err})")
 
         # Regenerate callflow HTML if the user previously generated one —
         # opt-in by existence so users who never ran callflow-html aren't affected.
