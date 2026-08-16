@@ -46,6 +46,7 @@ from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.markdown import extract_markdown  # noqa: F401
+from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
@@ -124,6 +125,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
     _resolve_js_import_target,
     _resolve_js_module_path,
     _resolve_lua_import_target,
+    _probe_python_module_candidate,
     _resolve_python_module_path,
     _resolve_tsconfig_alias,
     _resolve_workspace_import,
@@ -350,8 +352,20 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 base = Path(str_path).parent
                 for _ in range(dots - 1):
                     base = base.parent
-                rel = (module_name.replace(".", "/") + ".py") if module_name else "__init__.py"
-                target_path = base / rel
+                # A relative import can name a subpackage (a directory with an
+                # __init__.py), not a module file. Probing the candidate on disk
+                # (mirroring the companion `imports` edge's
+                # _resolve_python_module_path) resolves `graphs` -> graphs/__init__.py
+                # instead of a nonexistent graphs.py: without it the target keeps an
+                # absolute-path-derived slug that the target_file stamp below can't
+                # heal, so it dangles per-checkout (#2455).
+                candidate = base / module_name.replace(".", "/") if module_name else base
+                resolved = _probe_python_module_candidate(candidate)
+                if resolved is not None:
+                    target_path = resolved
+                else:
+                    rel = (module_name.replace(".", "/") + ".py") if module_name else "__init__.py"
+                    target_path = base / rel
                 tgt_nid = _make_id(str(target_path))
             else:
                 tgt_nid = _make_id(raw)
@@ -772,7 +786,14 @@ _JS_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
     call_accessor_object_field="object",
-    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition"}),
+    # `function_expression` belongs here so UNTRACKED inline/nested expressions
+    # reach walk_calls' existing closure handler, which already names the type
+    # (`_JS_CLOSURE_TYPES`). Without it the gate never opens, so such an
+    # expression's parameters and locals never fold into extra_locals for its
+    # subtree and read as by-name references (#2241 family). A top-level
+    # `const f = function (…) {}` is tracked via its declarator and was already
+    # fine; the inline/nested forms are what this covers.
+    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
 )
 
@@ -793,7 +814,8 @@ _TS_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
     call_accessor_object_field="object",
-    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition"}),
+    # `function_expression`: see the note on the JS config above.
+    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
 )
 
@@ -1850,9 +1872,99 @@ def extract_c(path: Path) -> dict:
     return _extract_generic(path, _C_CONFIG)
 
 
+# doctest / Catch2 name each test case with a string literal
+# (``TEST_CASE("name")``), which tree-sitter-cpp cannot parse: the construct
+# becomes an ERROR node and the whole test function is dropped from the graph
+# (issue #2594). Recover the test cases with a regex fallback, mirroring the
+# Spock handling of Groovy ``def "feature"()`` above. Scoped to doctest +
+# Catch2, which share this string-named-macro surface.
+#
+# Only the top-level test-declaration macros are recovered as callable nodes.
+# ``SUBCASE`` / ``SECTION`` are *nested* scopes inside a test body and
+# ``TEST_SUITE`` is a grouping wrapper, not a test function — emitting them as
+# file-contained nodes would fabricate wrong-granularity nodes and edges.
+_CPP_STRING_TEST_MACROS = (
+    "TEST_CASE", "TEST_CASE_TEMPLATE", "SCENARIO",
+)
+# The name group consumes C-string escapes (``\"``, ``\\``) so a test whose
+# name embeds an escaped quote is captured whole, not truncated at the escape.
+_CPP_STRING_TEST_RE = re.compile(
+    r'^[ \t]*(?:' + "|".join(_CPP_STRING_TEST_MACROS) + r')\s*\(\s*"((?:[^"\\]|\\.)+)"',
+    re.MULTILINE,
+)
+
+
+def _augment_cpp_string_tests(path: Path, result: dict) -> dict:
+    """Append callable nodes for doctest/Catch2 string-named test cases that
+    tree-sitter-cpp drops as ERROR nodes (issue #2594).
+
+    The generic C++ pass still recovers the surrounding functions and include
+    edges reliably, so this only adds the missing ``TEST_CASE("...")`` nodes and
+    their ``contains`` edge from the file node — it does not rebuild the result.
+
+    Matching is line-anchored raw text, mirroring the Spock fallback above; it is
+    deliberately not comment/preprocessor aware (a ``TEST_CASE`` disabled behind
+    a block comment or ``#if 0`` may still surface as a node, exactly as a
+    commented Spock ``def "feature"()`` would).
+    """
+    try:
+        source = path.read_text(errors="replace")
+    except OSError:
+        return result
+    matches = list(_CPP_STRING_TEST_RE.finditer(source))
+    if not matches:
+        return result
+
+    str_path = str(path)
+    stem = _file_stem(path)
+    file_nid = _make_id(str_path)
+    # A test name that is all punctuation (TEST_CASE("***")) normalizes to empty,
+    # so _make_id(stem, name) collapses onto this bare-stem id — colliding with
+    # the file's namespace and silently swallowing every later such test under
+    # one id (#1899). Detect that collapse and fall back to a line-positional id.
+    stem_collapse_id = _make_id(stem)
+    nodes = result.setdefault("nodes", [])
+    edges = result.setdefault("edges", [])
+    seen_ids = {n.get("id") for n in nodes}
+
+    for m in matches:
+        test_name = m.group(1)
+        line = source.count("\n", 0, m.start()) + 1
+        test_nid = _make_id(stem, test_name)
+        if test_nid == stem_collapse_id:
+            test_nid = _make_id(stem, "test", f"L{line}")
+        if test_nid in seen_ids:
+            continue
+        seen_ids.add(test_nid)
+        # Keep the raw test name as the label (mirroring the Spock fallback,
+        # which labels feature methods with their quoted string name).
+        nodes.append({
+            "id": test_nid,
+            "label": f'"{test_name}"',
+            "file_type": "code",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
+        edges.append({
+            "source": file_nid,
+            "target": test_nid,
+            "relation": "contains",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+    return result
+
+
 def extract_cpp(path: Path) -> dict:
-    """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file."""
-    return _extract_generic(path, _CPP_CONFIG)
+    """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file.
+
+    Recovers doctest/Catch2 ``TEST_CASE("name")`` test cases that tree-sitter-cpp
+    drops as ERROR nodes (issue #2594), mirroring the Spock fallback for Groovy.
+    """
+    result = _extract_generic(path, _CPP_CONFIG)
+    return _augment_cpp_string_tests(path, result)
 
 
 def extract_ruby(path: Path) -> dict:
@@ -4810,6 +4922,8 @@ _DISPATCH: dict[str, Any] = {
     ".svelte": extract_svelte,
     ".astro": extract_astro,
     ".dart": extract_dart,
+    ".ml": extract_ocaml,
+    ".mli": extract_ocaml,
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".svh": extract_verilog,
@@ -4862,7 +4976,16 @@ _EXTRA_FOR_EXTENSION = {
     ".hcl": "terraform",
     ".dm": "dm",
     ".dme": "dm",
+    ".ml": "ocaml",
+    ".mli": "ocaml",
 }
+
+# Substrings an extractor's error carries to classify why a dependency-backed
+# file contributed nothing, used by the #1745 warning in extract(). A grammar
+# that is present but fails to load (#2602) must not be reported as missing —
+# the "install the extra" hint would be a no-op.
+_DEP_MISSING_MARKER = "not installed"
+_DEP_LOAD_FAILED_MARKER = "failed to load"
 
 
 # Extensionless executables (CLI entry points like `devctl` or `manage`) carry
@@ -5451,21 +5574,28 @@ def extract(
     _missing_dep_error: dict[str, str] = {}
     for i, _p in enumerate(paths):
         _err = (per_file[i] or {}).get("error") or ""
-        if "not installed" in _err:
+        if _DEP_MISSING_MARKER in _err or _DEP_LOAD_FAILED_MARKER in _err:
             _ext = _p.suffix.lower()
             _missing_dep_count[_ext] = _missing_dep_count.get(_ext, 0) + 1
             _missing_dep_error.setdefault(_ext, _err)
     for _ext, _n in sorted(_missing_dep_count.items(), key=lambda kv: (-kv[1], kv[0])):
         _extra = _EXTRA_FOR_EXTENSION.get(_ext)
-        if _extra:
-            _reason = _missing_dep_error[_ext].split(". ")[0]
+        _err_text = _missing_dep_error[_ext]
+        if _extra and _DEP_MISSING_MARKER in _err_text:
+            # Genuinely absent optional extra — point the user at the install.
+            _reason = _err_text.split(". ")[0]
             _hint = f' Install it with: pip install "graphifyy[{_extra}]"'
+            _cause = "a dependency is missing"
         else:
-            _reason = _missing_dep_error[_ext]
+            # Either no known extra, or the grammar is present but failed to
+            # load (#2602): surface the real error and never suggest reinstall.
+            _reason = _err_text
             _hint = ""
+            _cause = ("a dependency is missing" if _DEP_MISSING_MARKER in _err_text
+                      else "a dependency failed to load")
         print(
             f"  warning: {_n} {_ext} file(s) contributed nothing to the graph "
-            f"because a dependency is missing: {_reason}.{_hint} (#1745)",
+            f"because {_cause}: {_reason}.{_hint} (#1745)",
             file=sys.stderr, flush=True,
         )
 
