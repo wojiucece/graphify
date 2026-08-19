@@ -2,7 +2,31 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
-## 0.9.44 (unreleased)
+## 0.9.46 (unreleased)
+
+- Fix: node-id normalization is now caseless-stable for combining-mark sequences — `casefold` and NFKC don't commute, so a single pass left `normalize_id(s) != normalize_id(s.casefold())` for inputs like Greek ypogegrammeni followed by a combining accent; normalization now iterates casefold+NFKC to a fixpoint. Letter/digit-bearing ids are unchanged, so existing graphs are not re-keyed.
+
+- Fix: Java annotations now emit `references` edges to their type — including class-literal arguments (`@Repeatable(Foo.class)`, `@Uses({A.class, B.class})`) and annotation-member return types — so a container annotation is no longer a disconnected island; string/enum arguments are not mistaken for type references (#2426, thanks @oleksii-tumanov).
+- Fix: `graphify query` treats `_` as a token separator (like `-`), so an underscore-spelled query (`user_service`) matches a hyphenated label (`user-service`); coverage-scaling keeps the broader tokenization from surfacing unrelated single-token noise (#2473, thanks @nadiadatepe-eng).
+- Fix: the `post-checkout` hook skips its rebuild when HEAD is unchanged (e.g. `git checkout -b` with no start point), so creating a branch no longer triggers a full graph rebuild (#2421, thanks @nothariharan).
+- Feature: Markdown nodes now carry a `node_kind` (`page` vs `heading`) attribute so a docs corpus can be filtered by kind, and leading YAML frontmatter is parsed onto the page node as bounded, sanitized attributes; a `#` comment inside frontmatter is no longer mis-extracted as a heading (thanks @evanthomasgelders). Node ids are unchanged, so existing markdown graphs are not re-keyed.
+
+- Feature: Common Lisp `.lisp`/`.cl`/`.lsp`/`.asd` extraction via tree-sitter-commonlisp (optional `[commonlisp]` extra) — packages, classes, functions, methods, generics, macros, variable definers, and same-file calls; `open`ed/`:use`d packages resolve cross-file (thanks @fade).
+
+- Fix: a `graphify query` whose node set fits the budget but whose edges push the total over now prints an honest "complete answer over budget" notice with the real size, instead of silently returning a payload several times the requested budget (and no longer advises raising the budget, which was the exact trigger); edges are still never dropped from a complete answer (#2784, thanks @AromalBiju1).
+- Fix: a `.gitignore`/`.graphifyignore` saved in a non-UTF-8 encoding no longer silently drops its rules (which let an explicitly-excluded directory get scanned anyway); the file is decoded UTF-8-first, then by a UTF-16 BOM, then the host codepage/latin-1, so the rule survives intact with a warning instead of being truncated (#2798, thanks @abhay-codes07).
+- Fix: when node dedup merges two nodes, any hyperedge that listed the merged-away node as a member now rewires that member to the survivor instead of silently dropping it, so a grouping no longer loses participants on dedup (#2805, thanks @abhay-codes07).
+- Fix: pruning a source file now also sweeps the external-import placeholder nodes it strands at degree 0, instead of leaving them to accumulate in the node count, `GRAPH_REPORT.md`, and exports; genuinely-isolated real nodes (which carry a `source_file`) are never touched (#2807, thanks @abhay-codes07).
+- Fix: when two edges connect the same node pair with different relations, the graph builder now keeps the more specific relation (`calls`, `imports`, `inherits`, ...) instead of letting a generic `references`/`uses`/`mentions` overwrite it; previously a real `calls` could be downgraded to `references` and then dropped from the call graph (#2803, thanks @abhay-codes07).
+
+## 0.9.45 (2026-08-16)
+
+- Fix: `graphify install <platform>` now advances the `.graphify_version` stamp only for the platform it actually (re)writes, instead of stamping every installed platform as current; a platform whose skill content was left untouched keeps its old stamp so its staleness warning stays truthful (#2694, thanks @ousamabenyounes). This completes #2694 (the CLAUDE_CONFIG_DIR half shipped in 0.9.44).
+- Fix: an incremental rebuild no longer collapses the whole graph when the `.graphify_root` marker records a subfolder while stored `source_file` paths are relative to the repo root; the marker is validated against the stored paths before it is trusted as their anchor, so a mismatched marker can't make every unchanged source look deleted (#2603, thanks @catpotd). A genuinely deleted source is still evicted, and incremental ids stay identical to a cold build.
+- Fix: a Go file that declares both an exported and an unexported symbol differing only by case (e.g. `Run` and `run`, which are distinct in Go's case-sensitive visibility rules) no longer collapses them onto one node id and drops one; the exported symbol keeps its stable id and the unexported one is disambiguated, so an intra-file call to the unexported symbol resolves locally instead of phantoming to another package (#2779, thanks @catpotd). Only the Go extractor's id assignment is affected; the shared id normalization is unchanged, so no other language's ids move.
+- Fix: loading a `graph.json` that contains a hyperedge with no `id` field (the semantic extractor emits them and they persist verbatim) no longer crashes the incremental re-extract with `KeyError: 'id'`; id-less hyperedges are tolerated and retained (#2775, thanks @ousamabenyounes).
+
+## 0.9.44 (2026-08-15)
 
 - Feature: `graphify hook install` reads a committed `.graphifyrc` (`viz_node_limit=<int>`) and bakes the visualization node limit into the generated git hooks, so a project-wide limit is shared via version control and survives hook regeneration; `hook status` reports it (#2760, thanks @hopstreax). The baked value uses a `${GRAPHIFY_VIZ_NODE_LIMIT:-<n>}` default so an explicit per-run env var still wins, and `hook status` degrades gracefully on a malformed `.graphifyrc`.
 - Fix: `graphify install` (Claude always-on) now writes the CLAUDE.md registration into `$CLAUDE_CONFIG_DIR` when that env var relocates the Claude profile, instead of always mutating the default `~/.claude/CLAUDE.md` (part of #2694, thanks @AromalBiju1).
