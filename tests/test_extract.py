@@ -2569,6 +2569,41 @@ def test_extract_bash_rejects_command_substitution_as_call(tmp_path):
     assert call_pairs == [], f"Command substitution erroneously emitted call edges: {call_pairs}"
 
 
+def test_extract_bash_command_substitution_in_assignment_emits_call(tmp_path):
+    """#2978: x=$(helper) inside a function must emit a calls edge to helper()."""
+    script = tmp_path / "a.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "helper() { echo ok; }\n"
+        "bare()      { helper; }\n"
+        "subst()     { x=$(helper); echo \"$x\"; }\n"
+        "orlist()    { helper || return 1; }\n"
+        "andlist()   { true && helper; }\n"
+        "pipe()      { helper | cat; }\n"
+        "cond()      { if helper; then :; fi; }\n"
+        "loop()      { while helper; do break; done; }\n"
+        "redir()     { helper >/dev/null; }\n"
+        "neg()       { ! helper; }\n",
+        encoding="utf-8",
+    )
+    result = extract_bash(script)
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    call_pairs = [
+        (labels.get(e["source"], e["source"]), labels.get(e["target"], e["target"]))
+        for e in result["edges"]
+        if e["relation"] == "calls"
+    ]
+    assert ("subst()", "helper()") in call_pairs
+    assert ("bare()", "helper()") in call_pairs
+    assert ("orlist()", "helper()") in call_pairs
+    assert ("andlist()", "helper()") in call_pairs
+    assert ("pipe()", "helper()") in call_pairs
+    assert ("cond()", "helper()") in call_pairs
+    assert ("loop()", "helper()") in call_pairs
+    assert ("redir()", "helper()") in call_pairs
+    assert ("neg()", "helper()") in call_pairs
+
+
 def test_extract_bash_process_substitution_not_recorded(tmp_path):
     """`<(helper)` (process substitution) must not be recorded as a call edge."""
     script = tmp_path / "process_substitution.sh"
@@ -3819,6 +3854,74 @@ def test_rewire_does_not_bind_supertype_stub_to_function():
     assert edges[0]["target"] == "BookStore"  # inherits stub not bound to function
 
 
+def test_rewire_does_not_bind_supertype_stub_across_language():
+    """#2812: a bare `extends Exception` in PHP is the language's own built-in.
+    It must not fuse onto a unique same-named TypeScript class."""
+    from graphify.extract import _rewire_unique_stub_nodes
+    nodes = [
+        {"id": "app_exception_Exception", "label": "Exception", "file_type": "code",
+         "source_file": "app/exception.ts", "source_location": "L1"},
+        {"id": "Exception", "label": "Exception", "file_type": "code", "source_file": ""},
+    ]
+    edges = [{"source": "pkg_FooApiException", "target": "Exception", "relation": "inherits",
+              "source_file": "pkg/FooApiException.php", "weight": 1.0}]
+    _rewire_unique_stub_nodes(nodes, edges)
+    assert edges[0]["target"] == "Exception"  # unchanged — cross-language blocked
+    assert "Exception" in {n["id"] for n in nodes}  # stub kept as the external base
+
+
+def test_rewire_binds_builtin_named_supertype_stub_within_same_language():
+    """#2812 control: the guard is per language family, not a name blocklist — a
+    PHP corpus that declares its own `Exception` must still absorb the stub."""
+    from graphify.extract import _rewire_unique_stub_nodes
+    nodes = [
+        {"id": "pkg_support_Exception", "label": "Exception", "file_type": "code",
+         "source_file": "pkg/Support/Exception.php", "source_location": "L1"},
+        {"id": "Exception", "label": "Exception", "file_type": "code", "source_file": ""},
+    ]
+    edges = [{"source": "pkg_FooApiException", "target": "Exception", "relation": "inherits",
+              "source_file": "pkg/FooApiException.php", "weight": 1.0}]
+    _rewire_unique_stub_nodes(nodes, edges)
+    assert edges[0]["target"] == "pkg_support_Exception"
+
+
+def test_rewire_builtin_supertype_guard_folds_case_insensitive_languages():
+    """#2812: PHP resolves class names case-insensitively, so `extends \\exception`
+    names the same built-in as `extends \\Exception` and must be blocked too."""
+    from graphify.extract import _rewire_unique_stub_nodes
+    nodes = [
+        {"id": "app_exception_exception", "label": "exception", "file_type": "code",
+         "source_file": "app/exception.ts", "source_location": "L1"},
+        {"id": "exception", "label": "exception", "file_type": "code", "source_file": ""},
+    ]
+    edges = [{"source": "pkg_FooApiException", "target": "exception", "relation": "inherits",
+              "source_file": "pkg/FooApiException.php", "weight": 1.0}]
+    _rewire_unique_stub_nodes(nodes, edges)
+    assert edges[0]["target"] == "exception"
+
+
+def test_rewire_builtin_supertype_guard_is_per_edge_not_per_stub():
+    """#2812: one sourceless `Exception` stub collects referrers from every
+    language that names it. A TypeScript referrer sharing the stub must not
+    re-open the cross-language bind for the PHP one — the guard reads the
+    referring file, not the union of the stub's referrer families."""
+    from graphify.extract import _rewire_unique_stub_nodes
+    nodes = [
+        {"id": "app_exception_Exception", "label": "Exception", "file_type": "code",
+         "source_file": "app/exception.ts", "source_location": "L1"},
+        {"id": "Exception", "label": "Exception", "file_type": "code", "source_file": ""},
+    ]
+    edges = [
+        {"source": "pkg_FooApiException", "target": "Exception", "relation": "inherits",
+         "source_file": "pkg/FooApiException.php", "weight": 1.0},
+        {"source": "app_http_HttpError", "target": "Exception", "relation": "inherits",
+         "source_file": "app/http.ts", "weight": 1.0},
+    ]
+    _rewire_unique_stub_nodes(nodes, edges)
+    assert edges[0]["target"] == "Exception"                 # PHP still blocked
+    assert edges[1]["target"] == "app_exception_Exception"   # TS still resolves
+
+
 def test_extract_emits_posix_source_file_for_relative_inputs(tmp_path):
     r"""source_file must be canonical POSIX on every node AND edge, whatever
     separator the caller's input paths used.
@@ -3966,3 +4069,42 @@ def test_inferred_uses_edge_dropped_for_module_top_level_reference(tmp_path):
     uses = _inferred_uses(result)
 
     assert not any(tgt == "helpers_helper" for _, tgt in uses)
+
+
+def test_extract_declined_data_json_is_not_failed(tmp_path, capsys):
+    """#2879: data JSON is declined by design (#1224), not failed.
+
+    A `.json` extractor is registered, so a declined file used to satisfy both
+    halves of the failed-source test (zero nodes + extractor exists) and was
+    re-queued on every incremental run because the CLI never stamped it as
+    processed.
+    """
+    pytest.importorskip("tree_sitter_json")
+    data = tmp_path / "meta.json"
+    data.write_text('{"pages": ["a", "b"], "title": "Docs"}\n')
+    cfg = tmp_path / "package.json"
+    cfg.write_text('{"dependencies": {"left-pad": "^1.0.0"}}\n')
+
+    result = extract([data, cfg], cache_root=tmp_path)
+    err = capsys.readouterr().err
+
+    assert result.get("failed_sources") == []
+    # ...and no "produced zero nodes" noise for a deliberate decline (#1666).
+    assert "zero nodes" not in err
+    # the config JSON still extracts normally
+    assert any(str(n.get("label", "")).startswith("package.json") for n in result["nodes"])
+
+
+def test_extract_genuinely_empty_json_still_failed(tmp_path, monkeypatch):
+    """#2879 guard: only an explicit `skipped` marker is exempt."""
+    pytest.importorskip("tree_sitter_json")
+    import graphify.extract as _ex
+
+    monkeypatch.setattr(
+        _ex, "_get_extractor",
+        lambda p: (lambda _p: {"nodes": [], "edges": []}) if p.suffix == ".json" else None,
+    )
+    p = tmp_path / "meta.json"
+    p.write_text("{}\n")
+    result = _ex.extract([p], cache_root=tmp_path)
+    assert [Path(x).name for x in result.get("failed_sources", [])] == ["meta.json"]

@@ -3714,13 +3714,29 @@ def _extract_generic(
                             if name_node is not None:
                                 fields[_read_text(name_node, source)] = type_name
                 line = node.start_point[0] + 1
-                metadata = {"ref_token": type_name}
-                if qualified:
-                    metadata["qualified"] = True
-                if qualifier:
-                    metadata["ref_qualifier"] = qualifier
-                add_edge(parent_class_nid, ensure_named_node(type_name, line),
-                         "references", line, context="field", metadata=metadata)
+                # Walk the whole type expression rather than only its outer name, so
+                # `Box<Widget>` yields the Box field ref AND the Widget generic_arg ref.
+                # Reading just the outer name left every generic argument in field
+                # position unlinked -- `IDbContextFactory<SomeContext>` lost SomeContext,
+                # and `Mock<IThing>` lost IThing across entire test suites. The C#
+                # property_declaration handler below and the tree_sitter_java
+                # field_declaration handler beside it already do exactly this; C# fields
+                # were the odd one out.
+                refs: list[tuple[str, str, bool, str]] = []
+                _csharp_collect_type_refs(
+                    type_node, source, False, refs, csharp_type_params
+                )
+                for ref_name, role, ref_qualified, ref_qualifier in refs:
+                    ctx = "generic_arg" if role == "generic_arg" else "field"
+                    target_nid = ensure_named_node(ref_name, line)
+                    if target_nid != parent_class_nid:
+                        metadata = {"ref_token": ref_name}
+                        if ref_qualified:
+                            metadata["qualified"] = True
+                        if ref_qualifier:
+                            metadata["ref_qualifier"] = ref_qualifier
+                        add_edge(parent_class_nid, target_nid, "references",
+                                 line, context=ctx, metadata=metadata)
             return
 
         if (config.ts_module == "tree_sitter_c_sharp"
@@ -3734,6 +3750,22 @@ def _extract_generic(
             # field. Use _csharp_collect_type_refs (like the Java/PHP/Kotlin
             # siblings) so `List<Widget>` yields both the List field ref and the
             # Widget generic_arg ref.
+            # A property becomes a node, the way a C++ data member does. Fields
+            # stay out: the id recipe casefolds and strips leading underscores, so
+            # `_count` and `Count` normalize to the same id, and emitting both
+            # would hand the node to whichever the parser reached first — in
+            # practice the private backing field, hiding the public member behind
+            # it. See #3006 for the follow-up.
+            prop_node_name = node.child_by_field_name("name")
+            if prop_node_name is not None:
+                property_name = _read_text(prop_node_name, source)
+                if property_name:
+                    property_line = node.start_point[0] + 1
+                    property_nid = _make_id(parent_class_nid, property_name)
+                    if property_nid not in seen_ids:
+                        add_node(property_nid, property_name, property_line)
+                        add_edge(parent_class_nid, property_nid, "defines",
+                                 property_line, context="field")
             type_node = node.child_by_field_name("type")
             if type_node is not None:
                 # Record the property's declared type for the method-scoped
@@ -3983,8 +4015,28 @@ def _extract_generic(
                     and any(c.type == "function_declarator" for c in d.children))
                 for d in decls
             )
-            if not is_method:
-                type_node = node.child_by_field_name("type")
+            type_node = node.child_by_field_name("type")
+            # A nested type (`class Inner { … };` inside a class body) is a
+            # field_declaration whose `type` field IS the class_specifier, so
+            # returning from this branch used to drop Inner and everything it
+            # declares — silently, with no parse error (#2876). Walk it as a
+            # class instead: the engine's existing nested-type handling gives
+            # it a `contains` edge from the enclosing type. The declarator loop
+            # below still runs, since `class Inner { } inst;` declares a member
+            # alongside the type.
+            # Only class/struct nested types are recovered here: `enum_specifier`
+            # is deliberately not in C++'s `class_types`, so a nested `enum` and
+            # its enumerators are still not emitted. That is outside #2876's scope
+            # (which is about nested class/struct and C++/CLI) and is left as a
+            # known gap rather than widened here.
+            is_nested_type = (
+                type_node is not None
+                and type_node.type in config.class_types
+                and type_node.child_by_field_name("body") is not None
+            )
+            if is_nested_type:
+                walk(type_node, parent_class_nid)
+            if not is_method and not is_nested_type:
                 if type_node is not None:
                     line = node.start_point[0] + 1
                     refs: list[tuple[str, str]] = []
@@ -4943,6 +4995,7 @@ def _extract_generic(
             swift_receiver: str | None = None
             member_receiver: str | None = None
             kotlin_qualified_prefix: str | None = None
+            csharp_qualified_prefix: str | None = None
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
@@ -5007,6 +5060,27 @@ def _extract_generic(
                                 if child.type == "identifier":
                                     callee_name = _read_text(child, source)
                                     break
+            elif config.ts_module == "tree_sitter_c_sharp" and node.type == "object_creation_expression":
+                # `new Foo(...)` keeps the constructed type in the `type` field, so
+                # the invocation path below never sees it and a type a method only
+                # constructs stays unlinked — the C# twin of the Java gap in #1373.
+                # Types reached solely through a method body are exactly the ones
+                # this misses: message classes handed straight to a bus
+                # (`Send(new OrderPlaced { ... })`) and locally built collaborators.
+                # `_read_csharp_type_name` drops the generic arguments and the
+                # namespace qualifier, so `new A.B.Cache<string>()` names `Cache`.
+                # Target-typed `new()` parses as `implicit_object_creation_expression`
+                # and stays out of `call_types`: naming it needs the declared type of
+                # whatever it is being assigned to, which is a separate problem.
+                # A qualifier written in source is kept for
+                # `_resolve_csharp_qualified_calls`, so `new A.B.Cache()` can still
+                # pick one of several `Cache` classes instead of hitting the
+                # ambiguity guard on the bare name.
+                type_info = _read_csharp_type_name(node.child_by_field_name("type"), source)
+                if type_info and type_info[0]:
+                    callee_name = type_info[0]
+                    if type_info[1] and type_info[2]:
+                        csharp_qualified_prefix = type_info[2]
             elif config.ts_module == "tree_sitter_c_sharp" and node.type == "invocation_expression":
                 # C#: the invoked function is the `function` field. A member call
                 # `recv.Method(...)` is a member_access_expression (receiver in its
@@ -5065,6 +5139,60 @@ def _extract_generic(
                                 else:
                                     callee_name = raw
                                 break
+                # C#: emit a `references[generic_arg]` edge for every type
+                # argument at the call site (`recv.Do<T>()`, the
+                # `services.AddScoped<ISvc, Impl>()` DI shape, static
+                # `Foo<IBar>()`). The property/return/parameter branches
+                # already walk their declared type for the same reason; the
+                # call-site branch didn't, so the type arguments never
+                # became nodes and dependency edges were silently erased
+                # (#2911). The C# class_declaration's field_declaration and
+                # property_declaration branches above are the direct
+                # analogue. The call-site function carries its type-arg list
+                # either as a `type_argument_list` child on a `generic_name`
+                # (static call) or as the same child on the
+                # `member_access_expression`'s `name` `generic_name` (member
+                # call); the fallback path uses raw text and never sees the
+                # structured type-arg list. The class declaration's
+                # field_declaration case is closed by the parallel fix in
+                # #2913; this branch covers what that PR deliberately left
+                # out.
+                if fn_node is not None:
+                    call_tal = None
+                    if fn_node.type == "member_access_expression":
+                        ma_name = fn_node.child_by_field_name("name")
+                        if ma_name is not None and ma_name.type == "generic_name":
+                            for tal_child in ma_name.children:
+                                if tal_child.type == "type_argument_list":
+                                    call_tal = tal_child
+                                    break
+                    elif fn_node.type == "generic_name":
+                        for tal_child in fn_node.children:
+                            if tal_child.type == "type_argument_list":
+                                call_tal = tal_child
+                                break
+                    if call_tal is not None:
+                        call_type_params = _csharp_type_parameters_in_scope(node, source)
+                        call_line = node.start_point[0] + 1
+                        for call_arg in call_tal.children:
+                            if not call_arg.is_named:
+                                continue
+                            call_refs: list[tuple[str, str, bool, str]] = []
+                            _csharp_collect_type_refs(
+                                call_arg, source, True, call_refs, call_type_params
+                            )
+                            for call_ref_name, _call_role, call_qualified, call_qualifier in call_refs:
+                                call_target = ensure_named_node(call_ref_name, call_line)
+                                if call_target == caller_nid:
+                                    continue
+                                call_meta = {"ref_token": call_ref_name}
+                                if call_qualified:
+                                    call_meta["qualified"] = True
+                                if call_qualifier:
+                                    call_meta["ref_qualifier"] = call_qualifier
+                                add_edge(caller_nid, call_target, "references",
+                                         call_line, context="generic_arg",
+                                         metadata=call_meta)
             elif config.ts_module == "tree_sitter_php":
                 # PHP: distinguish call expression subtypes
                 if node.type == "function_call_expression":
@@ -5248,6 +5376,16 @@ def _extract_generic(
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
+                    # A qualified `new A.B.Foo()` whose bare name matches only a
+                    # sourceless stub in this file would bind the call to the stub
+                    # and never reach _resolve_csharp_qualified_calls, the one pass
+                    # that can honour the namespace. Defer so it can.
+                    if (
+                        csharp_qualified_prefix
+                        and tgt_nid
+                        and not nid_to_sf.get(tgt_nid)
+                    ):
+                        tgt_nid = None
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:
@@ -5293,6 +5431,8 @@ def _extract_generic(
                     # class fields/properties are the base scope.
                     if config.ts_module == "tree_sitter_c_sharp":
                         rc_entry["lang"] = "csharp"
+                        if csharp_qualified_prefix:
+                            rc_entry["qualified_prefix"] = csharp_qualified_prefix
                         receiver_type = _csharp_scoped_receiver_type(
                             receiver_types, member_receiver, node.start_byte
                         )
