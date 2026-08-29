@@ -75,9 +75,27 @@ def run(db_path, output_dir="graphify-out", root=None,
         token_cost={"total": 0},
         root=root or str(Path(db_path).resolve().parent))
     (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
-    # B4: 经 export.to_json 写 node_link 格式（links 键 + backup_if_protected + prune_dangling）
-    to_json(G, communities, str(out / "graph.json"), force=True,
-            built_at_commit=None, community_labels={})
+    # B4: 经 export.to_json 写 node_link 格式（links 键）。
+    # 审查 fix（Important）：force=True 会绕过 #479 shrink-guard，使 DB 侧缩量
+    # （seed/refresh 丢失等）静默覆盖旧图。改 force=False 恢复保护——现有
+    # graph.json 节点数 >= 新图时 to_json 返回 False 拒绝写入，run() 据此报错，
+    # 防止重复跑进同一 output_dir 时旧图被静默缩量覆盖。
+    _ok = to_json(G, communities, str(out / "graph.json"), force=False,
+                  built_at_commit=None, community_labels={})
+    if not _ok:
+        from graphify.export import existing_graph_node_count, MALFORMED_GRAPH
+        _old_n = existing_graph_node_count(out / "graph.json")
+        if _old_n is MALFORMED_GRAPH:
+            _old_desc = "无法解析（疑似损坏或写入中途）"
+        else:
+            _old_desc = f"{_old_n} 个节点"
+        raise RuntimeError(
+            f"[run_analysis] shrink-guard 拦截写入 {out / 'graph.json'}："
+            f"现有图 {_old_desc}，新图 {G.number_of_nodes()} 个节点，拒绝覆盖"
+            f"（#479 防静默缩量）。若确认缩量是数据本身的真实变化，可手动删除 "
+            f"{out / 'graph.json'} 后重跑，或临时把 scripts/run_analysis.py 中 "
+            f"to_json 调用的 force=False 改为 force=True 强制重建。"
+        )
     if wiki:
         # C6: to_obsidian(G, communities, output_dir, community_labels=None, cohesion=None)（export.py:681 核读）
         to_obsidian(G, communities, str(out / "wiki"))
