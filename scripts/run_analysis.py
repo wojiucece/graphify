@@ -54,6 +54,9 @@ def run(db_path, output_dir="graphify-out", root=None,
             extraction = {"nodes": extraction["nodes"] + sem_nodes,
                            "edges": extraction["edges"] + sem_edges}
     G = build_from_json(extraction, root=root)
+    # C2: hyperedges 挂回图（export.py:180）；seed_hyperedges 已在 Task 6 seed 合并块备好
+    if seed_hyperedges:
+        attach_hyperedges(G, seed_hyperedges)
     communities = cluster(G)
     god_list = god_nodes(G)
     surprise_list = surprising_connections(G, communities=communities)  # 恒传 communities（Task 12 锁死路径）
