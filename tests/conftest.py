@@ -78,3 +78,10 @@ def pytest_collection_modifyitems(items: list[Any]) -> None:
             continue
         for warning_filter in _ANALYZE_WARNING_FILTERS:
             item.add_marker(pytest.mark.filterwarnings(warning_filter))
+
+
+import sys
+from pathlib import Path
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
