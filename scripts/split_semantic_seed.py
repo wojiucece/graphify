@@ -41,8 +41,25 @@ def split(graph_json_path, output_path=None, codegraph_db=None):
     seed_edges = [e for e in edges if e["source"] in sem_ids or e["target"] in sem_ids]
 
     anchor_remap = 0
-    if codegraph_db:  # Task 10 填充 .py 锚点改指
-        pass
+    if codegraph_db:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{Path(codegraph_db).resolve().as_posix()}?mode=ro", uri=True)
+        # 建 source_file -> codegraph file 节点 id 索引
+        sf_to_id = {row[1]: row[0] for row in conn.execute(
+            "SELECT id, file_path FROM nodes WHERE kind='file'")}
+        conn.close()
+        id_map = {}
+        for n in seed_nodes:
+            if n.get("source_file", "").endswith(".py") and n["source_file"] in sf_to_id:
+                old_id = n["id"]
+                new_id = sf_to_id[n["source_file"]]
+                if old_id != new_id:
+                    n["id"] = new_id
+                    id_map[old_id] = new_id
+                    anchor_remap += 1
+        for e in seed_edges:  # remap 边端点
+            e["source"] = id_map.get(e["source"], e["source"])
+            e["target"] = id_map.get(e["target"], e["target"])
 
     seed = {"nodes": seed_nodes, "edges": seed_edges, "hyperedges": hyperedges}
     stats = {"seed": seed, "semantic_nodes": len(sem_ids), "seed_edges": len(seed_edges),
