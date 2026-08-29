@@ -24,3 +24,27 @@ def test_version_gate_rejects_future_schema(tmp_path):
     _make_db_with_version(db, version=99)
     with pytest.raises(RuntimeError, match="schema.*99.*9"):
         load_codegraph(db, max_schema=9)
+
+
+def test_load_maps_nodes_and_edges():
+    from adapter import load_codegraph
+    result = load_codegraph(MINI_DB, max_schema=9)
+    assert len(result["nodes"]) > 0 and len(result["edges"]) > 0
+    n = result["nodes"][0]
+    assert set(n.keys()) >= {"id", "label", "source_file", "source_location", "kind", "language"}
+    assert n["source_location"].startswith("L") and n["source_location"][1:].isdigit()
+    e = result["edges"][0]
+    assert set(e.keys()) >= {"source", "target", "relation", "confidence"}
+    assert e["confidence"] in ("EXTRACTED", "INFERRED")
+
+
+def test_load_includes_file_nodes():
+    from adapter import load_codegraph
+    result = load_codegraph(MINI_DB, max_schema=9)
+    assert "file" in {n["kind"] for n in result["nodes"]}
+
+
+def test_load_provenance_to_confidence():
+    from adapter import load_codegraph
+    result = load_codegraph(MINI_DB, max_schema=9)
+    assert "EXTRACTED" in {e["confidence"] for e in result["edges"]}

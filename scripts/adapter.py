@@ -27,6 +27,39 @@ def load_codegraph(db_path: str | Path, max_schema: int = DEFAULT_MAX_SCHEMA) ->
     conn = _open_readonly(db_path)
     try:
         _check_schema(conn, max_schema)
-        return {"nodes": [], "edges": []}  # Task 3 填充
+        nodes = _map_nodes(conn)
+        edges = _map_edges(conn)
+        return {"nodes": nodes, "edges": edges}
     finally:
         conn.close()
+
+
+_PROVENANCE_CONFIDENCE = {"heuristic": "INFERRED"}
+
+
+def _map_nodes(conn):
+    out = []
+    for nid, qname, name, file_path, language, start_line, kind in conn.execute(
+        # COALESCE(start_line,1)：file 节点实测 start_line=1，但防御 NULL -> "LNone" 破坏 ^L\d 判层
+        "SELECT id, qualified_name, name, file_path, language, COALESCE(start_line,1), kind FROM nodes"):
+        out.append({
+            "id": nid,
+            "label": qname if qname else name,  # qualified_name 优先（§3.2）
+            "source_file": file_path,
+            "source_location": f"L{start_line}",  # ^L\d 判 AST 层
+            "kind": kind,
+            "language": language,
+        })
+    return out
+
+
+def _map_edges(conn):
+    out = []
+    for source, target, kind, provenance, metadata in conn.execute(
+        "SELECT source, target, kind, provenance, metadata FROM edges"):
+        out.append({
+            "source": source, "target": target,
+            "relation": kind,
+            "confidence": _PROVENANCE_CONFIDENCE.get(provenance or "", "EXTRACTED"),
+        })
+    return out
