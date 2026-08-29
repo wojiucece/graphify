@@ -69,6 +69,9 @@ def _is_file_node(G: nx.Graph, node_id: str) -> bool:
     from god nodes, surprising connections, and knowledge gap reporting.
     """
     attrs = G.nodes[node_id]
+    # CUSTOM: codegraph 适配器输出节点带 kind='file'，直接短路判定（§5.1，本地验证后提 PR）
+    if attrs.get("kind") == "file":
+        return True
     label = attrs.get("label", "")
     if not label:
         return False
