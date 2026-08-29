@@ -48,3 +48,32 @@ def test_load_provenance_to_confidence():
     from adapter import load_codegraph
     result = load_codegraph(MINI_DB, max_schema=9)
     assert "EXTRACTED" in {e["confidence"] for e in result["edges"]}
+
+
+def test_load_exports_knowledge_gaps(tmp_path):
+    """unresolved_refs status='failed' -> knowledge_gaps（§3.2，Phase 0 实测 32354 条）."""
+    from adapter import load_codegraph
+    db = tmp_path / "kg.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('function:a','function','a','a','a.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO unresolved_refs (from_node_id,reference_name,reference_kind,line,col,file_path,language,status,name_tail) VALUES ('function:a','missing_fn','references',10,5,'a.py','python','failed','missing_fn')")
+    conn.commit(); conn.close()
+    result = load_codegraph(db, max_schema=9)
+    gaps = result["knowledge_gaps"]
+    assert len(gaps) == 1
+    assert gaps[0]["ref"] == "missing_fn"
+    assert gaps[0]["node"] == "function:a"
+
+
+def test_knowledge_gaps_truncated_to_100(tmp_path):
+    """failed 超 100 条截断（防报告爆炸）."""
+    from adapter import load_codegraph
+    db = tmp_path / "many.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('function:a','function','a','a','a.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    for i in range(150):
+        conn.execute("INSERT INTO unresolved_refs (from_node_id,reference_name,reference_kind,line,col,file_path,language,status,name_tail) VALUES ('function:a',?,'references',?,0,'a.py','python','failed',?)", (f"miss{i}", i, f"miss{i}"))
+    conn.commit(); conn.close()
+    assert len(load_codegraph(db, max_schema=9)["knowledge_gaps"]) == 100

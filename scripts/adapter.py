@@ -29,9 +29,27 @@ def load_codegraph(db_path: str | Path, max_schema: int = DEFAULT_MAX_SCHEMA) ->
         _check_schema(conn, max_schema)
         nodes = _map_nodes(conn)
         edges = _map_edges(conn)
-        return {"nodes": nodes, "edges": edges}
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "knowledge_gaps": _map_knowledge_gaps(conn),
+        }
     finally:
         conn.close()
+
+
+_KG_TOP_N = 100  # 防 report 爆炸（Phase 0 实测 32354 条 failed）
+
+
+def _map_knowledge_gaps(conn):
+    """unresolved_refs status='failed' -> Knowledge Gaps 输入（§3.2）."""
+    out = []
+    for from_node, ref_name, line, file_path in conn.execute(
+        "SELECT from_node_id, reference_name, line, file_path "
+        "FROM unresolved_refs WHERE status='failed' LIMIT ?",
+        (_KG_TOP_N,)):
+        out.append({"ref": ref_name, "node": from_node, "file": file_path, "line": line})
+    return out
 
 
 _PROVENANCE_CONFIDENCE = {"heuristic": "INFERRED"}
