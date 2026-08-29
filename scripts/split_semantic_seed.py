@@ -50,9 +50,10 @@ def split(graph_json_path, output_path=None, codegraph_db=None):
         conn.close()
         id_map = {}
         for n in seed_nodes:
-            if n.get("source_file", "").endswith(".py") and n["source_file"] in sf_to_id:
+            sf = n.get("source_file") or ""  # 防 JSON null -> None 崩溃（真实旧图有 source_file=null 的节点）
+            if sf.endswith(".py") and sf in sf_to_id:
                 old_id = n["id"]
-                new_id = sf_to_id[n["source_file"]]
+                new_id = sf_to_id[sf]
                 if old_id != new_id:
                     n["id"] = new_id
                     id_map[old_id] = new_id

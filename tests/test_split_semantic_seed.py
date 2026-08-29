@@ -67,6 +67,35 @@ def test_split_remaps_py_anchor_by_source_file(tmp_path):
     assert stats["anchor_remap"] == 1
 
 
+def test_split_tolerates_null_source_file(tmp_path):
+    """生产 bug（Task 8 fork 迁移验收发现）：真实旧图有 source_file=null（JSON null -> None）的
+    semantic 概念节点与 ast 文件节点，锚点改指循环对 None.endswith 直接 AttributeError 崩溃.
+    修复后不抛异常，且 semantic 节点正常收进 seed."""
+    from split_semantic_seed import split
+    old = {
+        "nodes": [
+            # 两个 source_file=null 节点：semantic 概念 + 被边锚到的 ast 文件
+            {"id": "concept:nullsrc", "label": "N", "_origin": "semantic", "file_type": "concept", "source_file": None},
+            {"id": "file:src/app.py", "label": "app.py", "source_file": None, "_origin": "ast", "file_type": "code"},
+        ],
+        "links": [{"source": "concept:nullsrc", "target": "file:src/app.py", "relation": "documents", "_origin": "semantic"}],
+        "hyperedges": [],
+    }
+    old_path = tmp_path / "old-null.json"
+    old_path.write_text(json.dumps(old), encoding="utf-8")
+    import sqlite3
+    db = tmp_path / "cg.db"
+    _make_cg_db(db)
+    # 不抛异常即通过（None.endswith 崩溃点在锚点改指循环）
+    stats = split(old_path, output_path=None, codegraph_db=db)
+    seed = stats["seed"]
+    ids = {n["id"] for n in seed["nodes"]}
+    assert "concept:nullsrc" in ids  # semantic 节点正常收进 seed
+    assert "file:src/app.py" in ids  # 锚点文件节点正常携带
+    assert stats["semantic_nodes"] == 1
+    assert stats["anchor_remap"] == 0  # source_file=null 无从 remap，不误计
+
+
 def test_split_rejects_legacy_no_origin(tmp_path):
     """C8: 旧格式（无 _origin 键）拒绝作 seed——空 seed + 警告 + 不落盘.
     锁定控制器裁决：无 _origin 时不再继续拆（file_type 启发式已废弃），
