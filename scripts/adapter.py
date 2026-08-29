@@ -1,5 +1,6 @@
 """codegraph SQLite -> graphify 提取 schema 只读适配器（方案 §3）."""
 from __future__ import annotations
+import json as _json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ def load_codegraph(db_path: str | Path, max_schema: int = DEFAULT_MAX_SCHEMA) ->
         _check_schema(conn, max_schema)
         nodes = _map_nodes(conn)
         edges = _map_edges(conn)
+        _disambiguate_ids(nodes, edges)
         return {
             "nodes": nodes,
             "edges": edges,
@@ -71,13 +73,63 @@ def _map_nodes(conn):
     return out
 
 
+_GENERIC_RELATIONS = frozenset({"references", "uses", "mentions"})
+_RELATION_PRIORITY = {"calls":10,"imports":9,"contains":8,"extends":7,
+                      "implements":6,"instantiates":5,"decorates":4}
+
+
+def _relation_rank(kind: str) -> int:
+    return 0 if kind in _GENERIC_RELATIONS else _RELATION_PRIORITY.get(kind, 1)
+
+
 def _map_edges(conn):
-    out = []
+    pair_best = {}
     for source, target, kind, provenance, metadata in conn.execute(
         "SELECT source, target, kind, provenance, metadata FROM edges"):
-        out.append({
-            "source": source, "target": target,
-            "relation": kind,
-            "confidence": _PROVENANCE_CONFIDENCE.get(provenance or "", "EXTRACTED"),
-        })
-    return out
+        candidate = {"source": source, "target": target, "relation": kind,
+                     "confidence": _PROVENANCE_CONFIDENCE.get(provenance or "", "EXTRACTED")}
+        # C3: 展开 metadata，保留 synthesizedBy
+        if metadata:
+            try:
+                md = _json.loads(metadata)
+                if "synthesizedBy" in md:
+                    candidate["synthesized_by"] = md["synthesizedBy"]
+            except Exception:
+                pass
+        key = (source, target)
+        existing = pair_best.get(key)
+        if existing is None or _relation_rank(candidate["relation"]) > _relation_rank(existing["relation"]):
+            # C3: 败者 synthesizedBy 合入胜者（数组并集，非单值覆盖）
+            if existing and existing.get("synthesized_by"):
+                sb = set(existing.get("synthesized_by_list", [existing["synthesized_by"]]))
+                sb.update(candidate.get("synthesized_by_list", [candidate["synthesized_by"]] if candidate.get("synthesized_by") else []))
+                candidate["synthesized_by_list"] = sorted(sb)
+            pair_best[key] = candidate
+        elif candidate.get("synthesized_by"):
+            # 败者的 synthesizedBy 并入胜者数组
+            sb = set(existing.get("synthesized_by_list", [existing["synthesized_by"]] if existing.get("synthesized_by") else []))
+            sb.add(candidate["synthesized_by"])
+            existing["synthesized_by_list"] = sorted(sb)
+    return list(pair_best.values())
+
+
+def _disambiguate_ids(nodes, edges):
+    """normalize_id 后碰撞的 id 消歧，并同步 remap 边端点（A4）."""
+    from graphify.ids import normalize_id
+    groups = {}
+    for idx, n in enumerate(nodes):
+        groups.setdefault(normalize_id(n["id"]), []).append(idx)
+    id_map = {}  # old_id -> new_id
+    for norm, idxs in groups.items():
+        if len(idxs) <= 1:
+            continue
+        for suffix, idx in enumerate(idxs):
+            old = nodes[idx]["id"]
+            new = f"{old}__cg{suffix}"
+            nodes[idx]["id"] = new
+            id_map[old] = new
+    if not id_map:
+        return
+    for e in edges:
+        e["source"] = id_map.get(e["source"], e["source"])
+        e["target"] = id_map.get(e["target"], e["target"])

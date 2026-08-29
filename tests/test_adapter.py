@@ -77,3 +77,48 @@ def test_knowledge_gaps_truncated_to_100(tmp_path):
         conn.execute("INSERT INTO unresolved_refs (from_node_id,reference_name,reference_kind,line,col,file_path,language,status,name_tail) VALUES ('function:a',?,'references',?,0,'a.py','python','failed',?)", (f"miss{i}", i, f"miss{i}"))
     conn.commit(); conn.close()
     assert len(load_codegraph(db, max_schema=9)["knowledge_gaps"]) == 100
+
+
+def test_generic_relations_yield_to_specific(tmp_path):
+    """同 source->target 有 calls(specific) + references(generic) -> 保留 calls（§3.2）."""
+    from adapter import load_codegraph
+    db = tmp_path / "multi.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('function:a','function','a','a','a.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO nodes VALUES ('function:b','function','b','b','b.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO edges (source,target,kind,provenance) VALUES ('function:a','function:b','calls',NULL)")
+    conn.execute("INSERT INTO edges (source,target,kind,provenance,metadata) VALUES ('function:a','function:b','references',NULL,'{\"synthesizedBy\":\"dispatch\"}')")
+    conn.commit(); conn.close()
+    result = load_codegraph(db, max_schema=9)
+    pair = [e for e in result["edges"] if e["source"]=="function:a" and e["target"]=="function:b"]
+    assert len(pair) == 1
+    assert pair[0]["relation"] == "calls"
+    # C3: 败者 metadata.synthesizedBy 合入胜者（数组并集）
+    assert pair[0].get("synthesized_by") == "dispatch" or "dispatch" in pair[0].get("synthesized_by_list", [])
+
+
+def test_id_fold_collision_remaps_edges(tmp_path):
+    """真碰撞对：file:src/a+b.py vs file:src/a_b.py 经 normalize 都 -> file_src_a_b_py（A4）.
+    消歧后边端点必须同步 remap，否则 dangling."""
+    from adapter import load_codegraph
+    db = tmp_path / "collide.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('file:src/a+b.py','file','a+b.py','a+b.py','src/a+b.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO nodes VALUES ('file:src/a_b.py','file','a_b.py','a_b.py','src/a_b.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO nodes VALUES ('function:x','function','x','x','x.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    # 边引用两个碰撞 id
+    conn.execute("INSERT INTO edges (source,target,kind,provenance) VALUES ('file:src/a+b.py','function:x','contains',NULL)")
+    conn.execute("INSERT INTO edges (source,target,kind,provenance) VALUES ('file:src/a_b.py','function:x','contains',NULL)")
+    conn.commit(); conn.close()
+    result = load_codegraph(db, max_schema=9)
+    from graphify.ids import normalize_id
+    # 所有节点 id normalize 后唯一
+    norms = [normalize_id(n["id"]) for n in result["nodes"]]
+    assert len(set(norms)) == len(norms), f"碰撞未消歧: {norms}"
+    # 所有边端点 normalize 后仍指向图中存在的节点
+    node_norms = set(norms)
+    for e in result["edges"]:
+        assert normalize_id(e["source"]) in node_norms, f"dangling source: {e['source']}"
+        assert normalize_id(e["target"]) in node_norms, f"dangling target: {e['target']}"
