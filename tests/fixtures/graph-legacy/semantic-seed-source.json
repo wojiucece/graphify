@@ -1,0 +1,20 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {"hyperedges": []},
+  "nodes": [
+    {"id": "file:src/app.py", "label": "app.py", "source_file": "src/app.py", "_origin": "ast", "file_type": "code"},
+    {"id": "file:docs/auth.md", "label": "auth.md", "source_file": "docs/auth.md", "_origin": "ast", "file_type": "document"},
+    {"id": "concept:auth", "label": "认证", "source_file": "docs/auth.md", "_origin": "semantic", "file_type": "concept"},
+    {"id": "rationale:why-jwt", "label": "为何用JWT", "source_file": "docs/auth.md", "_origin": "semantic", "file_type": "rationale"}
+  ],
+  "links": [
+    {"source": "concept:auth", "target": "file:src/app.py", "relation": "documents", "_origin": "semantic"},
+    {"source": "concept:auth", "target": "file:docs/auth.md", "relation": "documents", "_origin": "semantic"},
+    {"source": "rationale:why-jwt", "target": "concept:auth", "relation": "supports", "_origin": "semantic"}
+  ],
+  "hyperedges": [
+    {"id": "auth_cluster", "label": "认证知识簇", "nodes": ["concept:auth", "rationale:why-jwt"]}
+  ],
+  "built_at_commit": null
+}
