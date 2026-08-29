@@ -67,6 +67,27 @@ def test_split_remaps_py_anchor_by_source_file(tmp_path):
     assert stats["anchor_remap"] == 1
 
 
+def test_split_rejects_legacy_no_origin(tmp_path):
+    """C8: 旧格式（无 _origin 键）拒绝作 seed——空 seed + 警告 + 不落盘.
+    锁定控制器裁决：无 _origin 时不再继续拆（file_type 启发式已废弃），
+    未来若有人回退到按 file_type 继续拆，本测试立即红."""
+    from split_semantic_seed import split
+    legacy = {
+        "nodes": [{"id": "x", "label": "X", "file_type": "concept"}],
+        "links": [],
+        "hyperedges": [],
+    }
+    old_path = tmp_path / "legacy.json"
+    old_path.write_text(json.dumps(legacy), encoding="utf-8")
+    out = tmp_path / "should-not-exist.json"
+    stats = split(old_path, output_path=out)
+    seed = stats["seed"]
+    assert seed["nodes"] == [] and seed["edges"] == [] and seed["hyperedges"] == []
+    assert stats["legacy_format"] is True
+    assert stats["warning"]  # 非空：拒绝原因提示
+    assert not out.exists()  # 拒绝路径不产出空种子文件
+
+
 def _make_cg_db(db):
     import sqlite3
     conn = sqlite3.connect(db)
