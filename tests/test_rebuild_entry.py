@@ -126,3 +126,13 @@ def test_stale_lock_taken_over(tmp_path):
     import pytest
     with pytest.raises(FileNotFoundError, match="codegraph init"):
         rebuild_entry.rebuild(tmp_path)
+
+
+def test_parse_refresh_filters_empty_segments():
+    """M1（用户审查）：CLI refresh 解析过滤空段。"a.md," 此前产生
+    Path('') -> Path('.')，refresh 指向整个 CWD；与 run_analysis.py CLI 已有的
+    空段过滤不一致。None 透传（无 refresh 语义）。"""
+    import rebuild_entry
+    assert rebuild_entry._parse_refresh("a.md,") == [Path("a.md")]
+    assert rebuild_entry._parse_refresh("a.md,,b.md") == [Path("a.md"), Path("b.md")]
+    assert rebuild_entry._parse_refresh(None) is None

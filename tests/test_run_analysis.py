@@ -112,7 +112,7 @@ def test_run_shrink_guard_blocks_silent_overwrite(tmp_path):
     assert json.loads(graph.read_text(encoding="utf-8")) == fake
 
 
-def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path):
+def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path, monkeypatch):
     """砖死回归（用户实测复现，两轮沙箱模拟）：refresh 产物此前只合入内存
     extraction，从不写回 seed 文件——.md 编辑产生 refresh 后，任何不带 refresh
     的重建（.py 编辑 / SessionEnd hook 触发面）产出 adapter-only 图 ->
@@ -121,8 +121,16 @@ def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path):
     修复后：refresh 合入后落盘 <out>/semantic-seed.json（与 rebuild_entry C1
     默认发现路径一致），下一轮无 refresh 的 run() 自动拾取，链路闭合不再砖死。
     """
+    # M2（用户审查）：extract() 的 cache 锚定 CWD（extract.py:5765 cache_location
+    # = Path('.').resolve()）——chdir 进沙箱，防 AST cache 写进真实仓库 graphify-out/cache/ast/
+    monkeypatch.chdir(tmp_path)
     from run_analysis import run
-    md = tmp_path / "notes.md"
+    # md 放进 root（fixture-src/）内：chdir 后 root 与 tmp 同盘，root 外文件走
+    # relpath 折叠分支（updepth=1）得 '../notes.md'，_sf_match 后缀匹配失效会
+    # 破坏 upsert 断言语义；root 内文件归一为 'notes.md'，与原（跨盘裸名）形态一致。
+    md_dir = tmp_path / "fixture-src"
+    md_dir.mkdir(parents=True, exist_ok=True)
+    md = md_dir / "notes.md"
     md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
                   encoding="utf-8")
     out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
@@ -145,11 +153,17 @@ def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path):
         f"第二轮丢失 semantic 节点: {sem_ids1 - sem_ids2}"
 
 
-def test_refresh_upsert_no_duplicate_growth(tmp_path):
+def test_refresh_upsert_no_duplicate_growth(tmp_path, monkeypatch):
     """upsert 语义（按 source_file 替换，防重复膨胀）：同一 .md 文件连续两次
     refresh，seed 中该文件的节点数不翻倍（第二次 = 先删同源旧节点/边再插入）。"""
+    # M2（用户审查）：chdir 进沙箱，防 extract() 的 CWD 锚定 cache 污染真实仓库。
+    # md 同步移入 root（fixture-src/）内：chdir 后 root 外文件 source_file 归一为
+    # '../notes.md'，_sf_match 后缀匹配失效；root 内归一为 'notes.md'（原形态）。
+    monkeypatch.chdir(tmp_path)
     from run_analysis import run
-    md = tmp_path / "notes.md"
+    md_dir = tmp_path / "fixture-src"
+    md_dir.mkdir(parents=True, exist_ok=True)
+    md = md_dir / "notes.md"
     md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
                   encoding="utf-8")
     out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
@@ -200,3 +214,13 @@ def test_large_graph_end_to_end_not_timeout(tmp_path):
     assert (Path(out) / "GRAPH_REPORT.md").exists()
     # 行为断言：10k 节点量级应在 120s 内完成（采样生效证据，非硬超时上限）
     assert elapsed < 120, f"大图分析耗时 {elapsed:.1f}s 异常，可能采样未生效"
+
+
+def test_parse_refresh_filters_empty_segments():
+    """M1（用户审查）：CLI refresh 解析过滤空段，与 rebuild_entry._parse_refresh 同款
+    （自包含副本，两端一致）。"a.md," 此前产生 Path('') -> Path('.')，refresh 指向
+    整个 CWD。None 透传（无 refresh 语义）。"""
+    import run_analysis
+    assert run_analysis._parse_refresh("a.md,") == [Path("a.md")]
+    assert run_analysis._parse_refresh("a.md,,b.md") == [Path("a.md"), Path("b.md")]
+    assert run_analysis._parse_refresh(None) is None

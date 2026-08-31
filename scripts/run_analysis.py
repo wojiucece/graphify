@@ -51,6 +51,10 @@ def _sf_match(sf, rf) -> bool:
 
 def run(db_path, output_dir="graphify-out", root=None,
         semantic_seed=None, semantic_refresh=None, wiki=False) -> Path:
+    """编排 codegraph 提取 -> build -> cluster -> analyze -> report -> export（方案 §3.1 链路）.
+
+    # CUSTOM: semantic_refresh 的 extract() 缓存锚定 CWD（graphify 既有行为）：hook/watch 场景 CWD=项目根故正确；从任意目录直调 CLI 时 cache 落在 CWD 下 graphify-out/cache/——cache 位置随 CWD 漂移，--output-dir 只管产物不管 cache。
+    """
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     extraction = load_codegraph(db_path)
     # CUSTOM: knowledge_gaps 写 sidecar（最终审查 I1，C4 接线）。load_codegraph 返回的
@@ -197,13 +201,23 @@ def diff(prev_graph, db_path, root=None) -> dict:
     """上轮 graph.json vs 本次 codegraph 重建的差分（B1 单库原地同步形态）.
     root 必须与产出 prev_graph 的 run() 一致，否则 source_file 归一化不同 -> 假 diff。"""
     prev_data = json.loads(Path(prev_graph).read_text(encoding="utf-8"))
-    # 从 prev graph.json 重建 G_old（node_link 格式）
-    import networkx as nx
+    # 从 prev graph.json 重建 G_old（node_link 格式；nx 用模块顶部导入，不再局部重复导入）
     G_old = nx.node_link_graph(prev_data, edges="links" if "links" in prev_data else "edges")
     extraction = load_codegraph(db_path)
     G_new = build_from_json(extraction, root=root)
     # 返回键名：new_nodes/removed_nodes/new_edges/removed_edges/summary（analyze.py:556）
     return _graph_diff(G_old, G_new)
+
+
+def _parse_refresh(s: str | None) -> list[Path] | None:
+    """CLI --semantic-refresh 逗号分隔解析：过滤空段（用户审查 M1，两端一致）.
+
+    rebuild_entry.py 持自包含同名副本（scripts 无包结构，不互相导入）：
+    "a.md," 不产生 Path('') -> Path('.')（refresh 指向整个 CWD）。
+    None 透传（无 refresh 语义）；"" 返回 []（falsy，下游 if semantic_refresh 等价）。"""
+    if s is None:
+        return None
+    return [Path(p) for p in s.split(",") if p]
 
 
 if __name__ == "__main__":
@@ -216,6 +230,7 @@ if __name__ == "__main__":
     ap.add_argument("--semantic-refresh", default=None)
     ap.add_argument("--wiki", action="store_true")
     args = ap.parse_args()
-    # CUSTOM: 逗号分隔 -> 列表并过滤空段（最终审查 M-a）。字符串直接传给 run() 会按字符迭代
-    refresh = [p for p in args.semantic_refresh.split(",") if p] if args.semantic_refresh else None
+    # CUSTOM: 逗号分隔 -> 列表并过滤空段（最终审查 M-a；用户审查 M1 抽成 _parse_refresh 两端一致）。
+    # 字符串直接传给 run() 会按字符迭代
+    refresh = _parse_refresh(args.semantic_refresh)
     print(f"分析完成: {run(args.db_path, args.output_dir, args.root, args.semantic_seed, refresh, args.wiki)}")

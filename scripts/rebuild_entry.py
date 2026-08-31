@@ -146,6 +146,17 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
             pass
 
 
+def _parse_refresh(s: str | None) -> list[Path] | None:
+    """CLI --semantic-refresh 逗号分隔解析：过滤空段（用户审查 M1，两端一致）.
+
+    "a.md," 此前产生 Path('') -> Path('.')，refresh 指向整个 CWD（与 run_analysis.py
+    CLI 已有的空段过滤不一致）。scripts 无包结构，两文件各持自包含副本，不互相导入。
+    None 透传（无 refresh 语义）；"" 返回 []（falsy，下游 if semantic_refresh 等价）。"""
+    if s is None:
+        return None
+    return [Path(p) for p in s.split(",") if p]
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="codegraph sync + graphify 分析重建（单一入口）")
     ap.add_argument("--project", required=True, help="项目根")
@@ -155,7 +166,8 @@ if __name__ == "__main__":
     ap.add_argument("--semantic-refresh", default=None, help="逗号分隔的语义文件路径")
     ap.add_argument("--skip-sync", action="store_true")
     args = ap.parse_args()
-    refresh = [Path(p) for p in args.semantic_refresh.split(",")] if args.semantic_refresh else None
+    # CUSTOM: 经 _parse_refresh 过滤空段（M1）："a.md," 不再产生 Path('') -> '.'
+    refresh = _parse_refresh(args.semantic_refresh)
     rebuild(args.project, db_path=Path(args.db) if args.db else None,
             out_dir=Path(args.out_dir) if args.out_dir else None,
             semantic_seed=Path(args.semantic_seed) if args.semantic_seed else None,
