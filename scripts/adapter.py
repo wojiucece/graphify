@@ -84,10 +84,17 @@ def _relation_rank(kind: str) -> int:
 
 def _map_edges(conn):
     pair_best = {}
-    for source, target, kind, provenance, metadata in conn.execute(
-        "SELECT source, target, kind, provenance, metadata FROM edges"):
+    # L1（用户审查）：codegraph edges 表无文件列，LEFT JOIN 取 source 端点 file_path
+    # 补边 source_file（方案 §3.2 映射缺口，消 build REQUIRED_EDGE_FIELDS 告警）。
+    # validate.py 对边只查键存在（缺失键才告警），None 值不告警，故端点缺失的
+    # dangling 边经 LEFT JOIN 保留 source_file=None 不丢键；build 图阶段对 falsy
+    # 边 source_file 本就回退端点节点值兜底（build.py 边循环 if not attrs.get("source_file")）。
+    for source, target, kind, provenance, metadata, src_file in conn.execute(
+        "SELECT e.source, e.target, e.kind, e.provenance, e.metadata, n.file_path "
+        "FROM edges e LEFT JOIN nodes n ON e.source = n.id"):
         candidate = {"source": source, "target": target, "relation": kind,
-                     "confidence": _PROVENANCE_CONFIDENCE.get(provenance or "", "EXTRACTED")}
+                     "confidence": _PROVENANCE_CONFIDENCE.get(provenance or "", "EXTRACTED"),
+                     "source_file": src_file}
         # C3: 展开 metadata，保留 synthesizedBy
         if metadata:
             try:

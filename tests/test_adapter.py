@@ -122,3 +122,36 @@ def test_id_fold_collision_remaps_edges(tmp_path):
     for e in result["edges"]:
         assert normalize_id(e["source"]) in node_norms, f"dangling source: {e['source']}"
         assert normalize_id(e["target"]) in node_norms, f"dangling target: {e['target']}"
+
+
+def test_edges_carry_source_file_from_source_node(tmp_path):
+    """L1（用户审查）：边 source_file = source 端点节点的 file_path.
+    codegraph edges 表无文件列，LEFT JOIN nodes 补齐（消 build REQUIRED_EDGE_FIELDS 告警）."""
+    from adapter import load_codegraph
+    db = tmp_path / "sf.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('function:a','function','a','a','src/a.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO nodes VALUES ('function:b','function','b','b','src/b.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO edges (source,target,kind,provenance) VALUES ('function:a','function:b','calls',NULL)")
+    conn.commit(); conn.close()
+    result = load_codegraph(db, max_schema=9)
+    pair = [e for e in result["edges"] if e["source"]=="function:a" and e["target"]=="function:b"]
+    assert len(pair) == 1
+    assert pair[0]["source_file"] == "src/a.py"  # 取 source 端点，非 target 的 src/b.py
+
+
+def test_dangling_edge_keeps_source_endpoint_file(tmp_path):
+    """L1：dangling 边（target 无对应节点）不被丢，source_file 仍取 source 端点（LEFT JOIN 语义）."""
+    from adapter import load_codegraph
+    db = tmp_path / "dangle.db"
+    _make_db_with_version(db, version=9)
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO nodes VALUES ('function:a','function','a','a','src/a.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
+    conn.execute("INSERT INTO edges (source,target,kind,provenance) VALUES ('function:a','function:ghost','calls',NULL)")
+    conn.commit(); conn.close()
+    result = load_codegraph(db, max_schema=9)  # 不抛异常
+    pair = [e for e in result["edges"] if e["source"]=="function:a"]
+    assert len(pair) == 1
+    assert pair[0]["target"] == "function:ghost"
+    assert pair[0]["source_file"] == "src/a.py"
