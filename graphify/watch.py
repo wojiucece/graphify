@@ -5,6 +5,7 @@ import json
 import os
 import posixpath
 import re
+import subprocess  # CUSTOM: _trigger_rebuild 启动 rebuild_entry 子进程
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,45 @@ _QUICK_SYNC_MAX_PENDING = 2      # ≤2 文件走快窗（codegraph QUICK_SYNC_M
 _QUICK_SYNC_QUIET = 0.3          # 快窗 300ms（codegraph QUICK_SYNC_QUIET_MS / 1000）
 _MAX_SYNC_FAILURE_RETRIES = 5    # 连续重建失败上限（codegraph MAX_SYNC_FAILURE_RETRIES）
 _MAX_RETRY_BACKOFF = 30.0        # 退避上限 30s（codegraph MAX_RETRY_BACKOFF_MS / 1000）
+
+# CUSTOM: Phase 3 拓扑切换（方案 §6.2）--代码索引职能移交 codegraph。
+# AST 可提取文件 -> rebuild_entry（sync + 适配器重建）；
+# 非 AST 文件（.md/.pdf/...）-> 作为 semantic_refresh 随入口重建（保留语义提取职能）。
+from graphify.extract import _get_extractor as _ge
+
+# 模块级 build_from_json 引用：仅作测试 patch 目标（tests/test_watch_rebuild_trigger.py
+# 退役断言 "build_from_json 不被调"）。_rebuild_code 内部仍局部导入（延迟加载惯例），
+# 此引用不参与执行路径。
+from graphify.build import build_from_json  # noqa: F401
+
+
+def _trigger_rebuild(watch_root: Path, semantic_refresh: list[Path], skip_sync: bool) -> None:
+    entry = Path(__file__).resolve().parent.parent / "scripts" / "rebuild_entry.py"
+    cmd = [sys.executable, str(entry), "--project", str(watch_root)]
+    if semantic_refresh:
+        cmd += ["--semantic-refresh", ",".join(map(str, semantic_refresh))]
+    if skip_sync:
+        cmd += ["--skip-sync"]
+    subprocess.Popen(cmd, start_new_session=True,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+# 设计上 .md 家族走语义层（semantic_refresh）：graphify 的 _get_extractor 含 markdown AST
+# 提取器（extract_markdown），但新架构下文档归 codegraph 域外的语义面——显式划回非 AST 侧
+# （brief 设计注释 "非 AST 文件（.md/.pdf/...）"，测试 test_semantic_files_route_with_refresh 据此）。
+_SEMANTIC_DOC_SUFFIXES = frozenset({".md", ".mdx", ".qmd", ".skill"})
+
+
+def _route_flush_batch(watch_root: Path, changed_files: list[Path]) -> None:
+    """flush 批次分流：AST 文件 -> rebuild_entry(sync+重建)；非 AST -> semantic_refresh."""
+    ast_files = [p for p in changed_files
+                 if _ge(p) is not None and p.suffix.lower() not in _SEMANTIC_DOC_SUFFIXES]
+    non_ast_files = [p for p in changed_files
+                     if _ge(p) is None or p.suffix.lower() in _SEMANTIC_DOC_SUFFIXES]
+    if ast_files:
+        _trigger_rebuild(watch_root, non_ast_files, skip_sync=False)   # 含 AST -> 触发 sync + 重建
+    elif non_ast_files:
+        _trigger_rebuild(watch_root, non_ast_files, skip_sync=True)    # 纯非 AST -> 仅语义重提取，跳过 sync
 
 
 def _queue_pending(out_dir: Path, changed_paths: list[Path]) -> None:
@@ -1661,6 +1701,15 @@ def _rebuild_code(
             "total_words": detected.get("total_words", 0),
         }
 
+        # CUSTOM: Phase 3 拓扑切换 -- flush 路由（方案 §6.2）：代码索引职能移交 codegraph。
+        # codegraph 项目（有 .codegraph/codegraph.db）改走单一重建入口 rebuild_entry，
+        # 原 build_from_json 代码索引分支退役；非 codegraph 项目（迁移期）回退旧 pipeline 兜底，
+        # 避免无 codegraph 的存量项目 watch/update 静默失效（rebuild_entry 无 db 会 FileNotFoundError）。
+        # 仅增量批次（changed_paths 非 None）路由——watch 循环已传 flush 批次，全量重建（CLI）暂留旧路径。
+        if changed_paths is not None and (watch_root / ".codegraph" / "codegraph.db").exists():
+            _route_flush_batch(watch_path, changed_paths)
+            return True
+
         # Inherit the existing graph's directed flag (#2342) so `graphify
         # update` can't silently downgrade a directed graph to undirected -
         # build_from_json defaults to directed=False otherwise.
@@ -2079,7 +2128,9 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
             # 上游 0.9.33+ 用 _batch_triggers_rebuild / _batch_needs_llm_flag 替代手动 has_code/has_non_code
             if _batch_triggers_rebuild(batch):
                 # CUSTOM: 失败计数 + 退避/降级（移植 codegraph flush 的 try/finally 退避）
-                ok = _rebuild_code(watch_path)
+                # CUSTOM: Phase 3 -- 把 flush 批次传给 _rebuild_code（增量路径），
+                # 汇聚点据此路由到 rebuild_entry（AST 批次 sync+重建 / 非 AST 作 semantic_refresh）。
+                ok = _rebuild_code(watch_path, changed_paths=batch)
                 if not ok:
                     failure_count += 1
                     backoff = min(debounce * 2 ** max(0, failure_count - 1), _MAX_RETRY_BACKOFF)
