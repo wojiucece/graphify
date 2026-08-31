@@ -82,6 +82,15 @@ def run(db_path, output_dir="graphify-out", root=None,
         seed_nodes = list(_seed_raw.get("nodes", []))
         seed_edges = list(_seed_raw.get("edges", []))
         seed_hyperedges = list(_seed_raw.get("hyperedges", []))
+    elif semantic_seed is not None:
+        # CUSTOM: 显式 seed 路径不存在 -> stderr 警告（用户回归报告：此前旧代码
+        # FileNotFoundError 当场 crash，拼错能立刻发现；静默跳过后产出 adapter-only 图
+        # 零警告）。保留 fail-loud：警告含传入路径 + 修复提示，不阻断主重建。
+        print(f"[run_analysis] 警告: 显式 --semantic-seed 路径不存在: {seed_path}"
+              f"——请检查 --semantic-seed 拼写；将按 adapter-only 图继续（无语义面）",
+              file=sys.stderr)
+    # 默认发现路径（semantic_seed is None，即 <out>/semantic-seed.json 不存在）不打警告：
+    # 那是正常首轮场景（无种子从 adapter 冷启动），不是拼错。
     # semantic_refresh（修订方案 §1.4 要求）：对每个 refresh 文件做语义提取，
     # 按 source_file 身份 upsert 进 seed 状态（无 seed 则建）。
     if semantic_refresh:

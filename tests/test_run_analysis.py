@@ -59,6 +59,21 @@ def test_run_warns_on_symbolic_anchor_violations(tmp_path, capfd):
     assert (Path(out) / "graph.json").exists()
 
 
+def test_run_warns_on_missing_explicit_seed(tmp_path, capfd):
+    """用户回归报告：显式 --semantic-seed 传不存在路径 -> stderr 警告（fail-loud 保留）.
+    旧代码传错路径当场 FileNotFoundError crash（拼错能立刻发现）；静默跳过则产出
+    adapter-only 图零警告。修复后：警告含路径/关键词，且 run 不抛异常、正常产出 graph.json。"""
+    from run_analysis import run
+    missing = tmp_path / "nonexistent.json"
+    out = run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
+              semantic_seed=missing)
+    # 不抛异常、正常产出
+    assert (Path(out) / "graph.json").exists()
+    captured = capfd.readouterr()
+    assert "semantic-seed" in captured.err or str(missing) in captured.err, \
+        f"stderr 未含 seed 路径警告: {captured.err!r}"
+
+
 def test_run_writes_knowledge_gaps_sidecar(tmp_path):
     """I1/C4 接线（最终审查）：knowledge_gaps 写 <out>/knowledge-gaps.json.
     load_codegraph 返回的 knowledge_gaps 原零消费；fixture DB 有 1 条 failed ref
