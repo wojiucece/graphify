@@ -19,6 +19,12 @@ cd "$cwd" || exit 0
 # rebuild_entry 是分钟级（sync + 全量 cluster/analyze/report），hook 面同步执行会超时强杀
 # -> finally 不执行 -> 锁残留 -> 后续三触发面全 exit 3。改为后台 detach（与注释意图一致），
 # rebuild_entry 内的 stale 锁检测兜底强杀场景。
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="${GRAPHIFY_PYTHON:-python}"
-nohup "$PYTHON" "$SCRIPT_DIR/rebuild_entry.py" --project "$cwd" > /tmp/graphify-rebuild.log 2>&1 &
+# Fix I2：无 .codegraph 的非 codegraph 项目回退旧 graphify update 路径（rebuild_entry 会
+# FileNotFoundError 静默失效，graph.json 不再更新）——与 watch 汇聚点的门控回退对称。
+if [ -d "$cwd/.codegraph" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PYTHON="${GRAPHIFY_PYTHON:-python}"
+    nohup "$PYTHON" "$SCRIPT_DIR/rebuild_entry.py" --project "$cwd" > /tmp/graphify-rebuild.log 2>&1 &
+else
+    graphify update . > /tmp/graphify-sessionend-update.log 2>&1
+fi
