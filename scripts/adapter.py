@@ -100,8 +100,13 @@ def _map_edges(conn):
         existing = pair_best.get(key)
         if existing is None or _relation_rank(candidate["relation"]) > _relation_rank(existing["relation"]):
             # C3: 败者 synthesizedBy 合入胜者（数组并集，非单值覆盖）
-            if existing and existing.get("synthesized_by"):
-                sb = set(existing.get("synthesized_by_list", [existing["synthesized_by"]]))
+            # M-b（最终审查）：existing 可能只有并集后的 synthesized_by_list 而无单值键
+            # （此前更高 rank 边置换时生成）——get 的默认参数急切求值，
+            # [existing["synthesized_by"]] 在无单值键时会 KeyError，须分步取。
+            if existing and (existing.get("synthesized_by") or existing.get("synthesized_by_list")):
+                sb = set(existing.get("synthesized_by_list") or [])
+                if existing.get("synthesized_by"):
+                    sb.add(existing["synthesized_by"])
                 sb.update(candidate.get("synthesized_by_list", [candidate["synthesized_by"]] if candidate.get("synthesized_by") else []))
                 candidate["synthesized_by_list"] = sorted(sb)
             pair_best[key] = candidate

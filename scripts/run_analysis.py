@@ -10,7 +10,7 @@ if str(_ROOT) not in sys.path:
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # import adapter
 
 import networkx as nx
-from adapter import load_codegraph
+from adapter import load_codegraph, validate_semantic_anchors  # CUSTOM: validate_semantic_anchors 为 B2 接线（最终审查 I1）
 from graphify.build import build_from_json
 from graphify.cluster import cluster
 from graphify.analyze import god_nodes, surprising_connections, find_import_cycles, graph_diff as _graph_diff
@@ -22,10 +22,23 @@ def run(db_path, output_dir="graphify-out", root=None,
         semantic_seed=None, semantic_refresh=None, wiki=False) -> Path:
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     extraction = load_codegraph(db_path)
+    # CUSTOM: knowledge_gaps 写 sidecar（最终审查 I1，C4 接线）。load_codegraph 返回的
+    # knowledge_gaps（codegraph unresolved_refs status='failed'，adapter 已截断 Top 100）
+    # 此前仅存在于返回值零消费——落地 <out>/knowledge-gaps.json 供人工/工具读取消费。
+    (out / "knowledge-gaps.json").write_text(
+        json.dumps(extraction.get("knowledge_gaps", []), ensure_ascii=False, indent=2),
+        encoding="utf-8")
     # semantic_seed 合并（Task 7 补 hyperedges 挂回）
     seed_hyperedges = []
     if semantic_seed is not None:
         seed = json.loads(Path(semantic_seed).read_text(encoding="utf-8"))
+        # CUSTOM: semantic 锚定校验（最终审查 I1，B2 接线）。semantic 边锚定符号级节点
+        # （codegraph kind:hash 形态 id，符号移动行号即变 id）易失——违规仅告警 stderr
+        # 不阻断：存量种子可能有合法悬挂锚点，提示后由用户自行决定是否修种子。
+        _violations = validate_semantic_anchors(seed)
+        if _violations:
+            print(f"CUSTOM: semantic 语义锚定违规 {len(_violations)} 条，首条: {_violations[0]}",
+                  file=sys.stderr)
         extraction = {"nodes": extraction["nodes"] + seed.get("nodes", []),
                        "edges": extraction["edges"] + seed.get("edges", [])}
         seed_hyperedges = seed.get("hyperedges", [])
@@ -48,7 +61,8 @@ def run(db_path, output_dir="graphify-out", root=None,
                 sem_edges += r.get("edges", [])
             except Exception as e:
                 # A: 至少落一条 stderr 日志，避免 extract 失败被静默吞掉（零产出无感知）
-                import sys
+                # （sys 用模块顶部导入；此处曾有局部 import sys 使 sys 变为函数局部变量，
+                #  导致 run() 前段的 stderr 告警 UnboundLocalError——最终审查 I1 接线时移除）
                 print(f"[run_analysis] semantic_refresh 提取失败 {rf}: {e}", file=sys.stderr)
         if sem_nodes or sem_edges:
             extraction = {"nodes": extraction["nodes"] + sem_nodes,
@@ -125,4 +139,6 @@ if __name__ == "__main__":
     ap.add_argument("--semantic-refresh", default=None)
     ap.add_argument("--wiki", action="store_true")
     args = ap.parse_args()
-    print(f"分析完成: {run(args.db_path, args.output_dir, args.root, args.semantic_seed, args.semantic_refresh, args.wiki)}")
+    # CUSTOM: 逗号分隔 -> 列表并过滤空段（最终审查 M-a）。字符串直接传给 run() 会按字符迭代
+    refresh = [p for p in args.semantic_refresh.split(",") if p] if args.semantic_refresh else None
+    print(f"分析完成: {run(args.db_path, args.output_dir, args.root, args.semantic_seed, refresh, args.wiki)}")

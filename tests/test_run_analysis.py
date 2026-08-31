@@ -40,6 +40,39 @@ def test_run_merges_seed_and_attaches_hyperedges(tmp_path):
     assert any(h["id"] == "auth_cluster" for h in hes), "hyperedges 未挂回"
 
 
+def test_run_warns_on_symbolic_anchor_violations(tmp_path, capfd):
+    """I1/B2 接线（最终审查）：seed 含符号级锚点（function:xxx）-> stderr 告警但不阻断.
+    validate_semantic_anchors 原仅测试调用；接线后 run() 内消费（违规只提示，不跑不炸）。"""
+    from run_analysis import run
+    seed = {
+        "nodes": [{"id": "concept:auth", "label": "认证", "_origin": "semantic", "file_type": "concept"}],
+        "edges": [{"source": "concept:auth", "target": "function:abc123", "relation": "documents"}],
+        "hyperedges": [],
+    }
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps(seed), encoding="utf-8")
+    out = run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src", semantic_seed=seed_path)
+    captured = capfd.readouterr()
+    assert "语义锚定违规" in captured.err, f"stderr 未含锚定违规告警: {captured.err!r}"
+    assert "function:abc123" in captured.err
+    # 不阻断：run 正常产出
+    assert (Path(out) / "graph.json").exists()
+
+
+def test_run_writes_knowledge_gaps_sidecar(tmp_path):
+    """I1/C4 接线（最终审查）：knowledge_gaps 写 <out>/knowledge-gaps.json.
+    load_codegraph 返回的 knowledge_gaps 原零消费；fixture DB 有 1 条 failed ref
+    （from file:c.py -> 'b'），sidecar 必须可解析且含该条。"""
+    from run_analysis import run
+    out = run(MINI_DB, output_dir=tmp_path, root="fixture-src")
+    kg_path = Path(out) / "knowledge-gaps.json"
+    assert kg_path.exists(), "knowledge-gaps.json sidecar 未写"
+    gaps = json.loads(kg_path.read_text(encoding="utf-8"))
+    assert isinstance(gaps, list) and len(gaps) >= 1
+    assert set(gaps[0].keys()) >= {"ref", "node", "file", "line"}
+    assert gaps[0]["ref"] == "b"
+
+
 def test_run_shrink_guard_blocks_silent_overwrite(tmp_path):
     """审查 fix（Important）：to_json force=False 恢复 #479 shrink-guard。
 

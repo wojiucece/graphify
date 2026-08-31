@@ -97,6 +97,17 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
     root = Path(project_root).resolve()
     db = db_path or root / ".codegraph" / "codegraph.db"
     out = out_dir or root / "graphify-out"
+    # CUSTOM: seed 默认发现（最终审查 C1）。三个自动触发面（watch _trigger_rebuild /
+    # SessionEnd / PreCompact hook）都不传 --semantic-seed，迁移后首次自动重建若不带 seed
+    # -> 语义面丢失 -> 缩量 -> shrink-guard 拒写 -> 每个触发面都失败，永久砖死。
+    # 约定默认种子路径 <out>/semantic-seed.json（split_semantic_seed.py 的 CLI 在 --output
+    # 未传时默认写 <graph_json 所在目录>/semantic-seed.json，即此发现路径）。
+    # 显式 --semantic-seed 仍优先（仅在 None 时发现）。
+    if semantic_seed is None:
+        _default_seed = out / "semantic-seed.json"
+        if _default_seed.exists():
+            semantic_seed = _default_seed
+            _log(f"CUSTOM: 发现默认种子 {semantic_seed}，自动合入")
     # mkdir 原子锁（确定性锁名 + stale 检测，跨进程互斥，沿用 sessionend hook 模式）
     if not _acquire_lock(root):
         _log("锁被占用，另一重建正在进行 -> exit 3")

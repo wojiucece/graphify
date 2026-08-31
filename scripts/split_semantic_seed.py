@@ -78,6 +78,13 @@ if __name__ == "__main__":
     ap.add_argument("--output", default=None)
     ap.add_argument("--codegraph-db", default=None)
     args = ap.parse_args()
-    s = split(args.graph_json, args.output, args.codegraph_db)
+    # CUSTOM: --output 未传时默认写 <graph_json 所在目录>/semantic-seed.json（最终审查 C1）
+    # ——这是 rebuild_entry.rebuild() 的默认发现路径（<out>/semantic-seed.json，out 默认
+    # <root>/graphify-out）。迁移时拆分一条命令落位，watch/hook 自动重建即可拾取种子。
+    output = args.output
+    if output is None:
+        output = Path(args.graph_json).resolve().parent / "semantic-seed.json"
+    s = split(args.graph_json, output, args.codegraph_db)
     print(f"semantic 节点 {s['semantic_nodes']}/边 {s['seed_edges']}/hyperedges {len(s['seed']['hyperedges'])}"
-          + (f"/{s['warning']}" if s.get('warning') else ""))
+          + (f"/{s['warning']}" if s.get('warning') else "")
+          + f" -> 种子已写入 {output}")

@@ -71,6 +71,47 @@ def test_missing_db_raises(tmp_path):
         rebuild_entry.rebuild(tmp_path)
 
 
+def test_rebuild_auto_discovers_default_seed(monkeypatch, tmp_path):
+    """C1（最终审查）：semantic_seed 未显式传时，默认发现 <out>/semantic-seed.json 并传给 run().
+    背景：watch/_trigger_rebuild 与两个 hook 触发面都不传 --semantic-seed，迁移后首次自动
+    重建若不发现种子 -> 语义面丢失 -> 缩量 -> shrink-guard 拒写 -> 触发面永久砖死。"""
+    import json as _json
+    import sqlite3
+    import rebuild_entry
+    db = tmp_path / ".codegraph" / "codegraph.db"; db.parent.mkdir(parents=True)
+    c = sqlite3.connect(db); c.execute("CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,applied_at INTEGER,description TEXT)"); c.execute("INSERT INTO schema_versions VALUES(9,0,'x')"); c.commit(); c.close()
+    seed_path = tmp_path / "graphify-out" / "semantic-seed.json"
+    seed_path.parent.mkdir(parents=True)
+    seed_path.write_text(_json.dumps({
+        "nodes": [{"id": "concept:auto-seed", "label": "自动种子", "_origin": "semantic", "file_type": "concept"}],
+        "edges": [], "hyperedges": [],
+    }), encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(rebuild_entry, "run_codegraph_sync", lambda r: 0)
+    monkeypatch.setattr(rebuild_entry, "db_fingerprint", lambda d: (1, 0))
+    monkeypatch.setattr("run_analysis.run", lambda *a, **k: captured.update(semantic_seed=k.get("semantic_seed")) or Path(tmp_path))
+    rebuild_entry.rebuild(tmp_path, db_path=db)   # 不传 semantic_seed -> 走默认发现
+    got = captured.get("semantic_seed")
+    assert got is not None, "run() 未收到 seed：默认发现未生效"
+    assert Path(got) == seed_path
+    # seed 内容含该 semantic 节点
+    assert _json.loads(Path(got).read_text(encoding="utf-8"))["nodes"][0]["id"] == "concept:auto-seed"
+
+
+def test_rebuild_no_seed_file_passes_none(monkeypatch, tmp_path):
+    """C1 反向：默认路径无种子文件时 semantic_seed 保持 None（不虚构路径）。"""
+    import sqlite3
+    import rebuild_entry
+    db = tmp_path / ".codegraph" / "codegraph.db"; db.parent.mkdir(parents=True)
+    c = sqlite3.connect(db); c.execute("CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,applied_at INTEGER,description TEXT)"); c.execute("INSERT INTO schema_versions VALUES(9,0,'x')"); c.commit(); c.close()
+    captured = {}
+    monkeypatch.setattr(rebuild_entry, "run_codegraph_sync", lambda r: 0)
+    monkeypatch.setattr(rebuild_entry, "db_fingerprint", lambda d: (1, 0))
+    monkeypatch.setattr("run_analysis.run", lambda *a, **k: captured.update(semantic_seed=k.get("semantic_seed")) or Path(tmp_path))
+    rebuild_entry.rebuild(tmp_path, db_path=db)
+    assert captured.get("semantic_seed") is None
+
+
 def test_stale_lock_taken_over(tmp_path):
     """E: 残留锁（年龄 > _LOCK_STALE_S）被接管清理，而非永久 exit 3。
     模拟进程被强杀后锁残留的场景。"""

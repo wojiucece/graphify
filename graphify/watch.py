@@ -1224,6 +1224,16 @@ def _rebuild_code(
             return ok
 
     watch_root = watch_path.resolve()
+    # CUSTOM: 全量重建门控（最终审查 I2）。全量分支（changed_paths is None：graphify update
+    # CLI / post-checkout hook 调用面）在 codegraph 项目上不得进旧 AST 管线——旧管线无
+    # semantic seed/refresh 语义面，全量覆盖 codegraph 重建图会缩量（shrink-guard 拒写使
+    # CLI exit 1，或 force 下静默丢失语义面）。增量批次（changed_paths 非 None）不受影响，
+    # 仍走下方 CUSTOM flush 路由（_route_flush_batch -> rebuild_entry）。
+    if changed_paths is None and (watch_root / ".codegraph" / "codegraph.db").exists():
+        print("CUSTOM: codegraph 项目请用 rebuild_entry（scripts/rebuild_entry.py --project）"
+              "而非 graphify update 全量路径；本次未改动现有图。")
+        return False
+
     # project_root stays CWD-anchored for a relative invocation on purpose: the
     # persisted graph rehomes source_file across invocation styles against it
     # (tests/test_watch.py:1389, :1428). The manifest is a different artifact
