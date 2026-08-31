@@ -10,7 +10,9 @@ echo "=== 修改的上游文件 ==="
 git diff --name-status upstream/v8...HEAD | grep "^M" | awk '{print $2}' || true
 echo ""
 echo "=== 新增文件存在性检查 ==="
-for f in graphify/prompt_hook.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh; do
+# 分层融合自定义面（Task 13-16，feat/codegraph-merge）：scripts/ 下四个自定义脚本与上游 graphify/ 零交叠
+# adapter.py=codegraph DB 只读适配器；run_analysis.py=编排器；split_semantic_seed.py=旧图 semantic 种子拆分；rebuild_entry.py=单一重建入口
+for f in graphify/prompt_hook.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh scripts/adapter.py scripts/run_analysis.py scripts/split_semantic_seed.py scripts/rebuild_entry.py; do
     if [ -f "$f" ]; then
         echo "✓ $f"
     else

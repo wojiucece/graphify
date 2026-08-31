@@ -93,3 +93,23 @@ Rules:
 - 根因：项目 .venv 装了上游版 graphifyy（无 prompt-hook），激活后遮蔽全局 fork 版
 - 排查：`bash scripts/check-custom.sh` 扫描所有 graphify.exe 标出上游版
 - 清理：`uv pip uninstall graphifyy --python <venv>/Scripts/python.exe`
+
+## 分层融合自定义面（feat/codegraph-merge）
+
+新增自定义文件（scripts/，与上游 graphify/ 零交叠）：
+- adapter.py -- codegraph DB 只读适配器（门控上限9 + 映射 + 折叠 + id 消歧 + Knowledge Gaps + 锚定校验）
+- run_analysis.py -- 编排器（adapter->build->cluster->analyze->report + export.to_json + graph_diff）
+- split_semantic_seed.py -- 旧图 semantic 种子拆分（links 键 + hyperedges + .py 锚点改指）
+- rebuild_entry.py -- 单一重建入口（codegraph sync + 指纹收敛 + mkdir 锁）
+
+上游补丁（最小 diff，提 PR 后若被接受则移除）：
+- graphify/analyze.py:63 _is_file_node 加 kind='file' 短路
+
+Phase 3 拓扑切换（三触发面单入口）：
+- graphify/watch.py flush 路由改指 rebuild_entry（退役代码索引）：AST 批次 sync+重建，纯文档 elif 走 skip_sync 语义重提取；`.codegraph` 守卫非 codegraph 项目回退旧行为（_routed_doc 同源）
+- scripts/sessionend/precompact-graphify-update.sh 改指 rebuild_entry
+
+同步检查项：
+- 4 契约入口（build_from_json/cluster/report.generate/export.to_json）签名未变即可
+- analyze.py 若上游改 _is_file_node，重放补丁（3 行 kind 短路）
+- watch.py 若上游改自定义防抖区，重放 _trigger_rebuild 路由
