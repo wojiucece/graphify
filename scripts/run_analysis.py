@@ -18,6 +18,37 @@ from graphify.report import generate as generate_report
 from graphify.export import to_json, attach_hyperedges, to_obsidian
 
 
+def _norm_sf(x) -> "str | None":
+    """source_file/路径 POSIX 归一化：反斜杠 -> 正斜杠，剥 './' 前缀。"""
+    if not x:
+        return None
+    s = str(x).replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s or None
+
+
+def _sf_match(sf, rf) -> bool:
+    """seed 节点/边的 source_file 与 refresh 文件 rf 是否同一源文件（upsert 匹配规则）.
+
+    选型说明（refresh 的 rf 是绝对或相对路径，seed 节点 source_file 形态由 extract
+    产出决定）：双方 POSIX 归一化后【相等】或【一方为另一方的路径后缀（以 / 为边界，
+    防 'mydocs' 误匹配 'docs'）】。覆盖组合：
+    - seed 存 root 相对路径（extract #555 in-root 归一化产物，如 'docs/auth.md'）
+      x rf 传绝对路径（watch.py 触发面）-> 后缀命中；
+    - seed 存 out-of-root portable 裸名（extract #2243 走 root 外分支，如 'notes.md'）
+      x rf 绝对路径 -> 后缀命中；
+    - 双方同为相对路径 -> 相等命中。
+    已知残余风险（接受）：大小写敏感（Windows 大小写差异仅在两侧字符串不同源时触发，
+    而两侧均来自同一文件系统的同一路径）；裸名 source_file 会匹配任意目录下同名文件
+    （裸名仅在 root 外场景产生，同项目内罕见）。
+    """
+    a, b = _norm_sf(sf), _norm_sf(rf)
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
 def run(db_path, output_dir="graphify-out", root=None,
         semantic_seed=None, semantic_refresh=None, wiki=False) -> Path:
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
@@ -28,25 +59,33 @@ def run(db_path, output_dir="graphify-out", root=None,
     (out / "knowledge-gaps.json").write_text(
         json.dumps(extraction.get("knowledge_gaps", []), ensure_ascii=False, indent=2),
         encoding="utf-8")
+    # CUSTOM: seed 路径解析 + 加载（修复用户实测两轮砖死链）。显式 semantic_seed
+    # 参数优先（用它的路径）；否则 <out>/semantic-seed.json——与 rebuild_entry
+    # 的 C1 默认发现路径一致（rebuild_entry.py 默认种子发现），两端同路径链路才闭合。
+    # 此前 seed 只在显式参数时加载；默认路径仅 rebuild_entry 侧发现，run() 直调
+    # （CLI 无 --semantic-seed / 上一轮 refresh 落盘后）会漏拾取。
+    seed_path = Path(semantic_seed) if semantic_seed is not None else out / "semantic-seed.json"
+    _seed_raw: dict = {}
+    seed_nodes: list = []
+    seed_edges: list = []
     # semantic_seed 合并（Task 7 补 hyperedges 挂回）
-    seed_hyperedges = []
-    if semantic_seed is not None:
-        seed = json.loads(Path(semantic_seed).read_text(encoding="utf-8"))
+    seed_hyperedges: list = []
+    if seed_path.exists():
+        _seed_raw = json.loads(seed_path.read_text(encoding="utf-8"))
         # CUSTOM: semantic 锚定校验（最终审查 I1，B2 接线）。semantic 边锚定符号级节点
         # （codegraph kind:hash 形态 id，符号移动行号即变 id）易失——违规仅告警 stderr
         # 不阻断：存量种子可能有合法悬挂锚点，提示后由用户自行决定是否修种子。
-        _violations = validate_semantic_anchors(seed)
+        _violations = validate_semantic_anchors(_seed_raw)
         if _violations:
             print(f"CUSTOM: semantic 语义锚定违规 {len(_violations)} 条，首条: {_violations[0]}",
                   file=sys.stderr)
-        extraction = {"nodes": extraction["nodes"] + seed.get("nodes", []),
-                       "edges": extraction["edges"] + seed.get("edges", [])}
-        seed_hyperedges = seed.get("hyperedges", [])
+        seed_nodes = list(_seed_raw.get("nodes", []))
+        seed_edges = list(_seed_raw.get("edges", []))
+        seed_hyperedges = list(_seed_raw.get("hyperedges", []))
     # semantic_refresh（修订方案 §1.4 要求）：对每个 refresh 文件做语义提取，
-    # 按 source_file 身份 upsert 进 extraction（无 seed 则建）。
+    # 按 source_file 身份 upsert 进 seed 状态（无 seed 则建）。
     if semantic_refresh:
         from graphify.extract import extract as _extract_semantic
-        sem_nodes, sem_edges = [], []
         for rf in semantic_refresh:
             try:
                 # A: extract() 签名是 extract(paths: list[Path], *, root=None, ...)，
@@ -57,16 +96,45 @@ def run(db_path, output_dir="graphify-out", root=None,
                     # refresh 合入的 .md 仍标 ast；split 按 _origin=='semantic' 判别会漏收。
                     # 强制赋值为 semantic，使 refresh 的语义节点进种子链路。
                     n["_origin"] = "semantic"
-                sem_nodes += r.get("nodes", [])
-                sem_edges += r.get("edges", [])
             except Exception as e:
                 # A: 至少落一条 stderr 日志，避免 extract 失败被静默吞掉（零产出无感知）
                 # （sys 用模块顶部导入；此处曾有局部 import sys 使 sys 变为函数局部变量，
                 #  导致 run() 前段的 stderr 告警 UnboundLocalError——最终审查 I1 接线时移除）
                 print(f"[run_analysis] semantic_refresh 提取失败 {rf}: {e}", file=sys.stderr)
-        if sem_nodes or sem_edges:
-            extraction = {"nodes": extraction["nodes"] + sem_nodes,
-                           "edges": extraction["edges"] + sem_edges}
+                continue
+            # 修复（用户实测复现，两轮沙箱模拟）：refresh 产物此前只合入内存 extraction，
+            # 没有任何代码写回 seed 文件（seed 唯一写入点是 split_semantic_seed.py 一次性
+            # 迁移工具）——.md 编辑产生 refresh 后，任何不带 refresh 的重建（.py 编辑/
+            # SessionEnd hook）产出 adapter-only 图 -> 节点数骤减 -> shrink-guard
+            # RuntimeError -> 图永久冻结。
+            # upsert 语义（按 source_file 替换，防重复膨胀）：先删除 source_file 与该
+            # refresh 文件匹配的旧 seed 节点/边，再插入本次 extract 的新节点/边。
+            # 已删源文件的驱逐留给全量重切兜底（既有约定，不实现）。
+            seed_nodes = [n for n in seed_nodes if not _sf_match(n.get("source_file"), rf)]
+            seed_edges = [e for e in seed_edges if not _sf_match(e.get("source_file"), rf)]
+            seed_nodes += r.get("nodes", [])
+            seed_edges += r.get("edges", [])
+    # 合并：extraction = adapter 产出 + 当前有效 seed 状态（含 refresh upsert 产物）。
+    # refresh 不再单独拼进 extraction——统一经 seed 状态合入，避免旧代码"seed 与
+    # refresh 各拼一次"造成的同源节点双份（此前仅靠 build 的 id 去重兜底）。
+    extraction = {"nodes": extraction["nodes"] + seed_nodes,
+                  "edges": extraction["edges"] + seed_edges}
+    if semantic_refresh:
+        # 落盘（无 seed 则建，时机=refresh 合入 extraction 之后）：把合并后的 seed
+        # 状态写回 seed 路径。hyperedges 从旧 seed 原样保留（refresh 不产 hyperedges；
+        # _seed_raw 的其余未知键也原样带回）。写盘失败（磁盘/权限）打 stderr 警告
+        # 但不阻断主重建——fallback 行为=旧行为（refresh 仅进本轮图），只影响下一轮：
+        # 无 refresh 重建仍会 adapter-only 缩量、被 shrink-guard 拦截。
+        try:
+            _seed_out = dict(_seed_raw)
+            _seed_out["nodes"] = seed_nodes
+            _seed_out["edges"] = seed_edges
+            _seed_out["hyperedges"] = seed_hyperedges
+            seed_path.write_text(json.dumps(_seed_out, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+        except Exception as e:
+            print(f"[run_analysis] seed 落盘失败 {seed_path}: {type(e).__name__}: {e}"
+                  f"——下一轮无 refresh 重建将丢失语义面", file=sys.stderr)
     G = build_from_json(extraction, root=root)
     # C2: hyperedges 挂回图（export.py:180）；seed_hyperedges 已在 Task 6 seed 合并块备好
     if seed_hyperedges:

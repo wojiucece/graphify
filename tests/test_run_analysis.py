@@ -97,6 +97,58 @@ def test_run_shrink_guard_blocks_silent_overwrite(tmp_path):
     assert json.loads(graph.read_text(encoding="utf-8")) == fake
 
 
+def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path):
+    """砖死回归（用户实测复现，两轮沙箱模拟）：refresh 产物此前只合入内存
+    extraction，从不写回 seed 文件——.md 编辑产生 refresh 后，任何不带 refresh
+    的重建（.py 编辑 / SessionEnd hook 触发面）产出 adapter-only 图 ->
+    节点数骤减 -> shrink-guard RuntimeError -> 图永久冻结。
+
+    修复后：refresh 合入后落盘 <out>/semantic-seed.json（与 rebuild_entry C1
+    默认发现路径一致），下一轮无 refresh 的 run() 自动拾取，链路闭合不再砖死。
+    """
+    from run_analysis import run
+    md = tmp_path / "notes.md"
+    md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
+                  encoding="utf-8")
+    out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
+                   semantic_refresh=[md]))
+    # 第一轮：seed 已落盘且含 semantic 节点
+    seed_path = out / "semantic-seed.json"
+    assert seed_path.exists(), "refresh 产物未落盘 semantic-seed.json"
+    seed = json.loads(seed_path.read_text(encoding="utf-8"))
+    assert any(n.get("_origin") == "semantic" for n in seed.get("nodes", [])), \
+        "seed 无 _origin=semantic 节点"
+    sem_ids1 = {n["id"] for n in json.loads((out / "graph.json").read_text(encoding="utf-8"))
+                .get("nodes", []) if n.get("_origin") == "semantic"}
+    assert sem_ids1, "第一轮 graph.json 无 semantic 节点"
+    # 第二轮：无 refresh（模拟 .py 编辑 / SessionEnd hook 触发面）。
+    # 修复前此处产出 adapter-only 图 -> shrink-guard RuntimeError（砖死）。
+    out2 = Path(run(MINI_DB, output_dir=out, root="fixture-src"))
+    graph2 = json.loads((out2 / "graph.json").read_text(encoding="utf-8"))
+    sem_ids2 = {n["id"] for n in graph2.get("nodes", []) if n.get("_origin") == "semantic"}
+    assert sem_ids1.issubset(sem_ids2), \
+        f"第二轮丢失 semantic 节点: {sem_ids1 - sem_ids2}"
+
+
+def test_refresh_upsert_no_duplicate_growth(tmp_path):
+    """upsert 语义（按 source_file 替换，防重复膨胀）：同一 .md 文件连续两次
+    refresh，seed 中该文件的节点数不翻倍（第二次 = 先删同源旧节点/边再插入）。"""
+    from run_analysis import run
+    md = tmp_path / "notes.md"
+    md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
+                  encoding="utf-8")
+    out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
+                   semantic_refresh=[md]))
+    seed1 = json.loads((out / "semantic-seed.json").read_text(encoding="utf-8"))
+    count1 = len([n for n in seed1.get("nodes", []) if n.get("source_file") == "notes.md"])
+    assert count1 > 0, "第一次 refresh 后 seed 无该文件节点"
+    run(MINI_DB, output_dir=out, root="fixture-src", semantic_refresh=[md])
+    seed2 = json.loads((out / "semantic-seed.json").read_text(encoding="utf-8"))
+    count2 = len([n for n in seed2.get("nodes", []) if n.get("source_file") == "notes.md"])
+    assert count2 == count1, \
+        f"第二次 refresh 后 seed 节点数膨胀: {count1} -> {count2}（upsert 未按 source_file 替换）"
+
+
 import time
 
 
