@@ -13,7 +13,7 @@ import networkx as nx
 from adapter import load_codegraph
 from graphify.build import build_from_json
 from graphify.cluster import cluster
-from graphify.analyze import god_nodes, surprising_connections, find_import_cycles
+from graphify.analyze import god_nodes, surprising_connections, find_import_cycles, graph_diff as _graph_diff
 from graphify.report import generate as generate_report
 from graphify.export import to_json, attach_hyperedges, to_obsidian
 
@@ -100,6 +100,19 @@ def run(db_path, output_dir="graphify-out", root=None,
         # C6: to_obsidian(G, communities, output_dir, community_labels=None, cohesion=None)（export.py:681 核读）
         to_obsidian(G, communities, str(out / "wiki"))
     return out
+
+
+def diff(prev_graph, db_path, root=None) -> dict:
+    """上轮 graph.json vs 本次 codegraph 重建的差分（B1 单库原地同步形态）.
+    root 必须与产出 prev_graph 的 run() 一致，否则 source_file 归一化不同 -> 假 diff。"""
+    prev_data = json.loads(Path(prev_graph).read_text(encoding="utf-8"))
+    # 从 prev graph.json 重建 G_old（node_link 格式）
+    import networkx as nx
+    G_old = nx.node_link_graph(prev_data, edges="links" if "links" in prev_data else "edges")
+    extraction = load_codegraph(db_path)
+    G_new = build_from_json(extraction, root=root)
+    # 返回键名：new_nodes/removed_nodes/new_edges/removed_edges/summary（analyze.py:556）
+    return _graph_diff(G_old, G_new)
 
 
 if __name__ == "__main__":
