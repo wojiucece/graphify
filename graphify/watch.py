@@ -2129,8 +2129,11 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
             # CUSTOM: Phase 3 (Fix I1) -- 纯文档批次判定：无代码文件但含 .md 家族（semantic 面）。
             # _batch_triggers_rebuild 只认 code/deletion（.md 不在 _CODE_EXTENSIONS），纯 .md 修改
             # 原走不进 _rebuild_code -> semantic_refresh 路径不达；此处补 elif 直接路由。
+            # Fix r2：_notify_only 守卫与 elif 门控同源（_routed_doc）——非 codegraph 项目纯文档批次
+            # 不路由时回退旧 _notify_only（needs_update 旗标+通知），不再被 not _pure_doc 静默丢弃。
             _pure_doc = (not any(p.suffix.lower() in _CODE_EXTENSIONS for p in batch)
                          and any(p.suffix.lower() in _SEMANTIC_DOC_SUFFIXES for p in batch))
+            _routed_doc = _pure_doc and (watch_root_for_ignore / ".codegraph" / "codegraph.db").exists()
             if _batch_triggers_rebuild(batch):
                 # CUSTOM: 失败计数 + 退避/降级（移植 codegraph flush 的 try/finally 退避）
                 # CUSTOM: Phase 3 -- 把 flush 批次传给 _rebuild_code（增量路径），
@@ -2152,12 +2155,11 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
                 else:
                     failure_count = 0
                     next_allowed_trigger = 0.0
-            elif _pure_doc and (watch_root_for_ignore / ".codegraph" / "codegraph.db").exists():
-                # CUSTOM: Phase 3 (Fix I1) -- 纯 .md 文档批次也路由 rebuild_entry
+            elif _routed_doc:
+                # CUSTOM: Phase 3 (Fix I1) -- 纯 .md 文档批次（codegraph 项目）路由 rebuild_entry
                 # （skip_sync=True + semantic_refresh=[该批次]），替代仅写 needs_update 旗标。
-                # 门控 .codegraph 与汇聚点/ hook 对称：非 codegraph 项目回退 _notify_only。
                 _route_flush_batch(watch_path, batch)
-            if _batch_needs_llm_flag(batch) and not _pure_doc:
+            if _batch_needs_llm_flag(batch) and not _routed_doc:
                 _notify_only(watch_path)
     except KeyboardInterrupt:
         print("\n[graphify watch] Stopped.")
