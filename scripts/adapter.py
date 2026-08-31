@@ -133,3 +133,29 @@ def _disambiguate_ids(nodes, edges):
     for e in edges:
         e["source"] = id_map.get(e["source"], e["source"])
         e["target"] = id_map.get(e["target"], e["target"])
+
+
+_SEMANTIC_FILE_TYPES = frozenset({"concept", "document", "rationale", "image"})
+
+
+def validate_semantic_anchors(seed: dict) -> list[str]:
+    """semantic 引用必须锚定文件级节点（§6.3 Q2）.
+    B2: 真实种子无 kind，按 id 前缀判定--file: 前缀或 file_type 在语义集为合规锚点；
+    codegraph 符号 id（kind:hash 形态）判违规（符号移动行号即变 id，易失）."""
+    node_info = {n["id"]: n for n in seed.get("nodes", [])}
+    violations = []
+    for e in seed.get("edges", []):
+        for end in ("source", "target"):
+            nid = e.get(end, "")
+            n = node_info.get(nid, {})
+            # semantic 自身节点不判违规
+            if nid.startswith(("concept:", "rationale:", "document:", "image:")):
+                continue
+            if n.get("_origin") == "semantic" or n.get("file_type") in _SEMANTIC_FILE_TYPES:
+                continue
+            # 合规锚点：file: 前缀 或 kind=file
+            if nid.startswith("file:") or n.get("kind") == "file":
+                continue
+            # 其余为符号级（codegraph kind:hash 形态）-> 违规
+            violations.append(f"semantic 边 {end} 锚定符号级节点 {nid}（易失），应锚定文件级节点")
+    return violations
