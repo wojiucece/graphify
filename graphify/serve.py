@@ -1704,6 +1704,21 @@ def _verdict_for_source_request(has_source: bool, explicit_body: bool):
     return None
 
 
+def _signature_line(sig: str, short: str) -> str:
+    """B2 fix：真实 DB signature 列无 def/class/async 前缀（fork 实测 7378/7378 函数/方法
+    签名均无前缀，`__init__` → `(self)`）——缺前缀且为括号形态（Python 函数签名）时前置
+    `def <short_name>` 重构出 def 行；已有前缀原样（不重复拼接）；非括号形态（非 Python
+    语言签名，如 `void (String item)`）不套 Python def。"""
+    sig = sig.strip()
+    if not sig:
+        return ""
+    if re.match(r"^(def|class|async def)\b", sig):
+        return sig
+    if sig.startswith("("):
+        return f"def {short}{sig}"
+    return sig
+
+
 def _format_node_card(G, nid, d) -> str:
     """B2 get_node 名片正文（none 档回归锚点——与扩展前逐字节一致，勿加字段）。
     名片增强（Signature:/Doc:）由 get_node 在非 none 档追加于本卡尾部。"""
@@ -2104,20 +2119,22 @@ def _build_server(graph_path: str):
         if include_source == "none":
             # none 档回归锚点：名片无 Signature:/Doc:/Code: 行，与扩展前逐字节一致
             return "\n".join(card), True, 1, override
-        # 名片增强：Signature:/Doc: 行（DB 一次 join 带出）
+        # 名片增强：Signature:/Doc: 行（DB 一次 join 带出）。short = 图 label 末段
+        # （函数名/类名），body 与 signature 两档共用（review 交接：复用）。
+        short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
         if row is not None:
             sig = (row[3] or "").strip()
             doc = (row[4] or "").strip()
             if sig:
-                card.append(f"  Signature: {sanitize_label(sig)}")
+                # 真实 DB signature 列无 def 前缀（fork 实测 7378/7378）——重构出 def 行
+                card.append(f"  Signature: {sanitize_label(_signature_line(sig, short))}")
             if doc:
                 card.append(f"  Doc: {sanitize_label(doc.splitlines()[0])}")
         if explicit_body and has_source:
             project_root = Path(active_graph_path).parent.parent
-            short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
             text, slice_ok = _slice_source(
                 project_root, row[0], row[1], row[2], short,
-                signature=(row[3] or "").strip() or None)
+                signature=_signature_line((row[3] or "").strip(), short) or None)
             if slice_ok:
                 if include_source == "body+context":
                     # ±3 行上下文窗口：在已验证切片前后各扩 3 行（漂移重定位区间同样扩张）
