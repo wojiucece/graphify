@@ -16,6 +16,8 @@ from __future__ import annotations
 import json, re, sqlite3, sys
 from pathlib import Path
 
+import networkx as nx  # B3 I2：get_digraph 统一缓存的 DiGraph 视图（graphify 核心依赖）
+
 _SELF = Path(__file__).resolve().parent
 if str(_SELF) not in sys.path:        # scripts 无包结构——同目录 import adapter（rebuild_entry 先例）
     sys.path.insert(0, str(_SELF))
@@ -44,16 +46,19 @@ _ALL_CHANNELS = frozenset({"fts", "pinned", "cjk", "structure"})
 
 _tiktoken_enc = None  # 可选依赖惰性缓存：None=未探测 / False=不可用 / 其余=编码器
 
-# M1：合并图加载缓存 {graph_path_str: (mtime_ns, size, (degree, collision_bases, nodes))}。
+# M1/I2：单入口单一载荷缓存 {graph_path_str: (mtime_ns, size, payload_dict)}。一次
+# json.loads 产出 B1 结构派生数据（degree/collision_bases/nodes）+ B3 有向视图（DiGraph，
+# lazy——首次 get_digraph 请求时从已缓存 links 构造并驻留同一 payload，见 get_digraph）。
 # 失效语义：mtime 与 size 双键命中才复用——rebuild 后 mtime 必变自动失效（Windows
 # st_mtime_ns 精度足够，~100ns 粒度远小于 rebuild 间隔）。缓存按 path_str 分键，多项目
 # 热切换互不串。并发安全：FastMCP sync handler 实际跑线程池，并发请求存在竞争——但
 # CPython dict 单键赋值原子（GIL），并发 miss 时重复加载无害（payload 幂等，后写覆盖
 # 先写内容相同），无需加锁；禁止以"单协程顺序执行"假设为依据添加非原子操作（如分步
 # get-then-put 删改，会在并发下撕裂）。L-B 容量上界：_GRAPH_CACHE_MAX_ENTRIES = 8，
-# 多项目热切换下最多驻留 8 份解析后整图（~50-150MB/项目），防无限增长。
+# 多项目热切换下最多驻留 8 份解析后整图（~50-150MB/项目），防无限增长；DiGraph 视图
+# 驻留同 entry 不另计。
 _GRAPH_CACHE_MAX_ENTRIES = 8
-_GRAPH_CACHE: dict[str, tuple[int, int, tuple[dict, set, list]]] = {}
+_GRAPH_CACHE: dict[str, tuple[int, int, dict]] = {}
 _graph_loads = 0  # M1 诊断：实际 json.loads 全量图次数（cache miss 才 +1），供测试/日志验证命中率
 
 
@@ -143,17 +148,15 @@ def _gap_refs(conn):
     return out
 
 
-def _load_graph(graph_path: Path):
-    """合并图加载 → (degree_map, collision_bases, nodes)。加载失败 → (None, None, [])。
-    degree：links 端点计数（合并图口径）。collision_bases：_normalize_id fold 含消歧
-    后缀（__cg）的图节点原始 id 基底（Q6：碰撞节点不参与 join）。
-    M1 缓存：payload 即结构通道所需全部派生数据（degree/collision_bases/nodes），
-    命中 = mtime 与 size 均不变；解析失败不缓存（下次修复即拾起）。"""
+def _cache_load(graph_path: Path) -> dict | None:
+    """统一缓存核心（I2 单入口）：mtime+size 双键命中复用；miss 则一次 json.loads 解析
+    graph.json → 派生 degree/collision_bases/nodes/links（B3 DiGraph 视图 lazy 后置）。
+    失败（缺失/损坏/越界）→ None，不缓存（下次修复即拾起）。"""
     key = str(graph_path)
     try:
         st = graph_path.stat()
     except OSError:
-        return None, None, []
+        return None
     hit = _GRAPH_CACHE.get(key)
     if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
         # L-B 命中移到最新：del 后重插（Python 3.7+ dict 保插入序，迭代首键即最旧）
@@ -163,7 +166,10 @@ def _load_graph(graph_path: Path):
     try:
         g = json.loads(graph_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None, None, []
+        return None
+    # 兼容旧图：edges 键等价 links（与 graphify/serve._load_graph 同款 shim）
+    if "links" not in g and "edges" in g:
+        g = dict(g, links=g["edges"])
     degree = {}
     for link in g.get("links", []):
         s, t = link.get("source"), link.get("target")
@@ -176,9 +182,16 @@ def _load_graph(graph_path: Path):
         nid = n.get("id", "")
         if nid and _CG_SUFFIX_RE.search(_normalize_id(nid)):
             collision_bases.add(nid.split("__cg")[0])
-    payload = (degree, collision_bases, g.get("nodes", []))
-    # 共享可变引用：payload（nodes list / degree dict）与调用方共享同一对象，
-    # 调用方须只读；mutate 会污染缓存（后续命中直接复用该对象）。
+    payload = {
+        "degree": degree,
+        "collision_bases": collision_bases,
+        "nodes": g.get("nodes", []),
+        "links": g.get("links", []),
+        "digraph": None,   # B3 lazy 有向视图（首次 get_digraph 时构造驻留）
+    }
+    # 共享可变引用：payload（nodes/links list、degree dict、digraph）与调用方共享同一
+    # 对象，调用方须只读；mutate 会污染缓存（后续命中直接复用该对象）。并发 miss 重复
+    # 解析无害（幂等，后写覆盖先写内容相同）。
     global _graph_loads
     _graph_loads += 1
     _GRAPH_CACHE[key] = (st.st_mtime_ns, st.st_size, payload)
@@ -186,6 +199,47 @@ def _load_graph(graph_path: Path):
         oldest = next(iter(_GRAPH_CACHE))   # 插入序首键 = 最旧条目（LRU 驱逐）
         del _GRAPH_CACHE[oldest]
     return payload
+
+
+def _load_graph(graph_path: Path):
+    """合并图加载 → (degree_map, collision_bases, nodes)。加载失败 → (None, None, [])。
+    degree：links 端点计数（合并图口径）。collision_bases：_normalize_id fold 含消歧
+    后缀（__cg）的图节点原始 id 基底（Q6：碰撞节点不参与 join）。
+    I2 统一缓存后本函数即 _cache_load 的 B1 视图瘦封装（签名/语义不变）。"""
+    payload = _cache_load(graph_path)
+    if payload is None:
+        return None, None, []
+    return payload["degree"], payload["collision_bases"], payload["nodes"]
+
+
+def get_digraph(graph_path: Path):
+    """B3 有向视图（R3-1 从 links source/target 重建方向）：I2 统一缓存的 lazy 双视图——
+    B1 payload 已解析一次，DiGraph 首次请求时从已缓存 links 构造并驻留同一 entry（不二次
+    json.loads）。生产 graph.json 实测 directed:false，node_link_graph 无向化丢方向，须从
+    原始 links 重建。节点/边属性（kind/label/source_file/relation/confidence）原样带上
+    （E2/N4 fixture 纪律）。调用方（serve._digraph_view）只读，禁止 mutate。失败 → 空
+    DiGraph（诚实降级，不崩出口）。"""
+    payload = _cache_load(graph_path)
+    if payload is None:
+        return nx.DiGraph()
+    if payload["digraph"] is None:
+        DG = nx.DiGraph()
+        for n in payload["nodes"]:
+            nid = n.get("id")
+            if nid is None:
+                continue
+            attrs = {k: v for k, v in n.items() if k != "id"}
+            if attrs:
+                DG.add_node(nid, **attrs)
+            else:
+                DG.add_node(nid)
+        for lk in payload["links"]:
+            s, t = lk.get("source"), lk.get("target")
+            if s is None or t is None:
+                continue
+            DG.add_edge(s, t, **{k: v for k, v in lk.items() if k not in ("source", "target")})
+        payload["digraph"] = DG
+    return payload["digraph"]
 
 
 def _cjk_search(nodes, cjk_tokens: list[str]):

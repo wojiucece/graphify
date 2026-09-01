@@ -1869,60 +1869,23 @@ def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
             "dispatch_candidate": candidate}
 
 
-_DIGRAPH_CACHE_MAX_ENTRIES = 2
-# B3 M1：_digraph_view 有向视图缓存 {resolved_path: (mtime_ns, size, nx.DiGraph)}。
-# 生产 graph.json 11MB——每次请求重解析是 P95 杀手；mtime+size 双键命中复用（同
-# scripts/ranked.py _GRAPH_CACHE 模式，rebuild 后 mtime 必变自动失效）。并发 miss
-# 重复加载无害（幂等，后写覆盖，CPython dict 单键赋值原子）。容量上界 2：DiGraph
-# 内存占用大（与 nx.Graph 同级），多项目热切换最多驻留 2 份。
-_DIGRAPH_CACHE: dict[str, tuple[int, int, nx.DiGraph]] = {}
-
-
 def _digraph_view(graph_path) -> nx.DiGraph:
-    """B3 R3-1 有向视图：直接读原始 graph.json 的 links source/target 建 DiGraph。
-    生产 graph.json 实测 directed:false——_load_graph 产 nx.Graph，node_link_graph
-    无向化即丢方向（links 的 source/target 被折叠进无向邻接）；B3 不吃无向 G，反向
-    闭包在无向图上混入下游调用方（系统性过报）。节点/边属性（kind/label/source_file/
-    relation/confidence）原样带上（E2/N4 fixture 纪律）。"""
-    resolved = Path(graph_path).resolve()
-    try:
-        st = resolved.stat()
-    except OSError:
-        return nx.DiGraph()
-    key = str(resolved)
-    hit = _DIGRAPH_CACHE.get(key)
-    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
-        # L-B 命中移到最新：del 后重插（Python 3.7+ dict 保插入序，迭代首键即最旧）
-        del _DIGRAPH_CACHE[key]
-        _DIGRAPH_CACHE[key] = hit
-        return hit[2]
-    try:
-        data = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return nx.DiGraph()
-    # 兼容旧图：edges 键等价 links（与 _load_graph 同款 shim）
-    if "links" not in data and "edges" in data:
-        data = dict(data, links=data["edges"])
-    DG = nx.DiGraph()
-    for n in data.get("nodes", []):
-        nid = n.get("id")
-        if nid is None:
-            continue
-        attrs = {k: v for k, v in n.items() if k != "id"}
-        if attrs:
-            DG.add_node(nid, **attrs)
-        else:
-            DG.add_node(nid)
-    for lk in data.get("links", []):
-        s, t = lk.get("source"), lk.get("target")
-        if s is None or t is None:
-            continue
-        DG.add_edge(s, t, **{k: v for k, v in lk.items() if k not in ("source", "target")})
-    _DIGRAPH_CACHE[key] = (st.st_mtime_ns, st.st_size, DG)
-    if len(_DIGRAPH_CACHE) > _DIGRAPH_CACHE_MAX_ENTRIES:
-        oldest = next(iter(_DIGRAPH_CACHE))
-        del _DIGRAPH_CACHE[oldest]
-    return DG
+    """B3 R3-1 有向视图：从原始 graph.json 的 links source/target 重建方向（DiGraph）。
+    生产 graph.json 实测 directed:false——_load_graph 产 nx.Graph，node_link_graph 无向化
+    即丢方向（links 的 source/target 被折叠进无向邻接）；B3 不吃无向 G，反向闭包在无向
+    图上混入下游调用方（系统性过报）。
+    I2（用户 L3 裁决）：单入口单一载荷缓存（scripts/ranked.py _GRAPH_CACHE lazy 双视图）
+    ——DiGraph 与 B1 结构派生（degree/collision_bases/nodes）同 entry 驻留，不二次
+    json.loads；独立 _DIGRAPH_CACHE 已删除。serve 接 scripts 走既有 lazy sys.path+import
+    先例（_tool_get_ranked_context 同款，graphify 包不反向依赖 scripts/ 只在调用时挂
+    sys.path——rebuild_entry 先例，非破例）。
+    节点/边属性（kind/label/source_file/relation/confidence）原样带上（E2/N4 纪律）。"""
+    import sys as _sys
+    _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    from ranked import get_digraph
+    return get_digraph(graph_path)
 
 
 def _reverse_closure(DG: nx.DiGraph, node, depth, top_k) -> tuple[list[str], int]:
