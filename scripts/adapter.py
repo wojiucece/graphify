@@ -181,3 +181,78 @@ def validate_semantic_anchors(seed: dict) -> list[str]:
             # 其余为符号级（codegraph kind:hash 形态）-> 违规
             violations.append(f"semantic 边 {end} 锚定符号级节点 {nid}（易失），应锚定文件级节点")
     return violations
+
+
+# === B3 分发线索直查（Phase 4 Task 9）=============================================
+# serve.py 持自包含副本（graphify 包不反向依赖 scripts/；rebuild_entry._parse_refresh
+# "scripts 无包结构，两文件各持自包含副本，不互相导入" 先例）——改这里要同步 serve 副本，
+# 防漂移锁定靠 tests/test_dispatch_trace.py::test_serve_selfcontained_copies_match_adapter。
+
+_DISPATCH_RESOLVED_BY = frozenset({"instance-method", "fuzzy", "qualified-name"})
+
+
+def _dispatch_candidate(meta: dict | None) -> bool:
+    """B3 R4-2 双判据并集：resolvedBy ∈ {instance-method, fuzzy, qualified-name, None}
+    或 confidence < 0.9 → 分发候选（宁多标勿漏标）。无 metadata = resolvedBy None 分支
+    （未记录解析方式 = 不可信）→ True。"""
+    if not meta:
+        return True
+    if meta.get("resolvedBy") in _DISPATCH_RESOLVED_BY or meta.get("resolvedBy") is None:
+        return True
+    conf = meta.get("confidence")
+    try:
+        if conf is not None and float(conf) < 0.9:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _symbol_short_name(d: dict, nid: str) -> str:
+    """B3 R3-2 合并图短名：label 首 token 末段（消歧后缀 ' (N)' 剥离）。
+    合并图 id 是 hash 形态且无 name 属性——短名唯一事实源是 label；label 缺失回退 nid。"""
+    return str(d.get("label") or nid).split(" ")[0].rsplit(".", 1)[-1]
+
+
+def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
+    """B3 R4-2 铰链改键：合并边无 DB edge id（实测生产 links 为 {source, target, relation,
+    _origin, confidence, ...}，且合并边 source 是 folded id、DB 边端点是 raw id、fold 多对一
+    不留反映射）——`WHERE edge_id=?` 无从落地。改用合并边自带的 source_file + relation
+    （→ DB kind）+ 两端短名（nodes.name 即短名，_symbol_short_name ↔ nodes.name）在 DB 侧
+    JOIN 定候选组（file+kind+双端短名缩到个位数）。组内最保守取值（Q11：不洗白猜测边）：
+    confidence=min、dispatch_candidate=any、resolvedBy 数组展示全部。空组 → dispatch_candidate
+    =True 宁多标勿漏标。"""
+    rows = conn.execute(
+        "SELECT e.metadata FROM edges e "
+        "JOIN nodes ns ON e.source = ns.id "
+        "JOIN nodes nt ON e.target = nt.id "
+        "WHERE e.kind = ? AND ns.file_path = ? AND ns.name = ? AND nt.name = ?",
+        (kind, source_file, src_name, tgt_name)).fetchall()
+    resolved_by = []
+    confidences = []
+    candidate = False
+    for (meta_json,) in rows:
+        meta = None
+        if meta_json:
+            try:
+                meta = _json.loads(meta_json)
+            except ValueError:
+                meta = None
+        candidate = candidate or _dispatch_candidate(meta)
+        if meta:
+            rb = meta.get("resolvedBy")
+            if rb is not None and rb not in resolved_by:
+                resolved_by.append(rb)
+            conf = meta.get("confidence")
+            if conf is not None:
+                try:
+                    confidences.append(float(conf))
+                except (TypeError, ValueError):
+                    pass
+    if not rows:
+        return {"resolvedBy": [], "confidence": None, "dispatch_candidate": True}
+    return {
+        "resolvedBy": resolved_by,
+        "confidence": min(confidences) if confidences else None,
+        "dispatch_candidate": candidate,
+    }

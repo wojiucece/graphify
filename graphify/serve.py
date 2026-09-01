@@ -1632,10 +1632,18 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
     B2：get_node 自报 override——result 四元组 (text, found, scanned, override) 取末元
     （显式 param 优先，契约不破）。verdict 优先级：degraded（freshness=rebuilding）压倒
     一切 > override > 推导（Task 2 minor 交接：override 原分支绕过 degraded，B2 首个真实
-    消费者，两者可同现——顺带修正并锁定）。"""
+    消费者，两者可同现——顺带修正并锁定）。
+    B3：5 元组 (text, found, scanned, override, extra_meta) 时 extra_meta 并入 _meta
+    （blast-radius 的 _meta.closure_size）；3/4 元组路径逐字节不受影响（tool_meta={} 不并入）。
+    """
     if name not in _SEARCH_TOOLS:
         return result
-    if isinstance(result, tuple) and len(result) == 4:
+    tool_meta = {}
+    if isinstance(result, tuple) and len(result) == 5:
+        text, found, scanned, tool_override, tool_meta = result
+        if verdict_override is None:
+            verdict_override = tool_override   # 无显式 param 时取工具自报
+    elif isinstance(result, tuple) and len(result) == 4:
         text, found, scanned, tool_override = result
         if verdict_override is None:
             verdict_override = tool_override   # 无显式 param 时取工具自报
@@ -1645,6 +1653,8 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
     v, meta = _derive_verdict(tool=name, found=found, scanned_nodes=scanned, degraded=degraded)
     if v != "degraded" and verdict_override is not None:
         v, meta = verdict_override, {}
+    if tool_meta:
+        meta = {**meta, **tool_meta}
     return _envelope(text, verdict=v, freshness=freshness, **meta)
 
 
@@ -1786,6 +1796,328 @@ def _neighbor_summary_lines(G, nid, db_path, top=10):
     if extra > 0:
         lines.append(f"  (+{extra} more)")
     return lines
+
+
+# === CUSTOM: B3 get_neighbors direction/depth/fanout/blast-radius（Phase 4 Task 9）===
+
+
+def _symbol_short_name(d: dict, nid: str) -> str:
+    """B3 R3-2 合并图短名：label 首 token 末段（消歧后缀 ' (N)' 剥离）。
+    serve 自包含副本——graphify 包不反向依赖 scripts/（rebuild_entry._parse_refresh
+    "scripts 无包结构，两文件各持自包含副本，不互相导入" 先例）；与 scripts/adapter.py
+    _symbol_short_name 同源，防漂移锁定靠 test_dispatch_trace 一致性测试。"""
+    return str(d.get("label") or nid).split(" ")[0].rsplit(".", 1)[-1]
+
+
+_DISPATCH_RESOLVED_BY = frozenset({"instance-method", "fuzzy", "qualified-name"})
+
+
+def _dispatch_candidate(meta: dict | None) -> bool:
+    """B3 R4-2 双判据并集（serve 自包含副本，同 adapter._dispatch_candidate）：resolvedBy
+    ∈ {instance-method, fuzzy, qualified-name, None} 或 confidence<0.9 → 分发候选（宁多标
+    勿漏标）。无 metadata = resolvedBy None 分支（未记录解析方式 = 不可信）→ True。"""
+    if not meta:
+        return True
+    if meta.get("resolvedBy") in _DISPATCH_RESOLVED_BY or meta.get("resolvedBy") is None:
+        return True
+    conf = meta.get("confidence")
+    try:
+        if conf is not None and float(conf) < 0.9:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
+    """B3 R4-2 铰链改键（serve 自包含副本，同 adapter._edge_dispatch_info）：合并边无
+    DB edge id——source_file+kind+两端短名 JOIN 定候选组，组内最保守取值（confidence=min、
+    dispatch_candidate=any、resolvedBy 数组）；空组 → dispatch_candidate=True 宁多标。"""
+    rows = conn.execute(
+        "SELECT e.metadata FROM edges e "
+        "JOIN nodes ns ON e.source = ns.id "
+        "JOIN nodes nt ON e.target = nt.id "
+        "WHERE e.kind = ? AND ns.file_path = ? AND ns.name = ? AND nt.name = ?",
+        (kind, source_file, src_name, tgt_name)).fetchall()
+    resolved_by = []
+    confidences = []
+    candidate = False
+    for (meta_json,) in rows:
+        meta = None
+        if meta_json:
+            try:
+                meta = json.loads(meta_json)
+            except ValueError:
+                meta = None
+        candidate = candidate or _dispatch_candidate(meta)
+        if meta:
+            rb = meta.get("resolvedBy")
+            if rb is not None and rb not in resolved_by:
+                resolved_by.append(rb)
+            conf = meta.get("confidence")
+            if conf is not None:
+                try:
+                    confidences.append(float(conf))
+                except (TypeError, ValueError):
+                    pass
+    if not rows:
+        return {"resolvedBy": [], "confidence": None, "dispatch_candidate": True}
+    return {"resolvedBy": resolved_by,
+            "confidence": min(confidences) if confidences else None,
+            "dispatch_candidate": candidate}
+
+
+_DIGRAPH_CACHE_MAX_ENTRIES = 2
+# B3 M1：_digraph_view 有向视图缓存 {resolved_path: (mtime_ns, size, nx.DiGraph)}。
+# 生产 graph.json 11MB——每次请求重解析是 P95 杀手；mtime+size 双键命中复用（同
+# scripts/ranked.py _GRAPH_CACHE 模式，rebuild 后 mtime 必变自动失效）。并发 miss
+# 重复加载无害（幂等，后写覆盖，CPython dict 单键赋值原子）。容量上界 2：DiGraph
+# 内存占用大（与 nx.Graph 同级），多项目热切换最多驻留 2 份。
+_DIGRAPH_CACHE: dict[str, tuple[int, int, nx.DiGraph]] = {}
+
+
+def _digraph_view(graph_path) -> nx.DiGraph:
+    """B3 R3-1 有向视图：直接读原始 graph.json 的 links source/target 建 DiGraph。
+    生产 graph.json 实测 directed:false——_load_graph 产 nx.Graph，node_link_graph
+    无向化即丢方向（links 的 source/target 被折叠进无向邻接）；B3 不吃无向 G，反向
+    闭包在无向图上混入下游调用方（系统性过报）。节点/边属性（kind/label/source_file/
+    relation/confidence）原样带上（E2/N4 fixture 纪律）。"""
+    resolved = Path(graph_path).resolve()
+    try:
+        st = resolved.stat()
+    except OSError:
+        return nx.DiGraph()
+    key = str(resolved)
+    hit = _DIGRAPH_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        # L-B 命中移到最新：del 后重插（Python 3.7+ dict 保插入序，迭代首键即最旧）
+        del _DIGRAPH_CACHE[key]
+        _DIGRAPH_CACHE[key] = hit
+        return hit[2]
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return nx.DiGraph()
+    # 兼容旧图：edges 键等价 links（与 _load_graph 同款 shim）
+    if "links" not in data and "edges" in data:
+        data = dict(data, links=data["edges"])
+    DG = nx.DiGraph()
+    for n in data.get("nodes", []):
+        nid = n.get("id")
+        if nid is None:
+            continue
+        attrs = {k: v for k, v in n.items() if k != "id"}
+        if attrs:
+            DG.add_node(nid, **attrs)
+        else:
+            DG.add_node(nid)
+    for lk in data.get("links", []):
+        s, t = lk.get("source"), lk.get("target")
+        if s is None or t is None:
+            continue
+        DG.add_edge(s, t, **{k: v for k, v in lk.items() if k not in ("source", "target")})
+    _DIGRAPH_CACHE[key] = (st.st_mtime_ns, st.st_size, DG)
+    if len(_DIGRAPH_CACHE) > _DIGRAPH_CACHE_MAX_ENTRIES:
+        oldest = next(iter(_DIGRAPH_CACHE))
+        del _DIGRAPH_CACHE[oldest]
+    return DG
+
+
+def _reverse_closure(DG: nx.DiGraph, node, depth, top_k) -> tuple[list[str], int]:
+    """B3 blast-radius 载体：有向图上反向 BFS（等价 nx.bfs_layers(DG.reverse(copy=False),
+    node) 取前 depth 层）得祖先，按度数排序取 top-k；返回 (ids, 全量闭包尺寸)。
+    只吃 DiGraph——无向图上"反向"退化为普通 BFS，调用方与被调用方混入 = 系统性过报，
+    类型注解 + 运行时 isinstance 断言强制防误用。"""
+    if not isinstance(DG, nx.DiGraph):
+        raise TypeError("_reverse_closure requires nx.DiGraph (call _digraph_view first)")
+    # nx.bfs_layers 首层是源节点自身（距离 0），blast-radius 要距离 1..depth 的祖先，
+    # 故切 [1:depth+1]（与"depth=1 即直接邻居"语义一致）。
+    layers = list(nx.bfs_layers(DG.reverse(copy=False), node))[1:depth + 1]
+    ids = [n for layer in layers for n in layer]
+    ranked = sorted(ids, key=lambda n: (-DG.degree(n), n))
+    return ranked[:top_k], len(ids)
+
+
+def _fanout_targets(DG: nx.DiGraph, target_id) -> tuple[list[str], str]:
+    """B3 fan-out 重展开：dispatch 调用目标 → 全部分类 override 候选。
+    三边联走：反向 contains 且 predecessor kind=='class' 得所属类 → extends/implements
+    反向 BFS 得子类集 → 各子类 contains 出边下短名与 target 短名相等的节点 = 全部可能目标。
+    任一步无果 → (原单目标, 'unavailable: no owning class')。同名匹配只走 label
+    （id 是 hash 形态无语义，R3-2 _symbol_short_name）。"""
+    if target_id not in DG:
+        return [target_id], "unavailable: no owning class"
+    tgt_short = _symbol_short_name(DG.nodes[target_id], target_id)
+    owning = [p for p in DG.predecessors(target_id)
+              if DG.nodes[p].get("kind") == "class"
+              and DG.edges[p, target_id].get("relation") == "contains"]
+    if not owning:
+        return [target_id], "unavailable: no owning class"
+    subclasses: list[str] = []
+    frontier = list(owning)
+    seen = set(owning)
+    while frontier:
+        nxt = []
+        for cls in frontier:
+            for child in DG.predecessors(cls):
+                if child in seen:
+                    continue
+                if DG.edges[child, cls].get("relation") not in ("extends", "implements"):
+                    continue
+                seen.add(child)
+                subclasses.append(child)
+                nxt.append(child)
+        frontier = nxt
+    targets = [target_id]
+    for cls in subclasses:
+        for succ in DG.successors(cls):
+            if DG.edges[cls, succ].get("relation") != "contains":
+                continue
+            if _symbol_short_name(DG.nodes[succ], succ) == tgt_short:
+                targets.append(succ)
+    return targets, ""
+
+
+def _neighbors_lines(G, nid, rel_filter=""):
+    """B3 缺省路径正文装配：direction/depth 未给定时的既有 G 语义——与扩展前
+    _tool_get_neighbors 的 successors/predecessors 循环逐字节一致（无向图上双向输出
+    本就同集合；方向只在 B3 有向视图路径用）。模块级提取以便缺省回归锚点测试。"""
+    lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+
+    def _edge_at(d: dict) -> str:
+        # Edge location = the relation SITE (call/import line) in the source
+        # node's file, not a def line (#BUG1).
+        loc = str(d.get("source_location") or "")
+        return (
+            f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
+            if loc else ""
+        )
+
+    # 生产 G 是 _load_graph 强制 directed:True 的 DiGraph（有向边逐一存储）——
+    # 保持 successors/predecessors 双循环逐字节不变；无向 Graph（缺省锚点测试的
+    # 逻辑无向形态）退化为 neighbors 双扫，双向输出本就同集合（_top_neighbor_ids 同款）。
+    if G.is_directed():
+        succ_iter, pred_iter = G.successors(nid), G.predecessors(nid)
+    else:
+        nb = list(G.neighbors(nid))
+        succ_iter, pred_iter = nb, nb
+    for nb in succ_iter:
+        d = edge_data(G, nid, nb)
+        rel = d.get("relation", "")
+        if rel_filter and rel_filter not in rel.lower():
+            continue
+        lines.append(
+            f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+        )
+    for nb in pred_iter:
+        d = edge_data(G, nb, nid)
+        rel = d.get("relation", "")
+        if rel_filter and rel_filter not in rel.lower():
+            continue
+        lines.append(
+            f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+        )
+    return lines
+
+
+def _toward_edge(DG, closure_set, nid, u, incoming):
+    """B3 新路径辅助：闭包节点 u 指向 nid 的那条边——ancestor（incoming）扫 successors、
+    descendant 扫 predecessors，取 (closure∪{nid}) 内排序首个；无则 (None, None)。
+    排序保证确定性输出（BFS 保证 toward 节点必在闭包内，排序仅影响多后继时的取舍）。"""
+    it = DG.successors(u) if incoming else DG.predecessors(u)
+    for v in sorted(it):
+        if v == nid or v in closure_set:
+            return v, DG.edges[(u, v) if incoming else (v, u)]
+    return None, None
+
+
+def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=None):
+    """B3 新路径正文装配（direction 或 depth>1 给定）：_digraph_view 产物上反向/正向闭包
+    + 逐节点 toward 边 + dispatch 标注（仅 depth>1，R5-5(b)：depth=1 普通邻接不查 DB——
+    hub 节点 50-200 邻边逐边 JOIN（edges 30k 行无 kind/source 索引）是 P95 杀手，且
+    depth=1 场景 agent 本要逐条看边、标注价值最低；top-50 截断后 ≤50 次 JOIN 有界）+
+    fanout 重展开 + 截断标志。edge_kinds 已由调用方过滤进 DG（本函数不重收）。返回
+    (lines, closure_total)。
+    """
+    if nid not in DG:
+        return [f"Neighbors of {sanitize_label(str(nid))} "
+                f"(direction={direction}, depth={depth}): (node missing from current directed view)"], 0
+    lines = [f"Neighbors of {sanitize_label(str(DG.nodes[nid].get('label') or nid))} "
+             f"(direction={direction}, depth={depth}):"]
+    FULL = 10 ** 9  # 取全量闭包 id（top-k 截断后 toward 边可能在截断区外，闭包集须全）
+    if direction == "in":
+        full_ids, total = _reverse_closure(DG, nid, depth, top_k=FULL)
+        show = full_ids[:top_k]
+        in_set, out_set = set(full_ids), set()
+    elif direction == "out":
+        full_ids, total = _reverse_closure(DG.reverse(copy=False), nid, depth, top_k=FULL)
+        show = full_ids[:top_k]
+        in_set, out_set = set(), set(full_ids)
+    else:
+        in_full, _in_total = _reverse_closure(DG, nid, depth, top_k=FULL)
+        out_full, _out_total = _reverse_closure(DG.reverse(copy=False), nid, depth, top_k=FULL)
+        merged = list(dict.fromkeys(in_full + out_full))
+        total = len(merged)
+        show = sorted(merged, key=lambda n: (-DG.degree(n), n))[:top_k]
+        in_set, out_set = set(in_full), set(out_full)
+    closure_full = in_set | out_set
+    conn = None
+    use_dispatch = depth > 1
+    if use_dispatch and db_path is not None:
+        db = Path(db_path)
+        if db.exists():
+            import sqlite3 as _sqlite3
+            try:
+                conn = _sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+            except _sqlite3.Error:
+                conn = None
+    try:
+        for u in show:
+            if u in in_set and u in out_set:
+                arrow, incoming = "<->", True
+            elif u in out_set:
+                arrow, incoming = "-->", False
+            else:
+                arrow, incoming = "<--", True
+            v, ed = _toward_edge(DG, closure_full, nid, u, incoming)
+            if v is None:
+                continue
+            rel = str(ed.get("relation", ""))
+            if rel_filter and rel_filter not in rel.lower():
+                continue
+            loc = str(ed.get("source_location") or "")
+            at = (f" at={sanitize_label(str(ed.get('source_file') or ''))}:{sanitize_label(loc)}"
+                  if loc else "")
+            line = (f"  {arrow} {sanitize_label(str(DG.nodes[u].get('label') or u))} "
+                    f"[{sanitize_label(rel)}] [{sanitize_label(str(ed.get('confidence', '')))}]{at}")
+            if conn is not None:
+                info = _edge_dispatch_info(
+                    conn,
+                    ed.get("source_file") or DG.nodes[u].get("source_file") or "",
+                    rel,
+                    _symbol_short_name(DG.nodes[u], u),
+                    _symbol_short_name(DG.nodes[v], v))
+                rb = ",".join(info["resolvedBy"]) or "unknown"
+                conf = info["confidence"]
+                conf_s = f"{conf:g}" if isinstance(conf, (int, float)) else "?"
+                if info["dispatch_candidate"]:
+                    line += f" [dispatch: resolvedBy={rb}, confidence={conf_s}]"
+                    fan_targets, note = _fanout_targets(DG, v)
+                    if note:
+                        line += f" fanout=({note})"
+                    elif len(fan_targets) > 1:
+                        line += " fanout=(" + ", ".join(
+                            _symbol_short_name(DG.nodes[t], t) for t in fan_targets[1:]) + ")"
+                else:
+                    line += f" [resolvedBy={rb}, confidence={conf_s}]"
+            lines.append(line)
+    finally:
+        if conn is not None:
+            conn.close()
+    if total > len(show):
+        lines.append(f"  (blast radius: {total} nodes; showing top {len(show)} by degree)")
+    return lines, total
 
 
 def _format_node_card(G, nid, d) -> str:
@@ -1965,12 +2297,24 @@ def _build_server(graph_path: str):
             ),
             types.Tool(
                 name="get_neighbors",
-                description="Get all direct neighbors of a node with edge details.",
+                description=(
+                    "Get neighbors of a node with edge details. depth=1 lists direct "
+                    "neighbors (undirected); depth>1 returns the blast radius on the "
+                    "directed view (callers for direction=in, callees for direction=out) "
+                    "with dispatch/fanout annotations and low-confidence verdict. "
+                    "edge_kinds restricts traversal to the given relation kinds."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "label": {"type": "string"},
                         "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
+                        "direction": {"type": "string", "enum": ["out", "in", "both"],
+                                      "description": "Edge direction on the directed view (default: undirected legacy)"},
+                        "depth": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1,
+                                  "description": "BFS depth; 1=direct neighbors, >1=blast radius"},
+                        "edge_kinds": {"type": "array", "items": {"type": "string"},
+                                       "description": "Optional: restrict traversal to these relation kinds"},
                         "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
                     },
                     "required": ["label"],
@@ -2227,7 +2571,7 @@ def _build_server(graph_path: str):
                 override = override or "low_confidence"
         return "\n".join(card), True, 1, override  # N1 found=节点已解析, scanned=1（扫描语义表）
 
-    def _tool_get_neighbors(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+    def _tool_get_neighbors(arguments: dict) -> tuple:  # CUSTOM: N1 三元组
         label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         nid, err = _resolve_single_node(G, label)
@@ -2235,39 +2579,51 @@ def _build_server(graph_path: str):
             # CUSTOM: N1 未解析出起点 -> 邻接边数无定义；标签解析扫过全图，
             # scanned=全图节点数（空图时为 0，empty_graph 旗标恰真；非空图不误报）。
             return err, False, G.number_of_nodes()
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-        def _edge_at(d: dict) -> str:
-            # Edge location = the relation SITE (call/import line) in the source
-            # node's file, not a def line (#BUG1).
-            loc = str(d.get("source_location") or "")
-            return (
-                f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
-                if loc else ""
-            )
-        for nb in G.successors(nid):
-            d = edge_data(G, nid, nb)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
-        for nb in G.predecessors(nid):
-            d = edge_data(G, nb, nid)
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
+        direction = arguments.get("direction")
+        raw_depth = arguments.get("depth", 1)
+        depth = raw_depth
+        if isinstance(raw_depth, str) and raw_depth.lstrip("-").isdigit():
+            depth = int(raw_depth)
         budget = int(arguments.get("token_budget", 2000))
-        # CUSTOM: N1 found=起点在图（已解析），scanned=邻接边数（扫描语义表；
-        # 检查过的邻接边总数，不随 relation_filter 过滤结果减少）。
-        return _cut_lines_to_budget(
-            lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
-        ), True, G.degree(nid)
+        # 缺省路径回归锁定：无 direction 且 depth<=1 时保持既有 G 上 successors/
+        # predecessors 循环逐字节不变（无向图上双向输出本就同集合；方向只在 B3
+        # 有向视图路径用）。direction/depth>1 新路径只在 _digraph_view 产物上走。
+        if direction is None and depth == 1:
+            lines = _neighbors_lines(G, nid, rel_filter)
+            # CUSTOM: N1 found=起点在图（已解析），scanned=邻接边数（扫描语义表；
+            # 检查过的邻接边总数，不随 relation_filter 过滤结果减少）。
+            return _cut_lines_to_budget(
+                lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
+            ), True, G.degree(nid)
+        # --- B3 新路径（direction 或 depth>1 给定）---
+        if not isinstance(depth, int) or isinstance(depth, bool) or not 1 <= depth <= 3:
+            return (f"Invalid depth {raw_depth!r}; expected integer 1..3.",
+                    False, G.number_of_nodes())
+        if direction not in ("out", "in", "both"):
+            return (f"Invalid direction {direction!r}; expected 'out', 'in' or 'both'.",
+                    False, G.number_of_nodes())
+        edge_kinds = arguments.get("edge_kinds")
+        DG = _digraph_view(active_graph_path)
+        if edge_kinds:
+            kinds = {k.lower() for k in edge_kinds}
+            DGF = nx.DiGraph()
+            DGF.add_nodes_from(DG.nodes(data=True))
+            for u, v, d in DG.edges(data=True):
+                if str(d.get("relation", "")).lower() in kinds:
+                    DGF.add_edge(u, v, **d)
+            DG = DGF
+        top_k = 50  # R5-5：top-50 截断后 dispatch 逐边 JOIN ≤50 次有界
+        db_path = Path(active_graph_path).parent.parent / ".codegraph" / "codegraph.db"
+        lines, total = _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
+                                           db_path=db_path)
+        # R3-3 verdict：depth=1（无 dispatch 边，R5-5(b) 不查 DB）→ 走推导（ok）；
+        # depth>1（blast-radius）→ low_confidence 经 verdict_override 直通 + advisory
+        # 措辞（Q14——输出建立在边语义不完整的图上，advisory 不可省）。
+        # N1：found=起点在图，scanned=闭包全量尺寸，extra_meta 带 _meta.closure_size。
+        override = "low_confidence" if depth > 1 else None
+        text = _cut_lines_to_budget(lines, budget,
+                                    "Narrow with relation_filter or reduce depth")
+        return text, True, total, override, {"closure_size": total}
 
     def _tool_get_community(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         cid = int(arguments["community_id"])
