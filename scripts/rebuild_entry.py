@@ -1,4 +1,4 @@
-"""单一重建入口：codegraph sync -> graphify 分析重建（指纹收敛循环）。
+"""单一重建入口：codegraph sync -> graphify 分析重建（指纹复核：变化不再重跑）。
 
 三个触发面（watch.py 代码事件 / SessionEnd hook / PreCompact hook）都改指本入口。
 跨进程互斥用 mkdir 原子锁；完成信号用子进程退出码（codegraph 无对外 sync 事件，F1/F5）。"""
@@ -156,17 +156,17 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
         # db 存在性检查在锁之后（测试 test_lock_held_exits_3 预建锁 -> 应 exit 3 而非 FileNotFoundError）
         if not db.exists():
             raise FileNotFoundError(f"{db} 不存在--先跑 codegraph init")
-        for _ in range(2):                                    # 指纹收敛，最多两轮
+        for _ in range(2):                                    # 指纹复核，最多两轮
             if not skip_sync:
                 code = _sync_with_retry(root)                 # 非零短退避重试后仍失败 -> 降级退出
                 if code != 0:
                     _log(f"sync 重试后仍失败（exit {code}），放弃本轮，交下个触发面兜底")
                     sys.exit(EXIT_SYNC_FAIL)
             f0 = db_fingerprint(db)
-            # A1a: rebuilding 标记（每轮重写，幂等）。db_fingerprint 复用 f0——不额外调
-            # db_fingerprint（少一次只读查询，且保住 test_rebuild_requeued 的 4 次调用预算）；
-            # f0 即本轮收敛基线，语义与重查一致。N2: 继承上轮 last_duration（否则时效逃生
-            # 2x 项恒 0，设计静默失效）。写权在锁 owner；serve 只读无写竞态。
+            # A1a: rebuilding 标记（幂等）。db_fingerprint 复用 f0——不额外调 db_fingerprint
+            # （少一次只读查询）；f0 即本轮收敛基线，语义与重查一致。N2: 继承上轮
+            # last_duration（否则时效逃生 2x 项恒 0，设计静默失效）。写权在锁 owner；
+            # serve 只读无写竞态。
             _write_state(root, lock, {
                 "schema": 1, "phase": "rebuilding", "started": t0,
                 "project": str(root), "db_fingerprint": list(f0),
@@ -174,9 +174,13 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
             from run_analysis import run                        # 懒导入（scripts/ 在 sys.path）
             run(db, output_dir=out, root=str(root),
                 semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
+            # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
+            # watch/hook 事件流兜底（变化本身说明后续触发面已排队/即将触发，重跑只
+            # 增加锁内阻塞时长）。循环结构保留（range(2) 仅走一轮），便于回滚对比。
             if db_fingerprint(db) == f0:
                 return out
-            _log("重建期间 DB 变化（daemon 并发写入），再排一轮")
+            _log("重建期间 DB 变化（daemon 并发写入），已记录日志；不再重跑，交下个触发面兜底")
+            return out
         _log("两轮不收敛，交下个触发面兜底")                    # watch/hook 事件流保证最终触发
         return out
     except BaseException:

@@ -65,6 +65,27 @@ def _mk_full_db(tmp_path):
     return db
 
 
+def test_rebuild_fingerprint_change_logs_without_rerun(tmp_path, monkeypatch, capsys):
+    """A3 验收第 2 条：重建期间 DB 变化 -> 记录日志、不再重跑（watch/hook 事件流兜底）."""
+    import sqlite3
+    import rebuild_entry
+    db = tmp_path / ".codegraph" / "codegraph.db"; db.parent.mkdir(parents=True)
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,applied_at INTEGER,description TEXT)")
+    c.execute("CREATE TABLE files(path TEXT PRIMARY KEY,content_hash TEXT,language TEXT,size INTEGER,"
+              "modified_at INTEGER,indexed_at INTEGER,node_count INTEGER,errors TEXT,generated INTEGER)")
+    c.execute("INSERT INTO schema_versions VALUES(9,0,'x')"); c.commit(); c.close()
+    monkeypatch.setattr(rebuild_entry, "run_codegraph_sync", lambda r: 0)
+    fingerprints = iter([(1, 0), (2, 0)])   # f0=(1,0)，重建后比对=(2,0)——两轮指纹不同
+    monkeypatch.setattr(rebuild_entry, "db_fingerprint", lambda d: next(fingerprints))
+    run_calls = []
+    monkeypatch.setattr("run_analysis.run", lambda *a, **k: run_calls.append(1) or Path(tmp_path))
+    rebuild_entry.rebuild(tmp_path, db_path=db, out_dir=tmp_path / "out")
+    assert len(run_calls) == 1               # 只调 run 一次，不再重跑
+    err = capsys.readouterr().err
+    assert "DB 变化" in err and "不再重跑" in err   # stderr 含变化日志
+
+
 def test_load_codegraph_opens_read_transaction(tmp_path, monkeypatch):
     """load_codegraph 首语句必须 BEGIN——否则各 SELECT 各自独立快照（autocommit），
     不满足 A3 单事务契约（并发写期间读取不恒为快照值）."""
