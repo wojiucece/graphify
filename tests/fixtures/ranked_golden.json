@@ -1,0 +1,12 @@
+[
+  {"q": "sanitize_label", "type": "identifier", "expect": ["function:fdcadfc04d5b1d422f7269791519d40a", "function:16cf7454816d964391dae08b38ca4ddb"]},
+  {"q": "normalize_id", "type": "identifier", "expect": ["function:555c22d0aaf1717e8bb1824c08198272", "function:688e77cebb686b03a1e8b26d08cbdc6e"]},
+  {"q": "god_nodes", "type": "identifier", "expect": ["function:802eccc5d881726469dd7574f42e11e8", "variable:39e9ec56d8871edf5598b407b4000277", "function:856f99c8da87cbc610f90db87294e5b0"]},
+  {"q": "query_graph", "type": "identifier", "expect": ["function:3cec8f34ca5c1ffc042b0e24629121bd", "function:3a21d01cc593032c2b74b8b9d6eaa214"]},
+  {"q": "watch 防抖 降级", "type": "cjk", "expect": ["file:graphify/watch.py", "function:5c7a654bb706eeb7bddd8499a971f087"]},
+  {"q": "rebuild 状态文件", "type": "cjk", "expect": ["function:23976b645364b9dcf281440db703e0d4", "function:d21fdd901881866c348635e43d9f4307", "file:scripts/rebuild_entry.py"]},
+  {"q": "rebuild_entry 锁 触发流程", "type": "traversal", "expect": ["file:scripts/rebuild_entry.py", "function:a553e9de347b2741165f50cb0027be3b", "file:tests/test_rebuild_entry.py"]},
+  {"q": "fetch_prs 到 compute_pr_impact 的调用链", "type": "traversal", "expect": ["function:b802f43512b0ac51afdbea3b6a0d9ccf", "function:2acd4998b992cf3fa9331da048850259"]},
+  {"q": "errno 处理", "type": "gap", "gap": true, "expect": ["import:5b516cb733bd313b102f29ab2f059f2b"]},
+  {"q": "sys 模块", "type": "gap", "gap": true, "expect": ["import:8422154bebe703b2341e84565bd82906", "import:f1bd18f4f6157f4b42f212bc266947f9"]}
+]

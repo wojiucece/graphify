@@ -1561,7 +1561,8 @@ _REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
 # 检索型工具清单（判据 = 响应内容反映图数据现状）；新工具（B1/B3/C 系）登记处——
 # 清单外工具裸 str 直通，新增检索型工具若拒绝登记则出口不予合并。
 _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
-                           "god_nodes", "shortest_path", "graph_stats"})
+                           "god_nodes", "shortest_path", "graph_stats",
+                           "get_ranked_context"})  # CUSTOM: B1 融合检索登记
 
 
 def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
@@ -1830,6 +1831,29 @@ def _build_server(graph_path: str):
                 },
             ),
             types.Tool(
+                # CUSTOM: B1 融合检索（scripts/ranked.py，四通道）。token_budget 用
+                # enum（受限取值参数 → JSON schema enum，无效值走参数校验失败 isError）。
+                name="get_ranked_context",
+                description=(
+                    "Rank code symbols by mixed retrieval: FTS5 BM25 x exact-name "
+                    "pinning x graph centrality under a token budget. Best first step "
+                    "to locate relevant symbols for a code query. Then fetch the actual "
+                    "implementation with get_node(label=..., include_source='body') "
+                    "(two-step: search here, fetch there)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "Code query: identifier tokens (English) route to FTS/pinning, CJK tokens to graph labels"},
+                        "token_budget": {"type": "integer", "default": 2000,
+                                         "enum": [500, 1000, 2000, 4000, 8000],
+                                         "description": "Max output tokens (tier)"},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
                 name="list_prs",
                 description=(
                     "List open GitHub PRs with CI status, review state, and graph impact "
@@ -2053,6 +2077,23 @@ def _build_server(graph_path: str):
         found = not (text.startswith("No ") or "both resolved to the same node" in text)
         return text, found, G.number_of_nodes()
 
+    def _tool_get_ranked_context(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+        # scripts/ 无包结构：lazy sys.path + import（graphify 包不反向依赖 scripts/，
+        # 仅在本工具被调用时才把 repo_root/scripts 挂到 sys.path——rebuild_entry 先例）。
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from ranked import ranked_context, format_ranked
+        query = arguments["query"]
+        budget = int(arguments.get("token_budget", 2000))
+        # 路径联动总条款：root 从当前 active graph（graphify-out/graph.json）推导，
+        # 多项目随请求图走（与 _derive_freshness 的 state_path.parent.parent 同构）。
+        root = Path(active_graph_path).parent.parent
+        r = ranked_context(root, query, token_budget=budget)
+        # CUSTOM: N1 found=结果非空, scanned=候选池大小（query_shape.scanned）。
+        return format_ranked(r), bool(r["results"]), int(r["query_shape"]["scanned"])
+
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -2146,6 +2187,7 @@ def _build_server(graph_path: str):
         "god_nodes": _tool_god_nodes,
         "graph_stats": _tool_graph_stats,
         "shortest_path": _tool_shortest_path,
+        "get_ranked_context": _tool_get_ranked_context,  # CUSTOM: B1
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,
