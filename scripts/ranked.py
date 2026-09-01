@@ -47,8 +47,12 @@ _tiktoken_enc = None  # 可选依赖惰性缓存：None=未探测 / False=不可
 # M1：合并图加载缓存 {graph_path_str: (mtime_ns, size, (degree, collision_bases, nodes))}。
 # 失效语义：mtime 与 size 双键命中才复用——rebuild 后 mtime 必变自动失效（Windows
 # st_mtime_ns 精度足够，~100ns 粒度远小于 rebuild 间隔）。缓存按 path_str 分键，多项目
-# 热切换互不串。并发安全：MCP 请求在单协程同步段内顺序执行，模块级 dict 读写无竞争，
-# 无需加锁。
+# 热切换互不串。并发安全：FastMCP sync handler 实际跑线程池，并发请求存在竞争——但
+# CPython dict 单键赋值原子（GIL），并发 miss 时重复加载无害（payload 幂等，后写覆盖
+# 先写内容相同），无需加锁；禁止以"单协程顺序执行"假设为依据添加非原子操作（如分步
+# get-then-put 删改，会在并发下撕裂）。L-B 容量上界：_GRAPH_CACHE_MAX_ENTRIES = 8，
+# 多项目热切换下最多驻留 8 份解析后整图（~50-150MB/项目），防无限增长。
+_GRAPH_CACHE_MAX_ENTRIES = 8
 _GRAPH_CACHE: dict[str, tuple[int, int, tuple[dict, set, list]]] = {}
 _graph_loads = 0  # M1 诊断：实际 json.loads 全量图次数（cache miss 才 +1），供测试/日志验证命中率
 
@@ -152,6 +156,9 @@ def _load_graph(graph_path: Path):
         return None, None, []
     hit = _GRAPH_CACHE.get(key)
     if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        # L-B 命中移到最新：del 后重插（Python 3.7+ dict 保插入序，迭代首键即最旧）
+        del _GRAPH_CACHE[key]
+        _GRAPH_CACHE[key] = hit
         return hit[2]
     try:
         g = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -170,9 +177,14 @@ def _load_graph(graph_path: Path):
         if nid and _CG_SUFFIX_RE.search(_normalize_id(nid)):
             collision_bases.add(nid.split("__cg")[0])
     payload = (degree, collision_bases, g.get("nodes", []))
+    # 共享可变引用：payload（nodes list / degree dict）与调用方共享同一对象，
+    # 调用方须只读；mutate 会污染缓存（后续命中直接复用该对象）。
     global _graph_loads
     _graph_loads += 1
     _GRAPH_CACHE[key] = (st.st_mtime_ns, st.st_size, payload)
+    if len(_GRAPH_CACHE) > _GRAPH_CACHE_MAX_ENTRIES:
+        oldest = next(iter(_GRAPH_CACHE))   # 插入序首键 = 最旧条目（LRU 驱逐）
+        del _GRAPH_CACHE[oldest]
     return payload
 
 

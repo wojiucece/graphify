@@ -147,6 +147,21 @@ def test_graph_cache_reuses_between_queries(mini_db):
     ranked_context(mini_db, "debounce grace", token_budget=2000)
     assert ranked._graph_loads == loads_first == 1, "第二次查询应命中缓存（loads 不增）"
 
+def test_graph_cache_invalidates_on_utime_change(mini_db):
+    """M1 失效：同 root 查询后 os.utime 改 mtime（size 不变）→ 再查询触发重载（loads=2）.
+    rebuild 后 mtime 必变（Windows st_mtime_ns ~100ns 粒度远小于 rebuild 间隔），
+    此断言锁定"mtime 变 → 缓存必失效"这一失效语义。"""
+    import ranked
+    import time
+    ranked._graph_loads = 0
+    ranked_context(mini_db, "debounce grace", token_budget=2000)
+    assert ranked._graph_loads == 1
+    graph = mini_db / "graphify-out" / "graph.json"
+    t = time.time_ns()
+    os.utime(graph, ns=(t + 10**9, t + 10**9))
+    ranked_context(mini_db, "debounce grace", token_budget=2000)
+    assert ranked._graph_loads == 2, "mtime 变更应失效缓存（重载全量图）"
+
 def test_missing_db_returns_absent_not_error(tmp_path):
     """M4：非 codegraph 项目（无 .codegraph/codegraph.db，多项目热切换目标）→
     absent + db_missing 标注，不 isError（真错误仅限 DB 在但查询炸）. """
