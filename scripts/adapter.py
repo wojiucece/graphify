@@ -221,7 +221,9 @@ def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
     （→ DB kind）+ 两端短名（nodes.name 即短名，_symbol_short_name ↔ nodes.name）在 DB 侧
     JOIN 定候选组（file+kind+双端短名缩到个位数）。组内最保守取值（Q11：不洗白猜测边）：
     confidence=min、dispatch_candidate=any、resolvedBy 数组展示全部。空组 → dispatch_candidate
-    =True 宁多标勿漏标。"""
+    =True 宁多标勿漏标。
+    M2（review 注释登记，已知模糊面）：同名重载并组——同文件同 kind 同短名对的候选组会
+    把其他重载方法的 min confidence / resolvedBy 灌入。宁多标方向：保守可接受（Q11）。"""
     rows = conn.execute(
         "SELECT e.metadata FROM edges e "
         "JOIN nodes ns ON e.source = ns.id "

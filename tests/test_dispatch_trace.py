@@ -1,10 +1,31 @@
 """B3：dispatch 双判据 / 有向视图反向闭包（R3-1）/ fan-out label 匹配（R3-2）/ 生产形态 fixture."""
-import json, sys
+import json, sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import networkx as nx
+import pytest
 from adapter import _dispatch_candidate, _symbol_short_name
+
+
+def _mk_db(tmp_path, nodes, edges):
+    """构造 B3 分发测试 DB：nodes=(id,kind,name,qname,file_path,lang,sl,el),
+    edges=(source,target,kind,metadata). 返回 db 路径。"""
+    db = tmp_path / ".codegraph" / "codegraph.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT, "
+                 "qualified_name TEXT, file_path TEXT, language TEXT, start_line INT, "
+                 "end_line INT, docstring TEXT, signature TEXT)")
+    conn.execute("CREATE TABLE edges (id INTEGER PRIMARY KEY, source TEXT, target TEXT, "
+                 "kind TEXT, metadata TEXT, line INT, col INT, provenance TEXT)")
+    conn.executemany(
+        "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [n + (None, None) for n in nodes])
+    conn.executemany("INSERT INTO edges (source,target,kind,metadata) VALUES (?,?,?,?)", edges)
+    conn.commit()
+    conn.close()
+    return db
 
 def test_dispatch_candidate_double_criteria():
     assert _dispatch_candidate({"resolvedBy": "exact-match", "confidence": 0.99}) is False
@@ -211,3 +232,166 @@ def test_serve_selfcontained_copies_match_adapter():
                    ({"label": "main (2)"}, "function:abc"),
                    ({}, "function:xyz")]:
         assert s_ssn(d, nid) == _symbol_short_name(d, nid), f"symbol_short_name 漂移: {d!r} {nid!r}"
+
+
+# === 以下为 review C1/I1 + 补充审核 M1a/M1b/M5 的修复锁定（计划所有者确认的必带测试）====
+
+def test_blast_radius_out_dispatch_hit_not_fallback(tmp_path):
+    """C1 命中路径断言（关键）：out 方向 fixture + 真 DB 行（resolvedBy=instance-method）
+    → 断言输出含 resolvedBy=instance-method 而非 unknown——区分命中/回退态（out src/tgt
+    互换时 JOIN 落空组→unknown，此测防回退态吞失效信号；结构性根因）。"""
+    from graphify.serve import _blast_radius_lines
+    db = _mk_db(tmp_path, [
+        ("function:cc", "function", "caller", "pkg.caller", "pkg/caller.py", "python", 1, 9),
+        ("method:bb", "method", "handle", "pkg.Base.handle", "pkg/base.py", "python", 1, 9)],
+        [("function:cc", "method:bb", "calls",
+          json.dumps({"resolvedBy": "instance-method", "confidence": 0.7}))])
+    DG = nx.DiGraph()
+    DG.add_node("function:c1", kind="function", label="pkg.caller")
+    DG.add_node("method:b1", kind="method", label="pkg.Base.handle")
+    DG.add_edge("function:c1", "method:b1", relation="calls", source_file="pkg/caller.py",
+                confidence="EXTRACTED")
+    # out/depth=2（R5-5(b)：dispatch 仅 depth>1 路径）：闭包 = callees {b1}，toward-edge (c1->b1)
+    lines, total = _blast_radius_lines(DG, "function:c1", "out", 2, 50, "", db_path=db)
+    body = "\n".join(lines)
+    assert "resolvedBy=instance-method" in body, body
+    assert "unknown" not in body   # 命中态不是回退态
+
+def test_blast_radius_out_fanout_lists_subclass_overrides(tmp_path):
+    """C1 out 方向 fanout：caller 调 Base.handle（instance-method 候选），Base 有 Child
+    覆写——从 caller 向 out 走，fanout 应列被调方 Base.handle 的子类覆写 Child.handle
+    （当前 bug 会 fanout 调用侧 caller → 'no owning class' 降级，非覆写列表）。"""
+    from graphify.serve import _blast_radius_lines
+    db = _mk_db(tmp_path, [
+        ("function:cc", "function", "caller", "pkg.caller", "pkg/caller.py", "python", 1, 9),
+        ("method:bb", "method", "handle", "pkg.Base.handle", "pkg/base.py", "python", 1, 9)],
+        [("function:cc", "method:bb", "calls",
+          json.dumps({"resolvedBy": "instance-method", "confidence": 0.7}))])
+    DG = nx.DiGraph()
+    DG.add_node("function:c1", kind="function", label="pkg.caller")
+    DG.add_node("class:b01", kind="class", label="pkg.Base")
+    DG.add_node("method:b1", kind="method", label="pkg.Base.handle")
+    DG.add_node("class:c01", kind="class", label="pkg.Child")
+    DG.add_node("method:c2", kind="method", label="pkg.Child.handle")
+    DG.add_edge("function:c1", "method:b1", relation="calls", source_file="pkg/caller.py",
+                confidence="EXTRACTED")
+    DG.add_edge("class:b01", "method:b1", relation="contains")
+    DG.add_edge("class:c01", "method:c2", relation="contains")
+    DG.add_edge("class:c01", "class:b01", relation="extends")
+    lines, total = _blast_radius_lines(DG, "function:c1", "out", 2, 50, "", db_path=db)
+    body = "\n".join(lines)
+    assert "Child.handle" in body, body   # fanout 展开被调方类层级，非调用侧
+
+def test_blast_radius_contains_edge_no_dispatch_annotation(tmp_path):
+    """I1：contains 边在闭包内无 dispatch 标注——非 calls 边不查 DB、不标 dispatch、
+    不 fanout（god node 噪声根除：52 行中 44 行）。DB 存在且含 contains 行也不查询。"""
+    from graphify.serve import _blast_radius_lines
+    db = _mk_db(tmp_path, [
+        ("class:bb", "class", "Base", "pkg.Base", "pkg/base.py", "python", 1, 9),
+        ("method:bh", "method", "handle", "pkg.Base.handle", "pkg/base.py", "python", 1, 9)],
+        [("class:bb", "method:bh", "contains",
+          json.dumps({"resolvedBy": "exact-match", "confidence": 0.99}))])
+    DG = nx.DiGraph()
+    DG.add_node("class:b01", kind="class", label="pkg.Base")
+    DG.add_node("method:b1", kind="method", label="pkg.Base.handle")
+    DG.add_edge("class:b01", "method:b1", relation="contains", source_file="pkg/base.py",
+                confidence="EXTRACTED")
+    lines, total = _blast_radius_lines(DG, "class:b01", "out", 2, 50, "", db_path=db)
+    body = "\n".join(lines)
+    assert "resolvedBy" not in body and "dispatch" not in body and "fanout" not in body, body
+
+def test_blast_radius_fanout_limited_by_edge_kinds(tmp_path):
+    """M1b：edge_kinds=['calls'] 滤掉 contains/extends → fanout 展开受限，降级 note 用
+    'limited by edge_kinds filter' 而非 'no owning class'（区分"被过滤"与"无所属类"）。"""
+    from graphify.serve import _blast_radius_lines
+    db = _mk_db(tmp_path, [
+        ("function:cc", "function", "caller", "pkg.caller", "pkg/caller.py", "python", 1, 9),
+        ("method:bb", "method", "handle", "pkg.Base.handle", "pkg/base.py", "python", 1, 9)],
+        [("function:cc", "method:bb", "calls",
+          json.dumps({"resolvedBy": "instance-method", "confidence": 0.7}))])
+    DG = nx.DiGraph()
+    DG.add_node("function:c1", kind="function", label="pkg.caller")
+    DG.add_node("class:b01", kind="class", label="pkg.Base")
+    DG.add_node("method:b1", kind="method", label="pkg.Base.handle")
+    DG.add_node("class:c01", kind="class", label="pkg.Child")
+    DG.add_node("method:c2", kind="method", label="pkg.Child.handle")
+    DG.add_edge("function:c1", "method:b1", relation="calls", source_file="pkg/caller.py",
+                confidence="EXTRACTED")
+    DG.add_edge("class:b01", "method:b1", relation="contains")
+    DG.add_edge("class:c01", "method:c2", relation="contains")
+    DG.add_edge("class:c01", "class:b01", relation="extends")
+    # 过滤后只剩 calls（contains/extends 缺席）→ fanout_limited=True
+    DGF = nx.DiGraph()
+    DGF.add_nodes_from(DG.nodes(data=True))
+    for u, v, d in DG.edges(data=True):
+        if str(d.get("relation", "")).lower() == "calls":
+            DGF.add_edge(u, v, **d)
+    lines, _ = _blast_radius_lines(DGF, "function:c1", "out", 2, 50, "",
+                                   db_path=db, fanout_limited=True)
+    body = "\n".join(lines)
+    assert "limited by edge_kinds filter" in body, body
+    assert "no owning class" not in body
+    # 完整图（无过滤）→ fanout 正常展开 Child.handle
+    lines2, _ = _blast_radius_lines(DG, "function:c1", "out", 2, 50, "", db_path=db)
+    assert "Child.handle" in "\n".join(lines2)
+
+def test_blast_radius_both_truncation_labels_both_directions():
+    """M1a：both 方向截断行标注 by degree across both directions（in/out 并集语义
+    对称性透明化）；in 方向仍用 by degree（不带 both 标注）。"""
+    from graphify.serve import _blast_radius_lines
+    DG = _fanout_digraph()
+    lines, total = _blast_radius_lines(DG, "function:f01", "both", 2, 1, "", db_path=None)
+    assert total > 1
+    assert any("by degree across both directions" in ln for ln in lines)
+    lines, total = _blast_radius_lines(DG, "function:f01", "in", 2, 1, "", db_path=None)
+    assert any("by degree" in ln and "both directions" not in ln for ln in lines)
+
+def test_fanout_targets_rejects_undirected_graph():
+    """M5：_fanout_targets 与 _reverse_closure 一致拒无向图（TypeError，运行时断言）."""
+    from graphify.serve import _fanout_targets
+    G = nx.Graph()
+    G.add_edge("a", "b")
+    try:
+        _fanout_targets(G, "a")
+    except TypeError:
+        return
+    raise AssertionError("_fanout_targets 必须拒绝无向图（nx.Graph）")
+
+@pytest.mark.golden
+def test_join_hit_rate_real_db_golden():
+    """生产探针固化（计划所有者建议）：正确顺序 JOIN（source_file+kind=calls+src短名+
+    tgt短名）在 fork 真实 DB 上的命中率 ≥ 阈值——防"回退态吞失效信号"回归（out src/tgt
+    互换或短名映射退化时命中率崩）。金标门（conftest）：真实 DB 缺失自动跳过。"""
+    from graphify.serve import _digraph_view, _edge_dispatch_info, _symbol_short_name
+    root = Path(__import__("os").environ.get("GRAPHIFY_GOLDEN_ROOT", r"D:/code/graphify_fork"))
+    db = root / ".codegraph" / "codegraph.db"
+    graph = root / "graphify-out" / "graph.json"
+    if not graph.exists():
+        pytest.skip(f"skipped (golden): {graph} 缺失")
+    DG = _digraph_view(graph)
+    hits = misses = 0
+    try:
+        conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        try:
+            for u, v, ed in DG.edges(data=True):
+                if str(ed.get("relation", "")) != "calls":
+                    continue
+                source_file = ed.get("source_file") or DG.nodes[u].get("source_file") or ""
+                src_short = _symbol_short_name(DG.nodes[u], u)
+                tgt_short = _symbol_short_name(DG.nodes[v], v)
+                if _edge_dispatch_info(conn, source_file, "calls", src_short, tgt_short)["resolvedBy"]:
+                    hits += 1
+                else:
+                    misses += 1
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pytest.skip(f"skipped (golden): {db} 不可读")
+    total = hits + misses
+    if total == 0:
+        pytest.skip("skipped (golden): 无 calls 边样本")
+    rate = hits / total
+    # 阈值 60%：基线 84.6%（11764 calls 边，2026-09-01 实测）——余量 25pt 防抖动，
+    # 仍能抓住灾难性回归（src/tgt 互换或短名映射退化时命中率崩到近 0）。
+    assert rate >= 0.6, (f"正确顺序 JOIN 命中率 {rate:.0%}（{hits}/{total}）< 60%——"
+                         f"out src/tgt 互换或短名映射退化（基线 84.6%，见 task-9-report）")

@@ -1832,7 +1832,9 @@ def _dispatch_candidate(meta: dict | None) -> bool:
 def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
     """B3 R4-2 铰链改键（serve 自包含副本，同 adapter._edge_dispatch_info）：合并边无
     DB edge id——source_file+kind+两端短名 JOIN 定候选组，组内最保守取值（confidence=min、
-    dispatch_candidate=any、resolvedBy 数组）；空组 → dispatch_candidate=True 宁多标。"""
+    dispatch_candidate=any、resolvedBy 数组）；空组 → dispatch_candidate=True 宁多标。
+    M2（review 注释登记，已知模糊面）：同名重载并组——同文件同 kind 同短名对的候选组
+    会把其他重载方法的 min confidence / resolvedBy 灌入。宁多标方向：保守可接受（Q11）。"""
     rows = conn.execute(
         "SELECT e.metadata FROM edges e "
         "JOIN nodes ns ON e.source = ns.id "
@@ -1944,6 +1946,9 @@ def _fanout_targets(DG: nx.DiGraph, target_id) -> tuple[list[str], str]:
     反向 BFS 得子类集 → 各子类 contains 出边下短名与 target 短名相等的节点 = 全部可能目标。
     任一步无果 → (原单目标, 'unavailable: no owning class')。同名匹配只走 label
     （id 是 hash 形态无语义，R3-2 _symbol_short_name）。"""
+    # M5（review）：与 _reverse_closure 一致拒无向图——类型注解 + 运行时 isinstance 断言。
+    if not isinstance(DG, nx.DiGraph):
+        raise TypeError("_fanout_targets requires nx.DiGraph (call _digraph_view first)")
     if target_id not in DG:
         return [target_id], "unavailable: no owning class"
     tgt_short = _symbol_short_name(DG.nodes[target_id], target_id)
@@ -2032,13 +2037,15 @@ def _toward_edge(DG, closure_set, nid, u, incoming):
     return None, None
 
 
-def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=None):
+def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=None,
+                        fanout_limited=False):
     """B3 新路径正文装配（direction 或 depth>1 给定）：_digraph_view 产物上反向/正向闭包
-    + 逐节点 toward 边 + dispatch 标注（仅 depth>1，R5-5(b)：depth=1 普通邻接不查 DB——
-    hub 节点 50-200 邻边逐边 JOIN（edges 30k 行无 kind/source 索引）是 P95 杀手，且
-    depth=1 场景 agent 本要逐条看边、标注价值最低；top-50 截断后 ≤50 次 JOIN 有界）+
-    fanout 重展开 + 截断标志。edge_kinds 已由调用方过滤进 DG（本函数不重收）。返回
-    (lines, closure_total)。
+    + 逐节点 toward 边 + dispatch 标注（仅 depth>1 且 rel=='calls'，R5-5(b)：depth=1 普通
+    邻接不查 DB——hub 节点 50-200 邻边逐边 JOIN（edges 30k 行无 kind/source 索引）是 P95
+    杀手，且 depth=1 场景 agent 本要逐条看边、标注价值最低；I1 后仅 calls 边查 DB，top-50
+    截断后 ≤50 次 JOIN 有界）+ fanout 重展开 + 截断标志。edge_kinds 已由调用方过滤进 DG
+    （本函数不重收）；fanout_limited 由调用方按 edge_kinds 是否含 fanout 遍历关系判定
+    （M1b）。返回 (lines, closure_total)。
     """
     if nid not in DG:
         return [f"Neighbors of {sanitize_label(str(nid))} "
@@ -2074,6 +2081,10 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=No
                 conn = None
     try:
         for u in show:
+            # L1（review 注释登记）：both 闭包下节点双在 in/out 集时只按祖先侧展示
+            # （incoming=True + <-> 箭头）——toward 边归属非最优（双向节点可能两侧各
+            # 有一条 toward 边，只取祖先侧），已知近似不修（文本摘要工具，主信息
+            # "节点在闭包内 + 双向"已正确）。
             if u in in_set and u in out_set:
                 arrow, incoming = "<->", True
             elif u in out_set:
@@ -2091,24 +2102,42 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=No
                   if loc else "")
             line = (f"  {arrow} {sanitize_label(str(DG.nodes[u].get('label') or u))} "
                     f"[{sanitize_label(rel)}] [{sanitize_label(str(ed.get('confidence', '')))}]{at}")
-            if conn is not None:
+            # I1（controller 裁决）：dispatch/fanout 仅对 calls 类边触发——宁多标语义
+            # 对 contains/imports 无意义（无"分发到子类 override"语义），且非 calls 边
+            # 多为空组会产噪声（god node 52 行中 44 行）。非 calls 边不查 DB、不标
+            # dispatch、不 fanout。
+            if conn is not None and rel == "calls":
+                # C1（review）：out 方向边缘是 (调用方 v → 被调方 u)，caller/callee
+                # 必须随 incoming 分支定序——in/both 入侧真序恰与 (u, v) 一致（in 方向
+                # 回归测试锁定不变），只有 out/both 出侧失真需换 (v, u)。
+                caller, callee = (u, v) if incoming else (v, u)
+                # JOIN 用 caller→callee（DB calls 边的 source=caller/target=callee）
                 info = _edge_dispatch_info(
                     conn,
                     ed.get("source_file") or DG.nodes[u].get("source_file") or "",
                     rel,
-                    _symbol_short_name(DG.nodes[u], u),
-                    _symbol_short_name(DG.nodes[v], v))
+                    _symbol_short_name(DG.nodes[caller], caller),
+                    _symbol_short_name(DG.nodes[callee], callee))
                 rb = ",".join(info["resolvedBy"]) or "unknown"
                 conf = info["confidence"]
                 conf_s = f"{conf:g}" if isinstance(conf, (int, float)) else "?"
                 if info["dispatch_candidate"]:
                     line += f" [dispatch: resolvedBy={rb}, confidence={conf_s}]"
-                    fan_targets, note = _fanout_targets(DG, v)
+                    # fanout 展开的是被调用方法（分发目标）的类层级
+                    fan_targets, note = _fanout_targets(DG, callee)
                     if note:
-                        line += f" fanout=({note})"
+                        # M1b：edge_kinds 滤掉 fanout 遍历关系（contains/extends）时展开
+                        # 受限——文案须区分"被过滤"与"无所属类"（宁多标方向都诚实）。
+                        if fanout_limited:
+                            line += " fanout=(limited by edge_kinds filter: contains/extends removed)"
+                        else:
+                            line += f" fanout=({note})"
                     elif len(fan_targets) > 1:
+                        # fanout 覆写用完整 label（短名歧义：Base.handle 与 Child.handle
+                        # 短名同为 handle，列表须可区分）。
                         line += " fanout=(" + ", ".join(
-                            _symbol_short_name(DG.nodes[t], t) for t in fan_targets[1:]) + ")"
+                            sanitize_label(str(DG.nodes[t].get("label") or t))
+                            for t in fan_targets[1:]) + ")"
                 else:
                     line += f" [resolvedBy={rb}, confidence={conf_s}]"
             lines.append(line)
@@ -2116,7 +2145,9 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=No
         if conn is not None:
             conn.close()
     if total > len(show):
-        lines.append(f"  (blast radius: {total} nodes; showing top {len(show)} by degree)")
+        # M1a：both 分支语义对称性透明化——闭包是 in/out 两方向并集，标注去向
+        by = "by degree across both directions" if direction == "both" else "by degree"
+        lines.append(f"  (blast radius: {total} nodes; showing top {len(show)} {by})")
     return lines, total
 
 
@@ -2582,8 +2613,6 @@ def _build_server(graph_path: str):
         direction = arguments.get("direction")
         raw_depth = arguments.get("depth", 1)
         depth = raw_depth
-        if isinstance(raw_depth, str) and raw_depth.lstrip("-").isdigit():
-            depth = int(raw_depth)
         budget = int(arguments.get("token_budget", 2000))
         # 缺省路径回归锁定：无 direction 且 depth<=1 时保持既有 G 上 successors/
         # predecessors 循环逐字节不变（无向图上双向输出本就同集合；方向只在 B3
@@ -2604,6 +2633,12 @@ def _build_server(graph_path: str):
                     False, G.number_of_nodes())
         edge_kinds = arguments.get("edge_kinds")
         DG = _digraph_view(active_graph_path)
+        # M4（review）：nid 不在有向视图（图 reload 竞态）→ found=False，不得谎报
+        # True+closure_size=0。scanned=0（未计算闭包），extra_meta 空（不宣称 closure_size）。
+        if nid not in DG:
+            return (f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}: "
+                    f"(node missing from current directed view)", False, 0, None, {})
+        fanout_limited = False
         if edge_kinds:
             kinds = {k.lower() for k in edge_kinds}
             DGF = nx.DiGraph()
@@ -2612,10 +2647,14 @@ def _build_server(graph_path: str):
                 if str(d.get("relation", "")).lower() in kinds:
                     DGF.add_edge(u, v, **d)
             DG = DGF
+            # M1b：edge_kinds 滤掉 fanout 遍历所需关系（contains/extends/implements）时，
+            # fanout 展开受限——标注须区分"被过滤"与"无所属类"。
+            fanout_limited = ("contains" not in kinds or
+                              ("extends" not in kinds and "implements" not in kinds))
         top_k = 50  # R5-5：top-50 截断后 dispatch 逐边 JOIN ≤50 次有界
         db_path = Path(active_graph_path).parent.parent / ".codegraph" / "codegraph.db"
         lines, total = _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
-                                           db_path=db_path)
+                                           db_path=db_path, fanout_limited=fanout_limited)
         # R3-3 verdict：depth=1（无 dispatch 边，R5-5(b) 不查 DB）→ 走推导（ok）；
         # depth>1（blast-radius）→ low_confidence 经 verdict_override 直通 + advisory
         # 措辞（Q14——输出建立在边语义不完整的图上，advisory 不可省）。
