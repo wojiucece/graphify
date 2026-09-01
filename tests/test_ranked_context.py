@@ -1,9 +1,9 @@
 """B1 融合检索：token 分流 / FTS 命中 / pinning / 预算 / query_shape."""
-import json, sqlite3, sys
+import json, os, sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import pytest
-from ranked import ranked_context
+from ranked import ranked_context, _count_tokens  # M2: 预算断言与实现同源计数
 
 @pytest.fixture
 def mini_db(tmp_path):
@@ -42,8 +42,11 @@ def test_fts_channel_hits_ranked(mini_db):
     assert r["query_shape"]["fts_hits"] >= 1
 
 def test_budget_respected(mini_db):
+    # M2：断言用实现同源 _count_tokens（tiktoken 可用时精确计数），不复算 len//4——
+    # 装了 tiktoken 的机器不再 flake。
     r = ranked_context(mini_db, "debounce grace", token_budget=50)
-    assert sum(len(json.dumps(x, ensure_ascii=False)) // 4 for x in r["results"]) <= 50
+    total = sum(_count_tokens(json.dumps(x, ensure_ascii=False))[0] for x in r["results"])
+    assert total <= 50
 
 def test_query_shape_reports_cjk(mini_db):
     r = ranked_context(mini_db, "防抖")   # 纯 CJK，FTS 零命中
@@ -135,6 +138,31 @@ def test_count_mode_reported(mini_db):
     r = ranked_context(mini_db, "debounce grace", token_budget=50)
     assert r["query_shape"]["count_mode"] in ("tiktoken", "estimate")
 
+def test_graph_cache_reuses_between_queries(mini_db):
+    """M1：同 root 连续两次查询，第二次命中 mtime+size 缓存（不重复 json.loads 全量图）."""
+    import ranked
+    ranked._graph_loads = 0
+    ranked_context(mini_db, "debounce grace", token_budget=2000)
+    loads_first = ranked._graph_loads
+    ranked_context(mini_db, "debounce grace", token_budget=2000)
+    assert ranked._graph_loads == loads_first == 1, "第二次查询应命中缓存（loads 不增）"
+
+def test_missing_db_returns_absent_not_error(tmp_path):
+    """M4：非 codegraph 项目（无 .codegraph/codegraph.db，多项目热切换目标）→
+    absent + db_missing 标注，不 isError（真错误仅限 DB 在但查询炸）. """
+    from ranked import format_ranked
+    from graphify.serve import _apply_envelope
+    r = ranked_context(tmp_path, "any query", token_budget=2000)   # tmp_path 无 .codegraph
+    assert r["results"] == []
+    assert r["query_shape"]["db_missing"] is True
+    assert r["query_shape"]["scanned"] == 0
+    assert r["gap_hit"] is False
+    # N1 信封：found=False + scanned=0 → absent（body 带 db_missing 标注区分于空图）
+    out = _apply_envelope("get_ranked_context",
+                          (format_ranked(r), False, 0), freshness="fresh")
+    meta = json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "absent"
+
 def test_format_ranked_wraps_meta(mini_db):
     """B1 是 JSON 工具：format_ranked 序列化体含 _meta 对象（query_shape/gap_hit），
     与 serve 尾部 _meta 信封行（verdict/freshness）并列不冲突."""
@@ -160,7 +188,10 @@ def test_serve_registers_ranked_context():
 # expect 符号 id 从 fork 真实图（D:/code/graphify_fork）派生（fixture 生产派生纪律），
 # 只读验证：无真实图时跳过（不 gate 合成 fixture 的单测）。融合 vs BM25-only 对照不降。
 
-_FORK_ROOT = Path(r"D:/code/graphify_fork")
+# M3：金标根支持 env 覆盖（GRAPHIFY_GOLDEN_ROOT），默认保留本机 D:/code/graphify_fork；
+# DB 缺失时的 skip 由 tests/conftest.py 的 golden gate（autouse fixture）统一处理——
+# 闸门存在性对 `-m golden` 可见，'skipped (golden)' 进测试摘要，不静默消失。
+_FORK_ROOT = Path(os.environ.get("GRAPHIFY_GOLDEN_ROOT", r"D:/code/graphify_fork"))
 
 
 def _load_golden() -> list[dict]:
@@ -174,10 +205,10 @@ def _recall(results: list[dict], expect: list[str]) -> float:
     return hit / len(expect)
 
 
+@pytest.mark.golden
 def test_golden_matrix_recall_and_no_degrade():
-    """金标 10 条：命中@5 ≥ 50%，且融合 ≥ BM25-only 对照（不降）；1000/2000 两档预算."""
-    if not (_FORK_ROOT / ".codegraph" / "codegraph.db").exists():
-        pytest.skip("fork 真实图不存在（只读验证依赖 D:/code/graphify_fork）")
+    """金标 10 条：命中@5 ≥ 50%，且融合 ≥ BM25-only 对照（不降）；1000/2000 两档预算.
+    DB 缺失时由 conftest golden gate 跳过（'skipped (golden)' 进摘要）."""
     golden = _load_golden()
     assert len(golden) == 10, "第一批矩阵最小集 = 10 条"
     for budget in (1000, 2000):
@@ -197,10 +228,10 @@ def test_golden_matrix_recall_and_no_degrade():
         assert f_total >= b_total, f"budget={budget} 融合 {f_total:.2f} 劣于 BM25-only {b_total:.2f}: {rows}"
 
 
+@pytest.mark.golden
 def test_golden_gap_queries_report_gap_hit():
-    """金标 gap 型 2 条：identifier 命中 gap.ref → gap_hit=true（方案 §4-B1 联动）. """
-    if not (_FORK_ROOT / ".codegraph" / "codegraph.db").exists():
-        pytest.skip("fork 真实图不存在（只读验证依赖 D:/code/graphify_fork）")
+    """金标 gap 型 2 条：identifier 命中 gap.ref → gap_hit=true（方案 §4-B1 联动）.
+    DB 缺失时由 conftest golden gate 跳过（'skipped (golden)' 进摘要）."""
     for item in _load_golden():
         if item.get("gap"):
             r = ranked_context(_FORK_ROOT, item["q"], token_budget=2000)

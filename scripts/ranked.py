@@ -44,6 +44,14 @@ _ALL_CHANNELS = frozenset({"fts", "pinned", "cjk", "structure"})
 
 _tiktoken_enc = None  # 可选依赖惰性缓存：None=未探测 / False=不可用 / 其余=编码器
 
+# M1：合并图加载缓存 {graph_path_str: (mtime_ns, size, (degree, collision_bases, nodes))}。
+# 失效语义：mtime 与 size 双键命中才复用——rebuild 后 mtime 必变自动失效（Windows
+# st_mtime_ns 精度足够，~100ns 粒度远小于 rebuild 间隔）。缓存按 path_str 分键，多项目
+# 热切换互不串。并发安全：MCP 请求在单协程同步段内顺序执行，模块级 dict 读写无竞争，
+# 无需加锁。
+_GRAPH_CACHE: dict[str, tuple[int, int, tuple[dict, set, list]]] = {}
+_graph_loads = 0  # M1 诊断：实际 json.loads 全量图次数（cache miss 才 +1），供测试/日志验证命中率
+
 
 def _count_tokens(text: str) -> tuple[int, str]:
     """token 计数：tiktoken 可用则精确（optional extra），否则 len//4 估算（declared，§8 ~4B/token）。"""
@@ -134,7 +142,17 @@ def _gap_refs(conn):
 def _load_graph(graph_path: Path):
     """合并图加载 → (degree_map, collision_bases, nodes)。加载失败 → (None, None, [])。
     degree：links 端点计数（合并图口径）。collision_bases：_normalize_id fold 含消歧
-    后缀（__cg）的图节点原始 id 基底（Q6：碰撞节点不参与 join）。"""
+    后缀（__cg）的图节点原始 id 基底（Q6：碰撞节点不参与 join）。
+    M1 缓存：payload 即结构通道所需全部派生数据（degree/collision_bases/nodes），
+    命中 = mtime 与 size 均不变；解析失败不缓存（下次修复即拾起）。"""
+    key = str(graph_path)
+    try:
+        st = graph_path.stat()
+    except OSError:
+        return None, None, []
+    hit = _GRAPH_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
     try:
         g = json.loads(graph_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -151,7 +169,11 @@ def _load_graph(graph_path: Path):
         nid = n.get("id", "")
         if nid and _CG_SUFFIX_RE.search(_normalize_id(nid)):
             collision_bases.add(nid.split("__cg")[0])
-    return degree, collision_bases, g.get("nodes", [])
+    payload = (degree, collision_bases, g.get("nodes", []))
+    global _graph_loads
+    _graph_loads += 1
+    _GRAPH_CACHE[key] = (st.st_mtime_ns, st.st_size, payload)
+    return payload
 
 
 def _cjk_search(nodes, cjk_tokens: list[str]):
@@ -204,7 +226,21 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
         "gap_summary": [],
     }
 
-    conn = _open_readonly(root / ".codegraph" / "codegraph.db")
+    try:
+        conn = _open_readonly(root / ".codegraph" / "codegraph.db")
+    except (sqlite3.OperationalError, OSError):
+        # M4：非 codegraph 项目（无 .codegraph/codegraph.db，多项目热切换下 agent 会对
+        # 无 codegraph 的项目调 B1）→ 诚实 absent 而非 isError。边界（Q1）：仅 DB 打开
+        # 失败降级；DB 在但查询炸（BEGIN/查询异常）仍 propagate 走服务端 isError。
+        # 形态选择：found=False + scanned=0 → N1 信封 absent+empty_graph（零 serve 改动，
+        # 与 _derive_verdict 契约一致）；db_missing/note 在 body._meta.query_shape 显式
+        # 标注，区分"codegraph 无 DB"（db_missing）与"graphify 空图"（empty_graph）——
+        # 两者同归 absent，原因不同，agent 靠 db_missing 分支处理。
+        shape["db_missing"] = True
+        shape["centrality"] = "db_missing"
+        shape["count_mode"] = _count_tokens("")[1]
+        shape["note"] = "codegraph DB 缺失（无 .codegraph/codegraph.db）——非 codegraph 项目，B1 检索不可用"
+        return {"results": [], "query_shape": shape, "gap_hit": False}
     try:
         conn.execute("BEGIN")   # 单事务快照读（Task 4 模式，WAL 并发写下恒读一致快照）
         fts_rows, fts_hits = (_fts_search(conn, identifiers) if "fts" in active else ([], 0))
@@ -230,9 +266,17 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
         conn.close()
 
     # 融合装配：stage 优先级（pinned > fts > cjk）+ 通道内排序 + 结构度数平局打破
+    # L1 id 恒等不变量：FTS raw id 与 merged 图 id 恒等（碰撞除外）——degree join 依赖
+    # 此隐含契约。当前成立：codegraph id 为小写 hex，graph.json 直通同一 id 池（AST
+    # 批次同源），仅 __cg 消歧后缀折叠（collision_bases 排除）。上游若改 id 生成
+    # （加盐/加前缀/改折叠规则），join 会静默退化为 degree 全 0——以 degenerate_degree
+    # 显式标注供诊断，不把"0"误当真实中心度（平局打破静默失效）。
     results, seen = [], set()
+    _join_candidates = 0   # 参与 degree join 的候选数（非碰撞）
+    _deg_positive = 0      # 其中 degree > 0 的个数（L1 退化判据）
 
     def _add(item: dict) -> None:
+        nonlocal _join_candidates, _deg_positive
         iid = item["id"]
         if iid in seen:
             return
@@ -242,7 +286,10 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
             if iid in collision_bases:   # 碰撞节点不参与 join（Q6），记录不误当真实度 0
                 shape["collisions"] += 1
             else:
+                _join_candidates += 1
                 d = degree.get(iid, 0)
+                if d > 0:
+                    _deg_positive += 1
         item["degree"] = d
         results.append(item)
 
@@ -260,6 +307,12 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
         _add({"id": cid, "label": clabel, "score": _CJK_SCORE,
               "stage": "cjk", "source_tool": "substring"})
     shape["scanned"] = len(seen)        # N1 scanned = 候选池大小（去重后）
+    # L1 退化标注：仅 merged_graph 口径（id 恒等不变量相关的 join 路径）——raw_db 降级
+    # （同源 DB 无恒等问题）与 BM25-only（degree=None）不触发。有非碰撞候选但 degree 全 0
+    # 时提示 id 恒等不变量疑破；稀疏图（孤立节点）也可能触发，属诊断信号非错误。
+    if degree is not None and shape["centrality"] == "merged_graph" \
+            and _join_candidates and _deg_positive == 0:
+        shape["degenerate_degree"] = True
 
     # token 预算装配：结果子集贪心截断（计数方式与测试断言同源：无 tiktoken 时 len//4）
     mode = _count_tokens("")[1]         # 惰性探测一次并固定 count_mode
