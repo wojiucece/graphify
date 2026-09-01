@@ -3,7 +3,7 @@
 三个触发面（watch.py 代码事件 / SessionEnd hook / PreCompact hook）都改指本入口。
 跨进程互斥用 mkdir 原子锁；完成信号用子进程退出码（codegraph 无对外 sync 事件，F1/F5）。"""
 from __future__ import annotations
-import argparse, os, sqlite3, subprocess, sys, tempfile, time
+import argparse, json, os, sqlite3, subprocess, sys, tempfile, time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +91,43 @@ def _acquire_lock(root: Path) -> bool:
         return False
 
 
+def _state_path(root: Path) -> Path:
+    """A1 路径联动总条款：状态文件随 active project root 推导."""
+    return root / "graphify-out" / ".rebuild-state.json"
+
+
+def _write_state(root: Path, lock: Path, payload: dict) -> None:
+    """写权单一化：仅锁 owner（pid 即自身）可写；serve 侧只读."""
+    try:
+        owner = int((lock / "pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if owner != os.getpid():
+        return
+    try:
+        _state_path(root).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        _log(f"状态文件写入失败（不阻塞 rebuild）: {e}")
+
+
+def _finish_state(root: Path, lock: Path, started: float, error: bool = False) -> None:
+    """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）."""
+    _write_state(root, lock, {"schema": 1, "phase": "error" if error else "complete",
+                              "started": started, "finished": time.time(),
+                              "last_duration": round(time.time() - started, 1),
+                              "project": str(root)})
+
+
+def _read_prev_duration(root: Path) -> float:
+    """N2：读上一轮 complete 的 last_duration——rebuilding 载荷覆盖整个文件，
+    不继承则时效逃生 max(2*last_duration, 1800) 中的 2x 项恒为 0（设计静默失效）."""
+    try:
+        return float(json.loads(_state_path(root).read_text(encoding="utf-8"))
+                     .get("last_duration", 0))
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
 def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | None = None,
             semantic_seed: Path | None = None, semantic_refresh: list[Path] | None = None,
             skip_sync: bool = False) -> Path:
@@ -113,6 +150,8 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
         _log("锁被占用，另一重建正在进行 -> exit 3")
         sys.exit(EXIT_LOCK)
     lock = _lock_path(root)
+    t0 = time.time()
+    exc_happened = False
     try:
         # db 存在性检查在锁之后（测试 test_lock_held_exits_3 预建锁 -> 应 exit 3 而非 FileNotFoundError）
         if not db.exists():
@@ -124,6 +163,14 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
                     _log(f"sync 重试后仍失败（exit {code}），放弃本轮，交下个触发面兜底")
                     sys.exit(EXIT_SYNC_FAIL)
             f0 = db_fingerprint(db)
+            # A1a: rebuilding 标记（每轮重写，幂等）。db_fingerprint 复用 f0——不额外调
+            # db_fingerprint（少一次只读查询，且保住 test_rebuild_requeued 的 4 次调用预算）；
+            # f0 即本轮收敛基线，语义与重查一致。N2: 继承上轮 last_duration（否则时效逃生
+            # 2x 项恒 0，设计静默失效）。写权在锁 owner；serve 只读无写竞态。
+            _write_state(root, lock, {
+                "schema": 1, "phase": "rebuilding", "started": t0,
+                "project": str(root), "db_fingerprint": list(f0),
+                "last_duration": _read_prev_duration(root)})
             from run_analysis import run                        # 懒导入（scripts/ 在 sys.path）
             run(db, output_dir=out, root=str(root),
                 semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
@@ -132,7 +179,13 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
             _log("重建期间 DB 变化（daemon 并发写入），再排一轮")
         _log("两轮不收敛，交下个触发面兜底")                    # watch/hook 事件流保证最终触发
         return out
+    except BaseException:
+        exc_happened = True
+        raise
     finally:
+        # A1a: 状态收尾必须在锁清理之前（_write_state 读锁 pid 判断 owner；锁没了则拒写）。
+        # 写序不变量 E1：run() 落盘 graph.json 先于此处 complete 标记。
+        _finish_state(root, lock, t0, error=exc_happened)
         # 误接管防御：若本进程超 _LOCK_STALE_S 被另进程接管，锁目录已含对方的 pid 文件，
         # 非空目录 rmdir 抛 OSError，会掩盖本进程的正常返回或原始异常。包 except 吞掉。
         # 修正（Task 13 E2E 发现）：brief 原文仅 rmdir 非空目录 -> 恒 OSError 被吞 ->
