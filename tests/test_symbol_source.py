@@ -210,7 +210,7 @@ def test_neighbor_summary_signature_not_sanitized(neighbor_env):
     G, root = neighbor_env
     lines = _neighbor_summary_lines(G, "hub", root / ".codegraph" / "codegraph.db")
     n6 = next(l for l in lines if l.startswith("  n6 "))
-    assert "def n6(\n    x: int,\n) -> None:" in n6
+    assert "def n6(\n      x: int,\n  ) -> None:" in n6
 
 def test_neighbor_signatures_missing_db_returns_empty(tmp_path):
     """M1 诚实降级：DB 缺失/损坏 → 空 dict（不崩出口）."""

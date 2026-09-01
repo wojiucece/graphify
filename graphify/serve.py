@@ -1724,7 +1724,11 @@ def _signature_line(sig: str, short: str) -> str:
 def _top_neighbor_ids(G, nid, top=10):
     """B2 M1: 1-hop 邻接去重 + 按邻居度数排序取 top-k（与 B3 blast-radius top-k 精神
     一致——god node 度数 100+ 时邻接只取最重要 top-k）。返回 (top_ids, 去重后总数)。"""
-    nbs = list(dict.fromkeys(list(G.successors(nid)) + list(G.predecessors(nid))))
+    if G.is_directed():
+        nb = list(G.successors(nid)) + list(G.predecessors(nid))
+    else:
+        nb = list(G.neighbors(nid))
+    nbs = list(dict.fromkeys(nb))  # 无向图同一邻居集不再双扫，去重仍留作防御
     ranked = sorted(nbs, key=lambda nb: (-G.degree(nb), nb))
     return ranked[:top], len(nbs)
 
@@ -1744,6 +1748,7 @@ def _neighbor_signatures(db_path, ids):
             for nid, sig in conn.execute(
                     f"SELECT id, signature FROM nodes WHERE id IN ({ph})", tuple(ids)):
                 sigs[nid] = sig or ""
+            # 碰撞罕见路径，逐条查询量级无害（top-10 最多 10 次往返），不批量优化
             for nid in ids:
                 if nid in sigs:
                     continue
@@ -1774,7 +1779,7 @@ def _neighbor_summary_lines(G, nid, db_path, top=10):
         sig = sigs.get(nb)
         if sig:
             nb_short = label.rsplit(".", 1)[-1]
-            lines.append(f"  {sanitize_label(label)}  Signature: {_signature_line(sig, nb_short)}")
+            lines.append(f"  {sanitize_label(label)}  Signature: {_signature_line(sig, nb_short).replace('\n', '\n  ')}")
         else:
             lines.append(f"  {sanitize_label(label)}")
     extra = total - len(top_ids)
