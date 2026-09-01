@@ -111,11 +111,67 @@ def _write_state(root: Path, lock: Path, payload: dict) -> None:
 
 
 def _finish_state(root: Path, lock: Path, started: float, error: bool = False) -> None:
-    """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）."""
-    _write_state(root, lock, {"schema": 1, "phase": "error" if error else "complete",
-                              "started": started, "finished": time.time(),
-                              "last_duration": round(time.time() - started, 1),
-                              "project": str(root)})
+    """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）.
+    C3/G3：git 可用时载荷加 git_head（rev-parse HEAD，基线锚点）——git 不可用/失败时
+    省略字段（schema 只增不改，可缺省；读者侧缺失语义 = "基线未锚定"）。成功/错误路径
+    都记（git_head 是仓库事实，与 build 成败无关；父注释"成功路径"取此义）。"""
+    payload = {"schema": 1, "phase": "error" if error else "complete",
+               "started": started, "finished": time.time(),
+               "last_duration": round(time.time() - started, 1),
+               "project": str(root)}
+    gh = _git_head(root)
+    if gh is not None:
+        payload["git_head"] = gh
+    _write_state(root, lock, payload)
+
+
+def _git_head(root: Path) -> str | None:
+    """C3：rev-parse HEAD 全 hash；git 不在 PATH/非 git 仓库/失败 -> None（省略字段语义）.
+    R5-1：subprocess 直调（无 shell 管道）；CREATE_NO_WINDOW 防 Windows 弹窗（F5 同款）."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _read_prev_git_head(root: Path) -> str | None:
+    """C3：读上一轮状态文件 git_head（rebuild 覆盖前缓存，变更摘要锚点）.
+    git_head 可缺省（G3）——文件缺失/损坏/非 str -> None（首次重建无锚点，摘要跳过）."""
+    try:
+        gh = json.loads(_state_path(root).read_text(encoding="utf-8")).get("git_head")
+    except (OSError, ValueError, TypeError):
+        return None
+    return gh if isinstance(gh, str) and gh else None
+
+
+def _log_changed_summary(root: Path, prev_head: str | None) -> None:
+    """C3：rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD）——
+    进当时活跃会话上下文。prev_head 不可得（首次）或孤儿 hash（amend/rebase）-> 静默
+    （不阻塞 rebuild，stderr 一行日志权限内诚实降级）。"""
+    if not prev_head:
+        return
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run(["git", "diff", "--name-only", f"{prev_head}..HEAD"],
+                           cwd=str(root), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if r.returncode != 0:
+        return   # 孤儿 prev_head -> 无摘要（不告警不阻塞，等下次事件流重建）
+    names = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    if not names:
+        return
+    shown = ", ".join(names[:10])
+    if len(names) > 10:
+        shown += f" … +{len(names) - 10} more"
+    _log(f"变更摘要（{len(names)} 文件，自 {prev_head[:8]}）：{shown}")
 
 
 def _read_prev_duration(root: Path) -> float:
@@ -150,6 +206,7 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
         _log("锁被占用，另一重建正在进行 -> exit 3")
         sys.exit(EXIT_LOCK)
     lock = _lock_path(root)
+    prev_git_head = _read_prev_git_head(root)   # C3：覆盖前缓存上一轮 git_head（变更摘要锚点）
     t0 = time.time()
     exc_happened = False
     try:
@@ -183,6 +240,9 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
                 gc_cache(out, out / "manifest.json", root=root)
             except Exception as e:   # GC 失败绝不影响 rebuild 结果
                 _log(f"cache gc 异常（忽略）: {e}")
+            # C3: rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD，
+            # 进当时活跃会话上下文）。prev_head 不可得/孤儿 hash -> 内部静默。
+            _log_changed_summary(root, prev_git_head)
             # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
             # watch/hook 事件流兜底（变化本身说明后续触发面已排队/即将触发，重跑只
             # 增加锁内阻塞时长）。循环结构保留（range(2) 仅走一轮），便于回滚对比。

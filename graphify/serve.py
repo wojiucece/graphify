@@ -1562,7 +1562,8 @@ _REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
 # 清单外工具裸 str 直通，新增检索型工具若拒绝登记则出口不予合并。
 _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
                            "god_nodes", "shortest_path", "graph_stats",
-                           "get_ranked_context"})  # CUSTOM: B1 融合检索登记
+                           "get_ranked_context",  # CUSTOM: B1 融合检索登记
+                           "get_changed_symbols"})  # CUSTOM: C3 git 轴登记（Task 10）
 
 
 def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
@@ -2167,6 +2168,35 @@ def _redact(text: str) -> str:
 # === CUSTOM: A2 end ===========================================================
 
 
+# === CUSTOM: C3 get_changed_symbols 正文装配（Phase 4 Task 10）=================
+
+
+def _format_changed_symbols(r: dict, from_head: str | None = None) -> str:
+    """C3 正文装配：文件集（与 git diff --stat 文件级吻合）+ 变更符号标签（命中文件内
+    节点）。basis 明示锚定方式——basis=graph_diff 时正文声明无变更信息（verdict 走 N1
+    推导 absent，"没有变更信息"≠ok，C 信封纪律不走 override）。"""
+    files = r.get("files", [])
+    symbols = r.get("symbols", [])
+    basis = r.get("basis", "graph_diff")
+    git_avail = r.get("git_available", False)
+    anchor = f" since {from_head[:8]}" if from_head else ""
+    lines = [f"Changed symbols{anchor} (basis={basis}, git_available={git_avail}):"]
+    if not files:
+        lines.append("  (no change information — git baseline unavailable)")
+        return "\n".join(lines)
+    lines.append(f"  {len(files)} file(s) changed, {len(symbols)} symbol(s) affected")
+    for f in files:
+        lines.append(f"  {f}")
+    if symbols:
+        shown = symbols[:50]
+        lines.append("  Symbols:")
+        lines.extend(f"    + {sanitize_label(s['label'])} ({sanitize_label(s['file'])})"
+                     for s in shown)
+        if len(symbols) > 50:
+            lines.append(f"    ... and {len(symbols) - 50} more")
+    return "\n".join(lines)
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2376,6 +2406,19 @@ def _build_server(graph_path: str):
                     },
                     "required": ["query"],
                 },
+            ),
+            types.Tool(
+                # CUSTOM: C3 git 轴（scripts/git_symbols.py，Task 10）。检索型工具
+                # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。
+                name="get_changed_symbols",
+                description=(
+                    "Get knowledge-graph symbols changed since the last rebuild "
+                    "(anchored to the git HEAD recorded in the rebuild state file). "
+                    "Lists the changed files (matching git diff --stat) and the "
+                    "graph symbols inside them. Falls back to an unanchored basis "
+                    "when git or the git baseline is unavailable."
+                ),
+                inputSchema={"type": "object", "properties": {}},
             ),
             types.Tool(
                 name="list_prs",
@@ -2695,6 +2738,30 @@ def _build_server(graph_path: str):
         # CUSTOM: N1 found=结果非空, scanned=候选池大小（query_shape.scanned）。
         return format_ranked(r), bool(r["results"]), int(r["query_shape"]["scanned"])
 
+    def _tool_get_changed_symbols(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: C3 三元组
+        # C3 git 轴（scripts/git_symbols.py）。路径联动总条款：root 从当前 active graph
+        # 推导（与 _derive_freshness / B1/B2/B3 同构）。G3：from_head 从状态文件 git_head
+        # 读出传入——字段缺失 -> from_head=None -> 与孤儿 hash 同走 graph_diff 回退。
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from git_symbols import changed_symbols
+        root = Path(active_graph_path).parent.parent
+        from_head = None
+        state_path = Path(active_graph_path).parent / ".rebuild-state.json"
+        try:
+            d = json.loads(state_path.read_text(encoding="utf-8"))
+            gh = d.get("git_head")
+            from_head = gh if isinstance(gh, str) and gh else None
+        except (OSError, ValueError, AttributeError):
+            from_head = None   # 状态文件缺失/损坏/非 dict -> 未锚定
+        r = changed_symbols(root, from_head=from_head)
+        # N1：found=symbol_ids 非空（变更符号集），scanned=文件集大小（扫描语义表）。
+        # C 信封纪律：不走 verdict_override——basis=git_head 有符号 -> ok；无变更信息
+        # （非 git / 基线未锚定）-> absent（"没有变更信息"≠ok，最诚实形态）。
+        return _format_changed_symbols(r, from_head), bool(r["symbol_ids"]), len(r["files"])
+
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -2789,6 +2856,7 @@ def _build_server(graph_path: str):
         "graph_stats": _tool_graph_stats,
         "shortest_path": _tool_shortest_path,
         "get_ranked_context": _tool_get_ranked_context,  # CUSTOM: B1
+        "get_changed_symbols": _tool_get_changed_symbols,  # CUSTOM: C3
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,
