@@ -1649,50 +1649,52 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
 
 
 # === CUSTOM: B2 get_node include_source 符号切片（Phase 4）====================
-_last_slice_meta: dict = {}  # 切片校验结果：成功带 slice_start/slice_end，失败置 slice_verified=False
 
 
-def _slice_source(project_root, file_path, start_line, end_line, name, signature=None):
+def _slice_source(project_root, file_path, start_line, end_line, name, signature=None, pad=0):
     """B2 符号切片：读 <project_root>/<file_path> 行区间 [start_line, end_line]（1-based 含）。
 
     校验（name 或 signature 出现于切片头部 3 行内）失败 → 全文逐行 fuzzy 定位
-    `def/class <name>` 行并重定区间 ±40 行；仍失败 → 返回 (原区间切片, False) +
-    模块级 _last_slice_meta={"slice_verified": False}。缺省档切片失败由调用方
-    （get_node）省略 Code: 段 + 标注，不毁响应。
-    返回 (切片文本, slice_verified)。
+    `def/class <name>` 行并重定区间 ±40 行；仍失败 → 返回 (原区间切片, False, 0, 0)。
+    pad>0：最终区间前后各扩 pad 行——body+context 的 ±3 上下文窗内聚于此（单次读文件
+    完成切片+扩窗，消除原 _last_slice_meta 模块级全局（FastMCP sync handler 线程池并发
+    get_node 交错互覆）+ TOCTOU 双读）。重定位窗尾非文件尾（±40 硬窗可能截断长函数）→
+    附 `(relocated window, may be truncated)` 提示行。
+    返回 (切片文本, slice_verified, slice_start, slice_end)。
     """
-    global _last_slice_meta
-    _last_slice_meta = {"slice_verified": True}   # 每次调用重置（按调用为最新）
     src = Path(project_root) / file_path
     try:
         lines = src.read_text(encoding="utf-8").splitlines()
     except OSError:
-        _last_slice_meta = {"slice_verified": False}
-        return "", False
+        return "", False, 0, 0
+    n = len(lines)
 
     def _slice(lo: int, hi: int) -> list[str]:
-        lo, hi = max(1, lo), min(len(lines), hi)
+        lo, hi = max(1, lo), min(n, hi)
         return lines[lo - 1:hi] if lo <= hi else []
+
+    def _expand(lo: int, hi: int) -> tuple[int, int]:
+        return max(1, lo - pad), min(n, hi + pad)
 
     body = _slice(start_line, end_line)
     if not body:
-        _last_slice_meta = {"slice_verified": False}
-        return "", False
+        return "", False, 0, 0
     head = "\n".join(body[:3])
     if (name and name in head) or (signature and signature in head):
-        _last_slice_meta = {"slice_verified": True, "slice_start": start_line, "slice_end": end_line}
-        return "\n".join(body), True
+        lo, hi = _expand(start_line, end_line)
+        return "\n".join(_slice(lo, hi)), True, lo, hi
     # 行漂移：DB 行区间失效 → fuzzy 逐行定位 def/class + name
     for i, ln in enumerate(lines, 1):
         stripped = ln.lstrip()
         if name and name in ln and (stripped.startswith("def ") or stripped.startswith("class ")):
-            lo, hi = max(1, i - 40), min(len(lines), i + 40)
-            relocated = _slice(i - 40, i + 40)
+            lo, hi = _expand(i - 40, i + 40)
+            relocated = _slice(lo, hi)
             if relocated:
-                _last_slice_meta = {"slice_verified": True, "slice_start": lo, "slice_end": hi}
-                return "\n".join(relocated), True
-    _last_slice_meta = {"slice_verified": False}
-    return "\n".join(body), False
+                # L1：±40 硬窗对长函数（>80 行）可能静默截断——窗尾非文件尾时附提示
+                if hi < n:
+                    relocated.append("(relocated window, may be truncated)")
+                return "\n".join(relocated), True, lo, hi
+    return "\n".join(body), False, 0, 0
 
 
 def _verdict_for_source_request(has_source: bool, explicit_body: bool):
@@ -1717,6 +1719,68 @@ def _signature_line(sig: str, short: str) -> str:
     if sig.startswith("("):
         return f"def {short}{sig}"
     return sig
+
+
+def _top_neighbor_ids(G, nid, top=10):
+    """B2 M1: 1-hop 邻接去重 + 按邻居度数排序取 top-k（与 B3 blast-radius top-k 精神
+    一致——god node 度数 100+ 时邻接只取最重要 top-k）。返回 (top_ids, 去重后总数)。"""
+    nbs = list(dict.fromkeys(list(G.successors(nid)) + list(G.predecessors(nid))))
+    ranked = sorted(nbs, key=lambda nb: (-G.degree(nb), nb))
+    return ranked[:top], len(nbs)
+
+
+def _neighbor_signatures(db_path, ids):
+    """B2 M1: 直查 nodes 表 signature 列（只读，复用 get_node DB 连接形态）——
+    body+context 邻接段签名摘要用。__cg 碰撞消歧后缀回退基 id（adapter A4）。
+    返回 {id: signature}。DB 缺失/损坏 → {}（诚实降级，不崩出口）。"""
+    if not ids:
+        return {}
+    import sqlite3 as _sqlite3
+    sigs = {}
+    try:
+        conn = _sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        try:
+            ph = ",".join("?" * len(ids))
+            for nid, sig in conn.execute(
+                    f"SELECT id, signature FROM nodes WHERE id IN ({ph})", tuple(ids)):
+                sigs[nid] = sig or ""
+            for nid in ids:
+                if nid in sigs:
+                    continue
+                m = re.match(r"^(.*)__cg\d+$", nid)
+                if not m:
+                    continue
+                row = conn.execute(
+                    "SELECT signature FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
+                if row:
+                    sigs[nid] = row[0] or ""
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        return {}
+    return sigs
+
+
+def _neighbor_summary_lines(G, nid, db_path, top=10):
+    """B2 M1: 1-hop 邻接签名摘要——每邻居 label + Signature:（直查 nodes 表 signature 列），
+    度数排序取 top-k，超限标 (+N more)。替代 _tool_get_neighbors 全量邻接文本（god node
+    时是 token 放大器）。label 过 sanitize_label（图 label 可为 LLM 字段，F-010）；
+    Signature 是代码文本非 LLM 字段（L2 语义锁定：不做 F-010 sanitize）。"""
+    lines = []
+    top_ids, total = _top_neighbor_ids(G, nid, top=top)
+    sigs = _neighbor_signatures(db_path, top_ids)
+    for nb in top_ids:
+        label = str(G.nodes[nb].get("label", nb))
+        sig = sigs.get(nb)
+        if sig:
+            nb_short = label.rsplit(".", 1)[-1]
+            lines.append(f"  {sanitize_label(label)}  Signature: {_signature_line(sig, nb_short)}")
+        else:
+            lines.append(f"  {sanitize_label(label)}")
+    extra = total - len(top_ids)
+    if extra > 0:
+        lines.append(f"  (+{extra} more)")
+    return lines
 
 
 def _format_node_card(G, nid, d) -> str:
@@ -2126,35 +2190,32 @@ def _build_server(graph_path: str):
             sig = (row[3] or "").strip()
             doc = (row[4] or "").strip()
             if sig:
-                # 真实 DB signature 列无 def 前缀（fork 实测 7378/7378）——重构出 def 行
-                card.append(f"  Signature: {sanitize_label(_signature_line(sig, short))}")
+                # 真实 DB signature 列无 def 前缀（fork 实测 7378/7378）——重构出 def 行。
+                # B2 L2：Signature 是代码文本非 LLM 字段——不做 F-010 sanitize
+                # （sanitize_label 剥 \n/\t 等控制空白，变形多行签名；fork 真实 DB
+                # 存在 `(\r\n self,\r\n ...)` 多行形态，见 test_sanitize_label_strips_*）。
+                card.append(f"  Signature: {_signature_line(sig, short)}")
             if doc:
+                # Doc: 头行：docstring 预览行（splitlines 已剥换行），保留 sanitize 防御
                 card.append(f"  Doc: {sanitize_label(doc.splitlines()[0])}")
         if explicit_body and has_source:
             project_root = Path(active_graph_path).parent.parent
-            text, slice_ok = _slice_source(
+            # B2 M2：pad=3（body+context ±3 上下文窗）内聚于 _slice_source——单次读文件
+            # 完成切片+扩窗，返回 (text, ok, slice_start, slice_end)；删 _last_slice_meta
+            # 全局（FastMCP sync handler 线程池并发 get_node 交错互覆）+ 消 TOCTOU 双读。
+            text, slice_ok, _s, _e = _slice_source(
                 project_root, row[0], row[1], row[2], short,
-                signature=_signature_line((row[3] or "").strip(), short) or None)
+                signature=_signature_line((row[3] or "").strip(), short) or None,
+                pad=3 if include_source == "body+context" else 0)
             if slice_ok:
-                if include_source == "body+context":
-                    # ±3 行上下文窗口：在已验证切片前后各扩 3 行（漂移重定位区间同样扩张）
-                    try:
-                        all_lines = (project_root / row[0]).read_text(encoding="utf-8").splitlines()
-                    except OSError:
-                        all_lines = text.splitlines()
-                    s = _last_slice_meta.get("slice_start", row[1])
-                    e = _last_slice_meta.get("slice_end", row[2])
-                    lo, hi = max(1, s - 3), min(len(all_lines), e + 3)
-                    code_lines = all_lines[lo - 1:hi] if lo <= hi else text.splitlines()
-                else:
-                    code_lines = text.splitlines()
                 card.append("Code:")
-                card.extend(f"  {ln}" for ln in code_lines)
+                card.extend(f"  {ln}" for ln in text.splitlines())
                 if include_source == "body+context":
-                    # 1-hop 邻接签名摘要（get_neighbors 复用）
+                    # B2 M1：1-hop 邻接签名摘要（label + Signature: 双列，度数 top-10 +
+                    # (+N more) 截断标注）——god node（度数 100+）不拼全量邻接文本
+                    # （原 _tool_get_neighbors 全量输出是 token 放大器）。
                     card.append("Context (1-hop neighbors):")
-                    nb_text, _, _ = _tool_get_neighbors({"label": label})
-                    card.extend(f"  {ln}" for ln in nb_text.splitlines())
+                    card.extend(_neighbor_summary_lines(G, nid, db_path))
             else:
                 # 切片校验失败：名片仍返回，Code: 段省略 + 标注 + low_confidence
                 card.append("Code: (slice unavailable — line drift detected; source body omitted)")
