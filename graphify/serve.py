@@ -1640,6 +1640,40 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
 # === CUSTOM: A1b end ==========================================================
 
 
+# === CUSTOM: A2 响应自动脱敏（Phase 4）========================================
+# CUSTOM: A2 响应脱敏（Phase 4）。L1 厂商前缀类（默认启用）——前缀+长度+字符集三重校验，
+# 误报率近零。L2 泛型启发式默认关（逐条校准后启用，见方案 §3-A2）。漏报可接受，误报不可接受。
+_REDACT_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("openai", re.compile(r"sk-(?!ant-|proj-|svcacct-|None-)[A-Za-z0-9]{32,}")),
+    ("openai-proj", re.compile(r"sk-proj-[A-Za-z0-9_-]{40,}")),
+    ("openai-svc", re.compile(r"sk-svcacct-[A-Za-z0-9_-]{20,}")),
+    ("openai-none", re.compile(r"sk-None-[A-Za-z0-9_-]{20,}")),
+    ("anthropic", re.compile(r"sk-ant-(api|admin)\d+-[A-Za-z0-9_-]{80,}")),
+    ("gemini", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("huggingface", re.compile(r"hf_[A-Za-z0-9]{34,40}")),
+    ("groq", re.compile(r"gsk_[A-Za-z0-9]{48,}")),
+    ("openrouter", re.compile(r"sk-or-(v1-)?[A-Za-z0-9_-]{20,}")),
+    ("xai", re.compile(r"xai-[A-Za-z0-9]{80}")),
+    ("perplexity", re.compile(r"pplx-[A-Za-z0-9]{20,}")),
+    ("tavily", re.compile(r"tvly-[A-Za-z0-9]{20,}")),
+    ("together", re.compile(r"tgp_v1_[A-Za-z0-9]{20,}")),
+    ("replicate", re.compile(r"r8_[A-Za-z0-9]{20,}")),
+    ("langsmith", re.compile(r"lsv2_(pt|sk)_[A-Za-z0-9]{20,}")),
+    ("slack", re.compile(r"xox[bpars]-[A-Za-z0-9-]{10,}")),
+    ("github", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}")),
+    ("aws", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("pem", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+]
+
+
+def _redact(text: str) -> str:
+    for kind, pat in _REDACT_PATTERNS:
+        text = pat.sub(f"[REDACTED:{kind}]", text)
+    return text
+# === CUSTOM: A2 end ===========================================================
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -1890,7 +1924,9 @@ def _build_server(graph_path: str):
             kind="mcp_query",
             question=question,
             corpus=str(active_graph_path),
-            result=result,
+            # CUSTOM: A2 与 serve 返回共用 _redact——querylog 记脱敏后文本，密钥零进
+            # 磁盘（GRAPHIFY_QUERY_LOG_RESPONSES=1 时 response 字段落盘同源脱敏）。
+            result=_redact(result),
             mode=mode,
             depth=depth,
             token_budget=budget,
@@ -2204,8 +2240,11 @@ def _build_server(graph_path: str):
             # _select_graph 之后取，多项目场景才随请求图走）。
             result = handler(arguments)
             state_path = Path(active_graph_path).parent / ".rebuild-state.json"
+            # CUSTOM: A2 出口脱敏顺序——工具文本 → _envelope → _redact → 返回。
+            # 信封（_meta 行）本身无密钥，正文先包信封再统一脱敏一次即可；querylog
+            # 落盘经同一 _redact（见 _tool_query_graph），密钥零进磁盘。
             return [types.TextContent(type="text",
-                                      text=_apply_envelope(name, result, _derive_freshness(state_path)))]
+                                      text=_redact(_apply_envelope(name, result, _derive_freshness(state_path))))]
         except ToolError:
             # A handler-signalled error: propagate so the result is marked
             # isError:true (the mcp 1.x decorator wraps a raised exception into
