@@ -2,16 +2,25 @@
 from __future__ import annotations
 import json as _json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
 DEFAULT_MAX_SCHEMA = 9  # Phase 0 实测：codegraph 1.6.0 = schema v9
 
 
-def _open_readonly(db_path: str | Path) -> sqlite3.Connection:
-    """URI 只读连接，禁用 immutable=1（WAL 下漏读未 checkpoint 数据，§3.3）."""
+def _open_readonly(db_path: str | Path, allow_immutable_fallback: bool = False) -> sqlite3.Connection:
+    """URI 只读连接。WAL 下 immutable=1 会漏读未 checkpoint 数据（§3.3），正常路径禁用；
+    仅当 mode=ro 打不开（只读介质缺 -shm）且 allow_immutable_fallback=True 时降级 immutable——
+    只读介质无并发写，陈旧快照顾虑不成立（A3 降级链 Q11）。降级写日志。"""
     p = Path(db_path).resolve()
-    return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+    try:
+        return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        if not allow_immutable_fallback:
+            raise
+        print(f"[adapter] mode=ro 打开失败，降级 immutable=1: {p}", file=sys.stderr)
+        return sqlite3.connect(f"file:{p.as_posix()}?immutable=1", uri=True)
 
 
 def _check_schema(conn: sqlite3.Connection, max_schema: int) -> int:
@@ -27,6 +36,7 @@ def _check_schema(conn: sqlite3.Connection, max_schema: int) -> int:
 def load_codegraph(db_path: str | Path, max_schema: int = DEFAULT_MAX_SCHEMA) -> dict[str, Any]:
     conn = _open_readonly(db_path)
     try:
+        conn.execute("BEGIN")  # A3：单事务快照读——WAL 下并发写期间所有 SELECT 恒读事务开始时的快照
         _check_schema(conn, max_schema)
         nodes = _map_nodes(conn)
         edges = _map_edges(conn)
