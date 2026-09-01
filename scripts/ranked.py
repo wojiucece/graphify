@@ -54,9 +54,13 @@ _tiktoken_enc = None  # 可选依赖惰性缓存：None=未探测 / False=不可
 # 热切换互不串。并发安全：FastMCP sync handler 实际跑线程池，并发请求存在竞争——但
 # CPython dict 单键赋值原子（GIL），并发 miss 时重复加载无害（payload 幂等，后写覆盖
 # 先写内容相同），无需加锁；禁止以"单协程顺序执行"假设为依据添加非原子操作（如分步
-# get-then-put 删改，会在并发下撕裂）。L-B 容量上界：_GRAPH_CACHE_MAX_ENTRIES = 8，
-# 多项目热切换下最多驻留 8 份解析后整图（~50-150MB/项目），防无限增长；DiGraph 视图
-# 驻留同 entry 不另计。
+# get-then-put 删改，会在并发下撕裂）。M-A（补充审核）：get_digraph 的 lazy 构造同此
+# 合法——check-then-act（digraph is None 检查与赋值分离）下并发双建内容相同（同一只读
+# payload 构建），一次性赋值幂等覆盖无害，与缓存主体同一论证；构建后 payload 视为
+# 不可变。L-A（补充审核）：digraph 构建完成后 payload["links"]=None 释放边列表（边数据
+# 已全部并入 digraph），B1-only 会话不驻留整图边列表。L-B 容量上界：
+# _GRAPH_CACHE_MAX_ENTRIES = 8，多项目热切换下最多驻留 8 份解析后整图
+# （~50-150MB/项目），防无限增长；DiGraph 视图驻留同 entry 不另计。
 _GRAPH_CACHE_MAX_ENTRIES = 8
 _GRAPH_CACHE: dict[str, tuple[int, int, dict]] = {}
 _graph_loads = 0  # M1 诊断：实际 json.loads 全量图次数（cache miss 才 +1），供测试/日志验证命中率
@@ -150,7 +154,8 @@ def _gap_refs(conn):
 
 def _cache_load(graph_path: Path) -> dict | None:
     """统一缓存核心（I2 单入口）：mtime+size 双键命中复用；miss 则一次 json.loads 解析
-    graph.json → 派生 degree/collision_bases/nodes/links（B3 DiGraph 视图 lazy 后置）。
+    graph.json → 派生 degree/collision_bases/nodes/links（B3 DiGraph 视图 lazy 后置，
+    get_digraph 构造后 payload["links"] 置 None 释放——L-A，见 get_digraph）。
     失败（缺失/损坏/越界）→ None，不缓存（下次修复即拾起）。"""
     key = str(graph_path)
     try:
@@ -218,7 +223,8 @@ def get_digraph(graph_path: Path):
     json.loads）。生产 graph.json 实测 directed:false，node_link_graph 无向化丢方向，须从
     原始 links 重建。节点/边属性（kind/label/source_file/relation/confidence）原样带上
     （E2/N4 fixture 纪律）。调用方（serve._digraph_view）只读，禁止 mutate。失败 → 空
-    DiGraph（诚实降级，不崩出口）。"""
+    DiGraph（诚实降级，不崩出口）。构造完成后 payload["links"] 置 None 释放（L-A：边数据
+    已全部并入 digraph，B1-only 会话不驻留整图边列表）。"""
     payload = _cache_load(graph_path)
     if payload is None:
         return nx.DiGraph()
@@ -238,7 +244,14 @@ def get_digraph(graph_path: Path):
             if s is None or t is None:
                 continue
             DG.add_edge(s, t, **{k: v for k, v in lk.items() if k not in ("source", "target")})
+        # M-A（补充审核）：DG 构建完一次性赋值——并发下两线程可都见 digraph is None 各建
+        # 一份（check-then-act），但内容相同（同一只读 payload 构建），后写覆盖无害——与
+        # 缓存主体同一幂等论证，无需加锁；构建后 payload 视为不可变（调用方只读）。
         payload["digraph"] = DG
+        # L-A（补充审核）：links 已全部并入 digraph（边数据/属性原样携带），释放边列表
+        # ——B1-only 会话（从不调 get_digraph）不驻留整图边列表 ~20-40MB/项目。grep 核实
+        # payload 内无其他 links 消费者（仅本构造期读取），释放安全。
+        payload["links"] = None
     return payload["digraph"]
 
 

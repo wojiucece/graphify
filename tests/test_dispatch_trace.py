@@ -339,6 +339,9 @@ def test_blast_radius_both_truncation_labels_both_directions():
     """M1a：both 方向截断行标注 by degree across both directions（in/out 并集语义
     对称性透明化）；in 方向仍用 by degree（不带 both 标注）。"""
     from graphify.serve import _blast_radius_lines
+    # L-B（补充审核）：下面 any(...) 截断行断言依赖 _fanout_digraph() 的 total=4 > top_k=1
+    # （f01 both depth=2 闭包 4 节点：in {c11,b01,a01,a02} + out ∅，top 1 截断才产截断行）；
+    # 改动 fixture 节点数需同步检查此断言（节点数减到 ≤top_k 时无截断行，any 落空）。
     DG = _fanout_digraph()
     lines, total = _blast_radius_lines(DG, "function:f01", "both", 2, 1, "", db_path=None)
     assert total > 1
