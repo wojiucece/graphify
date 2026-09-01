@@ -174,6 +174,13 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
             from run_analysis import run                        # 懒导入（scripts/ 在 sys.path）
             run(db, output_dir=out, root=str(root),
                 semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
+            # B4: cache GC 挂载（成功路径末尾、finally 前，锁内）。manifest 锚定
+            # mark-and-sweep + 频率门控摊销扫描；GC 失败绝不影响 rebuild 结果。
+            try:
+                from cache_gc import gc_cache
+                gc_cache(out, out / "manifest.json")
+            except Exception as e:   # GC 失败绝不影响 rebuild 结果
+                _log(f"cache gc 异常（忽略）: {e}")
             # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
             # watch/hook 事件流兜底（变化本身说明后续触发面已排队/即将触发，重跑只
             # 增加锁内阻塞时长）。循环结构保留（range(2) 仅走一轮），便于回滚对比。
