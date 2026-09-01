@@ -1628,16 +1628,98 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
     """N1 返回契约：检索型清单内 result=(text, found, scanned_nodes) 解包过信封；
     清单外裸 str 直通。模块级纯函数——不经 MCP server 即可测.
     R3-3：verdict_override 非 None 时直通（_derive_verdict 无 low_confidence 推导路径——
-    它是工具侧的诚实自评，不是出口可推导的；B3 遍历档/C 系分析工具用）."""
+    它是工具侧的诚实自评，不是出口可推导的；B3 遍历档/C 系分析工具用）。
+    B2：get_node 自报 override——result 四元组 (text, found, scanned, override) 取末元
+    （显式 param 优先，契约不破）。verdict 优先级：degraded（freshness=rebuilding）压倒
+    一切 > override > 推导（Task 2 minor 交接：override 原分支绕过 degraded，B2 首个真实
+    消费者，两者可同现——顺带修正并锁定）。"""
     if name not in _SEARCH_TOOLS:
         return result
-    text, found, scanned = result
-    if verdict_override is not None:
-        v, meta = verdict_override, {}
+    if isinstance(result, tuple) and len(result) == 4:
+        text, found, scanned, tool_override = result
+        if verdict_override is None:
+            verdict_override = tool_override   # 无显式 param 时取工具自报
     else:
-        v, meta = _derive_verdict(tool=name, found=found, scanned_nodes=scanned,
-                                  degraded=(freshness == "rebuilding"))
+        text, found, scanned = result
+    degraded = freshness == "rebuilding"
+    v, meta = _derive_verdict(tool=name, found=found, scanned_nodes=scanned, degraded=degraded)
+    if v != "degraded" and verdict_override is not None:
+        v, meta = verdict_override, {}
     return _envelope(text, verdict=v, freshness=freshness, **meta)
+
+
+# === CUSTOM: B2 get_node include_source 符号切片（Phase 4）====================
+_last_slice_meta: dict = {}  # 切片校验结果：成功带 slice_start/slice_end，失败置 slice_verified=False
+
+
+def _slice_source(project_root, file_path, start_line, end_line, name, signature=None):
+    """B2 符号切片：读 <project_root>/<file_path> 行区间 [start_line, end_line]（1-based 含）。
+
+    校验（name 或 signature 出现于切片头部 3 行内）失败 → 全文逐行 fuzzy 定位
+    `def/class <name>` 行并重定区间 ±40 行；仍失败 → 返回 (原区间切片, False) +
+    模块级 _last_slice_meta={"slice_verified": False}。缺省档切片失败由调用方
+    （get_node）省略 Code: 段 + 标注，不毁响应。
+    返回 (切片文本, slice_verified)。
+    """
+    global _last_slice_meta
+    _last_slice_meta = {"slice_verified": True}   # 每次调用重置（按调用为最新）
+    src = Path(project_root) / file_path
+    try:
+        lines = src.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        _last_slice_meta = {"slice_verified": False}
+        return "", False
+
+    def _slice(lo: int, hi: int) -> list[str]:
+        lo, hi = max(1, lo), min(len(lines), hi)
+        return lines[lo - 1:hi] if lo <= hi else []
+
+    body = _slice(start_line, end_line)
+    if not body:
+        _last_slice_meta = {"slice_verified": False}
+        return "", False
+    head = "\n".join(body[:3])
+    if (name and name in head) or (signature and signature in head):
+        _last_slice_meta = {"slice_verified": True, "slice_start": start_line, "slice_end": end_line}
+        return "\n".join(body), True
+    # 行漂移：DB 行区间失效 → fuzzy 逐行定位 def/class + name
+    for i, ln in enumerate(lines, 1):
+        stripped = ln.lstrip()
+        if name and name in ln and (stripped.startswith("def ") or stripped.startswith("class ")):
+            lo, hi = max(1, i - 40), min(len(lines), i + 40)
+            relocated = _slice(i - 40, i + 40)
+            if relocated:
+                _last_slice_meta = {"slice_verified": True, "slice_start": lo, "slice_end": hi}
+                return "\n".join(relocated), True
+    _last_slice_meta = {"slice_verified": False}
+    return "\n".join(body), False
+
+
+def _verdict_for_source_request(has_source: bool, explicit_body: bool):
+    """B2 Q9 分档：语义节点（无源文件/DB 行）显式请求 body/body+context → 'absent'
+    （get_node 装配 scanned=1，扫描语义表）；缺省/none/signature 档名片正常返回 → None
+    （Code: 段自然省略）。"""
+    if not has_source and explicit_body:
+        return "absent"
+    return None
+
+
+def _format_node_card(G, nid, d) -> str:
+    """B2 get_node 名片正文（none 档回归锚点——与扩展前逐字节一致，勿加字段）。
+    名片增强（Signature:/Doc:）由 get_node 在非 none 档追加于本卡尾部。"""
+    return "\n".join([
+        f"Node: {sanitize_label(d.get('label', nid))}",
+        f"  ID: {sanitize_label(nid)}",
+        f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
+        *([f"  Defined in: {sanitize_label(str(d.get('definition_file', '')))} "
+           f"{sanitize_label(str(d.get('definition_location', '')))}"]
+          if d.get("definition_file") else []),
+        f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
+        f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
+        f"  Degree: {G.degree(nid)}",
+    ])
+# === CUSTOM: B2 end ===========================================================
+
 # === CUSTOM: A1b end ==========================================================
 
 
@@ -1769,11 +1851,31 @@ def _build_server(graph_path: str):
                 },
             ),
             types.Tool(
+                # CUSTOM: B2 include_source 四档（受限取值参数 → JSON schema enum，
+                # 无效值走参数校验失败 isError）。缺省 signature（DB 名片增强），
+                # none 档输出与扩展前逐字节一致（回归锚点）。
                 name="get_node",
-                description="Get full details for a specific node by label or ID.",
+                description=(
+                    "Get full details for a specific node by label or ID. include_source "
+                    "controls source slicing: signature (default; def line + signature + "
+                    "docstring head), body (source slice), body+context (±3 lines + "
+                    "1-hop neighbor signatures), or none (card only)."
+                ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"label": {"type": "string", "description": "Node label or ID to look up"}},
+                    "properties": {
+                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        "include_source": {
+                            "type": "string",
+                            "enum": ["none", "signature", "body", "body+context"],
+                            "default": "signature",
+                            "description": (
+                                "Source slicing mode (default signature): none=card only; "
+                                "signature=def line + signature + docstring head; body=source "
+                                "slice; body+context=±3 lines + 1-hop neighbor signatures"
+                            ),
+                        },
+                    },
                     "required": ["label"],
                 },
             ),
@@ -1960,29 +2062,87 @@ def _build_server(graph_path: str):
         # found." 是 _query_graph_text 的空态哨兵），scanned=全图节点数（扫描语义表）。
         return result, not result.startswith("No matching nodes found"), G.number_of_nodes()
 
-    def _tool_get_node(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+    def _tool_get_node(arguments: dict) -> tuple[str, bool, int, str | None]:  # CUSTOM: B2 四元组
+        # B2 include_source 四档：none/signature(缺省)/body/body+context。返回
+        # (text, found, scanned, verdict_override)——末元是工具侧诚实自评（R3-3），
+        # 切片校验失败→low_confidence、语义节点显式请求 body→absent（扫描语义 scanned=1）。
+        import sqlite3 as _sqlite3
         label = arguments["label"].lower()
+        include_source = arguments.get("include_source", "signature")
         nid, err = _resolve_single_node(G, label)
         if err:
             # CUSTOM: N1 found=err is None（机械约定，Ambiguous 亦计 absent 文本保留）；
             # scanned=1（扫描语义表：get_node 只针对单节点解析）。
-            return err, False, 1
+            return err, False, 1, None
         d = G.nodes[nid]
-        # Sanitise every LLM-derived field before concatenation (F-010).
-        return "\n".join([
-            f"Node: {sanitize_label(d.get('label', nid))}",
-            f"  ID: {sanitize_label(nid)}",
-            f"  Source: {sanitize_label(str(d.get('source_file', '')))} {sanitize_label(str(d.get('source_location', '')))}",
-            # A C/C++/ObjC symbol declared in a header and defined in the sibling
-            # impl file is ONE node keyed to the header, so Source alone points at
-            # the declaration. Name where it is implemented too, when known.
-            *([f"  Defined in: {sanitize_label(str(d.get('definition_file', '')))} "
-               f"{sanitize_label(str(d.get('definition_location', '')))}"]
-              if d.get("definition_file") else []),
-            f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
-            f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
-            f"  Degree: {G.degree(nid)}",
-        ]), True, 1  # CUSTOM: N1 found=节点已解析, scanned=1（扫描语义表）
+        card = [_format_node_card(G, nid, d)]  # none 档锚点：与扩展前逐字节一致
+        # 路径联动总条款：root 从当前 active graph（graphify-out/graph.json）推导
+        # （与 _derive_freshness / _tool_get_ranked_context 同构）。DB 只读 join 带出
+        # signature/docstring/行区间——codegraph nodes 表 id 与图节点 id 同源
+        # （adapter._map_nodes 直通）；__cg 碰撞消歧后缀回退基 id（adapter A4）。
+        row = None
+        db_path = Path(active_graph_path).parent.parent / ".codegraph" / "codegraph.db"
+        try:
+            conn = _sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT file_path, start_line, end_line, signature, docstring "
+                    "FROM nodes WHERE id = ?", (nid,)).fetchone()
+                if row is None:
+                    m = re.match(r"^(.*)__cg\d+$", nid)
+                    if m:
+                        row = conn.execute(
+                            "SELECT file_path, start_line, end_line, signature, docstring "
+                            "FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
+            finally:
+                conn.close()
+        except _sqlite3.Error:
+            row = None  # DB 缺失/损坏：语义节点等价（has_source=False，诚实降级）
+        has_source = row is not None and bool(row[0])
+        explicit_body = include_source in ("body", "body+context")
+        override = _verdict_for_source_request(has_source=has_source, explicit_body=explicit_body)
+        if include_source == "none":
+            # none 档回归锚点：名片无 Signature:/Doc:/Code: 行，与扩展前逐字节一致
+            return "\n".join(card), True, 1, override
+        # 名片增强：Signature:/Doc: 行（DB 一次 join 带出）
+        if row is not None:
+            sig = (row[3] or "").strip()
+            doc = (row[4] or "").strip()
+            if sig:
+                card.append(f"  Signature: {sanitize_label(sig)}")
+            if doc:
+                card.append(f"  Doc: {sanitize_label(doc.splitlines()[0])}")
+        if explicit_body and has_source:
+            project_root = Path(active_graph_path).parent.parent
+            short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
+            text, slice_ok = _slice_source(
+                project_root, row[0], row[1], row[2], short,
+                signature=(row[3] or "").strip() or None)
+            if slice_ok:
+                if include_source == "body+context":
+                    # ±3 行上下文窗口：在已验证切片前后各扩 3 行（漂移重定位区间同样扩张）
+                    try:
+                        all_lines = (project_root / row[0]).read_text(encoding="utf-8").splitlines()
+                    except OSError:
+                        all_lines = text.splitlines()
+                    s = _last_slice_meta.get("slice_start", row[1])
+                    e = _last_slice_meta.get("slice_end", row[2])
+                    lo, hi = max(1, s - 3), min(len(all_lines), e + 3)
+                    code_lines = all_lines[lo - 1:hi] if lo <= hi else text.splitlines()
+                else:
+                    code_lines = text.splitlines()
+                card.append("Code:")
+                card.extend(f"  {ln}" for ln in code_lines)
+                if include_source == "body+context":
+                    # 1-hop 邻接签名摘要（get_neighbors 复用）
+                    card.append("Context (1-hop neighbors):")
+                    nb_text, _, _ = _tool_get_neighbors({"label": label})
+                    card.extend(f"  {ln}" for ln in nb_text.splitlines())
+            else:
+                # 切片校验失败：名片仍返回，Code: 段省略 + 标注 + low_confidence
+                card.append("Code: (slice unavailable — line drift detected; source body omitted)")
+                override = override or "low_confidence"
+        return "\n".join(card), True, 1, override  # N1 found=节点已解析, scanned=1（扫描语义表）
 
     def _tool_get_neighbors(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         label = arguments["label"].lower()

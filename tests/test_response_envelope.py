@@ -81,3 +81,33 @@ def test_apply_envelope_verdict_override():
                           freshness="fresh", verdict_override="low_confidence")
     meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
     assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
+
+def test_apply_envelope_degraded_beats_override():
+    """B2 优先级：degraded 压倒一切——freshness=rebuilding 时 override 不得压掉 degraded
+    （Task 2 minor 交接：override 分支绕过 degraded 是历史缺陷，B2 是 override 首个真实
+    消费者，两者可同现（rebuild 期间 get_node 切片失败）——顺带修正+锁定）."""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("get_node", ("Node: x", True, 1),
+                          freshness="rebuilding", verdict_override="low_confidence")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "degraded" and meta["freshness"] == "rebuilding"
+    # override 仍直通（非 degraded 时）——R3-3 不破
+    out2 = _apply_envelope("get_node", ("Node: x", True, 1),
+                           freshness="fresh", verdict_override="low_confidence")
+    meta2 = _json.loads(out2.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta2["verdict"] == "low_confidence" and meta2["freshness"] == "fresh"
+
+def test_apply_envelope_four_tuple_override_flow():
+    """B2 N1 扩展：result 四元组 (text, found, scanned, verdict_override) 时取末元直通
+    （get_node 工具自报 low_confidence/absent 的通道）；显式 param 优先，契约不破."""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("get_node", ("Node: x", True, 1, "absent"), freshness="fresh")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "absent"
+    # 四元组 + 显式 param：param 优先（R3-3 契约）
+    out2 = _apply_envelope("get_node", ("Node: x", True, 1, "absent"),
+                           freshness="fresh", verdict_override="low_confidence")
+    meta2 = _json.loads(out2.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta2["verdict"] == "low_confidence"
