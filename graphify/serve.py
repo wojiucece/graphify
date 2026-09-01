@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+import time  # CUSTOM: A1b _derive_freshness 需要（状态文件时效逃生）
 from array import array
 from collections import OrderedDict
 from pathlib import Path
@@ -1549,6 +1550,96 @@ def _community_header(cid: int, community_name) -> str:
     return base
 
 
+# === CUSTOM: A1b 检索诚实性信封（Phase 4）====================================
+# verdict ∈ {ok, low_confidence, absent, degraded}，freshness ∈ {fresh, stale_index,
+# rebuilding}；confidence 初期一律 declared（§8 纪律）。状态文件解析按 A1a 的
+# schema 自包含实现——serve.py 不 import scripts/rebuild_entry（graphify 包不反向
+# 依赖 scripts/）；complete/error 载荷不含 db_fingerprint（以 A1a 实现为准），
+# 本层只依赖 phase/started/last_duration 三字段。
+_REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
+
+# 检索型工具清单（判据 = 响应内容反映图数据现状）；新工具（B1/B3/C 系）登记处——
+# 清单外工具裸 str 直通，新增检索型工具若拒绝登记则出口不予合并。
+_SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
+                           "god_nodes", "shortest_path", "graph_stats"})
+
+
+def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
+    """A1b 尾部行信封：既有正文逐字节不变，追加 '\\n\\n_meta: {json 单行}'。"""
+    meta = {"verdict": verdict, "freshness": freshness, "confidence": "declared", **extra}
+    return f"{text}\n\n_meta: {json.dumps(meta, ensure_ascii=False, separators=(',', ':'))}"
+
+
+def _derive_freshness(state_path):
+    """从 A1a 状态文件推导 freshness；路径联动总条款见 call_tool 出口。
+
+    - 无状态文件 = 未迁移项目，守卫回退 fresh（不得全标 stale）
+    - rebuilding 超时效（max(2*last_duration, 1800)s）判 stale_index（Q3 时效逃生，
+      kill -9 残留的自愈上限）
+    - complete 态比对 graph.json mtime vs codegraph DB mtime（主 DB mtime 仅
+      checkpoint 时更新，不可直接用；-wal 不存在时回退主 DB，取较新者）
+    """
+    try:
+        d = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "fresh"  # 无状态文件 = 未迁移项目，守卫回退
+    if d.get("phase") == "rebuilding":
+        limit = max(2 * float(d.get("last_duration", 0)), _REBUILD_STALE_FLOOR_S)
+        if time.time() - float(d.get("started", 0)) > limit:
+            print(f"[serve] 状态文件超时效（{limit:.0f}s），判 stale_index", file=sys.stderr)
+            return "stale_index"
+        return "rebuilding"
+    # complete 态：E1 不变量保证 run() 先落 graph.json 再进 finally 写状态文件 ->
+    # graph.json mtime 恒 >= complete.finished。WAL mtime 更新 = rebuild 完成后 DB
+    # 又有新数据且无 rebuild 在处理（走到本分支即排除了 rebuilding 态）——这正是
+    # stale_index 语义，非竞态误报。graph.json 与状态文件同目录（自动兼容
+    # GRAPHIFY_OUT 重定向），不硬编码 'graphify-out'。
+    root = state_path.parent.parent
+    wal = root / ".codegraph" / "codegraph.db-wal"
+    db = root / ".codegraph" / "codegraph.db"
+    ref = wal if wal.exists() else db
+    try:
+        graph_m = (state_path.parent / "graph.json").stat().st_mtime_ns
+        return "stale_index" if ref.exists() and ref.stat().st_mtime_ns > graph_m else "fresh"
+    except OSError:
+        # R5-3：graph.json 缺失（产物被删/多项目路径联动出错）——freshness 是附加
+        # 诚实层，无权让 call_tool 出口崩溃杀死全部响应；产物缺失即最陈旧形态，
+        # 判 stale_index 诚实且安全。
+        return "stale_index"
+
+
+def _derive_verdict(tool: str, found: bool, scanned_nodes: int, degraded: bool = False):
+    """verdict 三分推导：degraded 压倒一切 > found=ok > absent（携带扫描计数）。
+
+    degraded/found/scanned_nodes 全由出口（call_tool）装配，工具只报事实；
+    low_confidence 无推导路径（R3-3：工具侧诚实自评经 verdict_override 直通）。
+    """
+    if degraded:
+        return "degraded", {}
+    if found:
+        return "ok", {}
+    if scanned_nodes > 0:
+        return "absent", {"scanned_nodes": scanned_nodes}
+    return "absent", {"scanned_nodes": 0, "empty_graph": True}
+
+
+def _apply_envelope(name: str, result, freshness: str, verdict_override: str | None = None) -> str:
+    """N1 返回契约：检索型清单内 result=(text, found, scanned_nodes) 解包过信封；
+    清单外裸 str 直通。模块级纯函数——不经 MCP server 即可测.
+    R3-3：verdict_override 非 None 时直通（_derive_verdict 无 low_confidence 推导路径——
+    它是工具侧的诚实自评，不是出口可推导的；B3 遍历档/C 系分析工具用）."""
+    if name not in _SEARCH_TOOLS:
+        return result
+    text, found, scanned = result
+    if verdict_override is not None:
+        v, meta = verdict_override, {}
+    else:
+        v, meta = _derive_verdict(tool=name, found=found, scanned_nodes=scanned,
+                                  degraded=(freshness == "rebuilding"))
+    return _envelope(text, verdict=v, freshness=freshness, **meta)
+# === CUSTOM: A1b end ==========================================================
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -1751,6 +1842,12 @@ def _build_server(graph_path: str):
                 },
             ),
         ]
+        # CUSTOM: A1b 清单标注——检索型工具（_SEARCH_TOOLS）的描述声明 _meta 信封契约，
+        # 调用方在 tool discovery 时即知响应尾部有 verdict/freshness 行（正文不变）。
+        for _t in _tools:
+            if _t.name in _SEARCH_TOOLS:
+                _t.description += (" Responses carry a trailing `_meta:` JSON line "
+                                   "(verdict/freshness; body unchanged).")
         # Multi-project support: every tool accepts an optional project_path.
         # Injected here (rather than repeated in 11 literal schemas) so the set
         # stays in lockstep as tools are added. Omitting it keeps the historical
@@ -1771,7 +1868,7 @@ def _build_server(graph_path: str):
             }
         return _tools
 
-    def _tool_query_graph(arguments: dict) -> str:
+    def _tool_query_graph(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         import time as _time
         from graphify import querylog
         question = arguments["question"]
@@ -1799,13 +1896,17 @@ def _build_server(graph_path: str):
             token_budget=budget,
             duration_ms=(_time.perf_counter() - _t0) * 1000,
         )
-        return result
+        # CUSTOM: N1 (text, found, scanned)——found=查到结果（"No matching nodes
+        # found." 是 _query_graph_text 的空态哨兵），scanned=全图节点数（扫描语义表）。
+        return result, not result.startswith("No matching nodes found"), G.number_of_nodes()
 
-    def _tool_get_node(arguments: dict) -> str:
+    def _tool_get_node(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         label = arguments["label"].lower()
         nid, err = _resolve_single_node(G, label)
         if err:
-            return err
+            # CUSTOM: N1 found=err is None（机械约定，Ambiguous 亦计 absent 文本保留）；
+            # scanned=1（扫描语义表：get_node 只针对单节点解析）。
+            return err, False, 1
         d = G.nodes[nid]
         # Sanitise every LLM-derived field before concatenation (F-010).
         return "\n".join([
@@ -1821,14 +1922,16 @@ def _build_server(graph_path: str):
             f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
             f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
             f"  Degree: {G.degree(nid)}",
-        ])
+        ]), True, 1  # CUSTOM: N1 found=节点已解析, scanned=1（扫描语义表）
 
-    def _tool_get_neighbors(arguments: dict) -> str:
+    def _tool_get_neighbors(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         nid, err = _resolve_single_node(G, label)
         if err:
-            return err
+            # CUSTOM: N1 未解析出起点 -> 邻接边数无定义；标签解析扫过全图，
+            # scanned=全图节点数（空图时为 0，empty_graph 旗标恰真；非空图不误报）。
+            return err, False, G.number_of_nodes()
         lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
         def _edge_at(d: dict) -> str:
             # Edge location = the relation SITE (call/import line) in the source
@@ -1857,15 +1960,18 @@ def _build_server(graph_path: str):
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
             )
         budget = int(arguments.get("token_budget", 2000))
+        # CUSTOM: N1 found=起点在图（已解析），scanned=邻接边数（扫描语义表；
+        # 检查过的邻接边总数，不随 relation_filter 过滤结果减少）。
         return _cut_lines_to_budget(
             lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
-        )
+        ), True, G.degree(nid)
 
-    def _tool_get_community(arguments: dict) -> str:
+    def _tool_get_community(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         cid = int(arguments["community_id"])
         nodes = communities.get(cid, [])
         if not nodes:
-            return f"Community {cid} not found."
+            # CUSTOM: N1 found=结果非空（社区成员表），scanned=全图节点数（扫描语义表）。
+            return f"Community {cid} not found.", False, G.number_of_nodes()
         header = _community_header(cid, G.nodes[nodes[0]].get("community_name"))
         lines = [f"{header} ({len(nodes)} nodes):"]
         for n in nodes:
@@ -1876,18 +1982,20 @@ def _build_server(graph_path: str):
                 f"[{sanitize_label(str(d.get('source_file', '')))}]"
             )
         budget = int(arguments.get("token_budget", 2000))
+        # CUSTOM: N1 found=社区非空，scanned=全图节点数（扫描语义表）。
         return _cut_lines_to_budget(
             lines, budget, "Raise token_budget or use get_node for specific members"
-        )
+        ), True, G.number_of_nodes()
 
-    def _tool_god_nodes(arguments: dict) -> str:
+    def _tool_god_nodes(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         from graphify.analyze import god_nodes as _god_nodes
         nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
         lines = ["God nodes (most connected):"]
         lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
-        return "\n".join(lines)
+        # CUSTOM: N1 found=结果非空（god 节点列表），scanned=全图节点数（扫描语义表）。
+        return "\n".join(lines), bool(nodes), G.number_of_nodes()
 
-    def _tool_graph_stats(_: dict) -> str:
+    def _tool_graph_stats(_: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
         total = len(confs) or 1
         return (
@@ -1897,10 +2005,17 @@ def _build_server(graph_path: str):
             f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
             f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
             f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
-        )
+        # CUSTOM: N1 found=图非空（stats 反映图现状，空图即 absent+empty_graph），
+        # scanned=全图节点数（扫描语义表）。
+        ), G.number_of_nodes() > 0, G.number_of_nodes()
 
-    def _tool_shortest_path(arguments: dict) -> str:
-        return _shortest_path_text(G, arguments)
+    def _tool_shortest_path(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+        # _shortest_path_text 保持 -> str（tests/test_serve.py 直接 import 测它，签名不可动）；
+        # found 从其既有文本哨兵推导：No* 前缀 = 端点缺失/无路径，同点退化 = 无有效路径
+        # （"Path exceeds max_hops" 路径存在，计 found=True）。
+        text = _shortest_path_text(G, arguments)
+        found = not (text.startswith("No ") or "both resolved to the same node" in text)
+        return text, found, G.number_of_nodes()
 
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
@@ -2030,9 +2145,10 @@ def _build_server(graph_path: str):
                 return report_path.read_text(encoding="utf-8")
             return "GRAPH_REPORT.md not found. Run graphify extract first."
         if uri_str == "graphify://stats":
-            return _tool_graph_stats({})
+            # CUSTOM: N1 三元组解包——资源保持裸文本（资源不经 call_tool 信封出口）。
+            return _tool_graph_stats({})[0]
         if uri_str == "graphify://god-nodes":
-            return _tool_god_nodes({"top_n": 10})
+            return _tool_god_nodes({"top_n": 10})[0]
         if uri_str == "graphify://surprises":
             try:
                 from graphify.analyze import surprising_connections
@@ -2080,7 +2196,16 @@ def _build_server(graph_path: str):
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
             _select_graph(project_path)  # bind G/communities to the target graph
-            return [types.TextContent(type="text", text=handler(arguments))]
+            # CUSTOM: A1b+N1 出口（G1 调用链）——检索型清单内工具闭包返回
+            # (text, found, scanned_nodes) 三元组，出口装配 verdict/freshness 信封；
+            # 清单外工具裸 str 直通。isError 真错误路径（ToolError/except Exception）
+            # 不附 _meta.verdict——维持 upstream 既有错误通道。
+            # 路径联动总条款：状态文件取 active_graph_path 所在输出目录（必须在
+            # _select_graph 之后取，多项目场景才随请求图走）。
+            result = handler(arguments)
+            state_path = Path(active_graph_path).parent / ".rebuild-state.json"
+            return [types.TextContent(type="text",
+                                      text=_apply_envelope(name, result, _derive_freshness(state_path)))]
         except ToolError:
             # A handler-signalled error: propagate so the result is marked
             # isError:true (the mcp 1.x decorator wraps a raised exception into
