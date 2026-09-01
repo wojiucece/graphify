@@ -176,9 +176,11 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
                 semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
             # B4: cache GC 挂载（成功路径末尾、finally 前，锁内）。manifest 锚定
             # mark-and-sweep + 频率门控摊销扫描；GC 失败绝不影响 rebuild 结果。
+            # root 显式传项目根（live 重算的 file_hash path-salt 锚点；--out-dir 自定义
+            # 时 cache_root.parent 不是项目根）。
             try:
                 from cache_gc import gc_cache
-                gc_cache(out, out / "manifest.json")
+                gc_cache(out, out / "manifest.json", root=root)
             except Exception as e:   # GC 失败绝不影响 rebuild 结果
                 _log(f"cache gc 异常（忽略）: {e}")
             # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
