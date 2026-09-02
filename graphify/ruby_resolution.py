@@ -143,13 +143,14 @@ def resolve_ruby_member_calls(
         return next(iter(hits)) if len(hits) == 1 else None
 
     def _emit(caller: str, target: str, rc: dict[str, Any],
-              relation: str = "calls", context: str = "call") -> None:
+              relation: str = "calls", context: str = "call",
+              resolved_by: str | None = None) -> None:
         if not caller or not target or caller == target:
             return
         if (caller, target) in existing_pairs:
             return
         existing_pairs.add((caller, target))
-        all_edges.append({
+        edge: dict[str, Any] = {
             "source": caller,
             "target": target,
             "relation": relation,
@@ -159,7 +160,14 @@ def resolve_ruby_member_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
-        })
+        }
+        # resolved_by (native-indexing spec): how the call was resolved — a
+        # constant (class/module) receiver is a static qualified reference
+        # ("qualified-name"), a typed instance receiver is "instance-method".
+        # Mixins (relation="mixes_in") are not calls and carry no resolved_by.
+        if resolved_by is not None:
+            edge["resolved_by"] = resolved_by
+        all_edges.append(edge)
 
     # `include`/`extend`/`prepend <Const>` mixins (#1668): resolve the module
     # reference lexically, the way Ruby constant lookup works (#2302) — try the
@@ -218,7 +226,7 @@ def resolve_ruby_member_calls(
                          else _unique_class(recv_raw))
             if class_nid is not None:
                 if callee == "new":
-                    _emit(caller, class_nid, rc)
+                    _emit(caller, class_nid, rc, resolved_by="qualified-name")
                 else:
                     # Emit to the singleton/instance method the class owns
                     # (`def self.call`, which the extractor indexes); otherwise
@@ -226,7 +234,8 @@ def resolve_ruby_member_calls(
                     # like ActiveRecord `where`/`find_by` still give correct
                     # blast-radius. An ambiguous receiver bails to nothing.
                     method_nid = method_index.get((class_nid, str(callee)))
-                    _emit(caller, method_nid or class_nid, rc)
+                    _emit(caller, method_nid or class_nid, rc,
+                          resolved_by="qualified-name")
             continue
 
         # `p.run` where p's type is known -> edge to that class's method.
@@ -239,4 +248,4 @@ def resolve_ruby_member_calls(
         method_nid = method_index.get((class_nid, str(callee)))
         if method_nid is None:
             continue
-        _emit(caller, method_nid, rc)
+        _emit(caller, method_nid, rc, resolved_by="instance-method")

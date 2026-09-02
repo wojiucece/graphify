@@ -891,6 +891,11 @@ def _apply_symbol_resolution_facts(
             "source_location": f"L{line}",
             "weight": 1.0,
         }
+        # Import-guided `calls` edges (JS/Python symbol-resolution pass) resolve
+        # through the import system — a static reference -> qualified-name
+        # (native-indexing spec resolved_by). Other relations carry no resolved_by.
+        if relation == "calls":
+            edge["resolved_by"] = "qualified-name"
         # A re-export edge's target is a FILE node that can collapse with a
         # same-basename cross-extension sibling; stamp the resolved target file so
         # the id-disambiguation salt is keyed by the TARGET, not the importer (#1814).

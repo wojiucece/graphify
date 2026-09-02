@@ -550,6 +550,10 @@ def resolve_bash_source_edges(
                     "source_file": raw_call.get("source_file", str(path)),
                     "source_location": raw_call.get("source_location", ""),
                     "weight": 1.0,
+                    # Resolved through the script's explicit `source` scoping — a
+                    # static reference to the sourced file's function table
+                    # (native-indexing spec resolved_by: qualified-name).
+                    "resolved_by": "qualified-name",
                 }
             )
 

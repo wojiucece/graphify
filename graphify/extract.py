@@ -156,6 +156,20 @@ from graphify.extractors.julia import extract_julia  # noqa: E402,F401
 
 _RECURSION_LIMIT = 10_000
 
+# resolved_by — how a cross-file call edge was resolved (native-indexing spec,
+# §提取契约 resolved_by). Three values, one per resolution path:
+#   static-type  (import-backed name match, or explicit class/module/package
+#                 qualification written in source)        -> "qualified-name"
+#   instance-method (receiver typed via a type table / this / base / self /
+#                 inherited-method dispatch)              -> "instance-method"
+#   heuristic   (bare name matching with no import
+#                 evidence, tie-breakers)                 -> "fuzzy"
+# Stamped at each cross-file CALL edge emission site; task 04 signal source for
+# the FTS/tool layers (tasks 05/06). Additive only — nothing reads it yet.
+RESOLVED_BY_QUALIFIED_NAME = "qualified-name"
+RESOLVED_BY_INSTANCE_METHOD = "instance-method"
+RESOLVED_BY_FUZZY = "fuzzy"
+
 # Language built-in globals that AST may classify as call targets when used as
 # constructors or coercion functions (e.g. String(x), Number(x), Boolean(x)).
 # Without this filter they become god-nodes accumulating spurious edges from
@@ -3023,6 +3037,8 @@ def _resolve_swift_member_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            "resolved_by": (RESOLVED_BY_QUALIFIED_NAME if type_qualified
+                            else RESOLVED_BY_INSTANCE_METHOD),
         })
 
 
@@ -3131,6 +3147,9 @@ def _resolve_python_member_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # Static qualified reference: the receiver is an explicit class or
+            # imported module name written in source.
+            "resolved_by": RESOLVED_BY_QUALIFIED_NAME,
         })
 
     for rc in all_raw_calls:
@@ -3312,6 +3331,8 @@ def _resolve_typescript_member_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            "resolved_by": (RESOLVED_BY_QUALIFIED_NAME if type_qualified
+                            else RESOLVED_BY_INSTANCE_METHOD),
         })
 
 
@@ -3440,6 +3461,10 @@ def _resolve_cpp_member_calls(
             "source_file": src_file,
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # `Foo::bar()` names the type explicitly -> qualified-name; `this->bar()`
+            # and a receiver typed via the local table are instance dispatch.
+            "resolved_by": (RESOLVED_BY_INSTANCE_METHOD if receiver == "this" or not type_qualified
+                            else RESOLVED_BY_QUALIFIED_NAME),
         })
 
 
@@ -3648,6 +3673,12 @@ def _resolve_csharp_member_calls(
             "source_file": src_file,
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # `Type.M()` names the type explicitly -> qualified-name; `this.M()`,
+            # `base.M()` and a receiver typed via the field/param table are
+            # instance dispatch.
+            "resolved_by": (RESOLVED_BY_INSTANCE_METHOD
+                            if receiver in ("this", "base") or not type_qualified
+                            else RESOLVED_BY_QUALIFIED_NAME),
         })
 
 
@@ -3817,6 +3848,12 @@ def _resolve_java_member_calls(
                 "source_file": raw_call.get("source_file", ""),
                 "source_location": raw_call.get("source_location"),
                 "weight": 1.0,
+                # `Type.method()` names the type explicitly -> qualified-name;
+                # `this.method()` and a receiver typed via the method-scoped
+                # field/param/local table are instance dispatch.
+                "resolved_by": (RESOLVED_BY_INSTANCE_METHOD
+                                if receiver == "this" or not exact
+                                else RESOLVED_BY_QUALIFIED_NAME),
             })
 
 
@@ -4008,6 +4045,12 @@ def _resolve_objc_member_calls(
             "source_file": src_file,
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # A capitalized receiver names the type explicitly in source ->
+            # qualified-name; `self`/`super`/`self.field`/local-typed receivers
+            # are instance dispatch.
+            "resolved_by": (RESOLVED_BY_QUALIFIED_NAME
+                            if type_qualified and receiver[:1].isupper()
+                            else RESOLVED_BY_INSTANCE_METHOD),
         })
 
 
@@ -4149,6 +4192,9 @@ def _resolve_csharp_qualified_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # Fully-qualified `Pkg.Type.method()` — resolved through the static
+            # namespace prefix written in source.
+            "resolved_by": RESOLVED_BY_QUALIFIED_NAME,
         })
 
 
@@ -4260,6 +4306,9 @@ def _resolve_kotlin_qualified_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # Fully-qualified `Pkg.fn()` / `Pkg.Type.method()` — resolved through
+            # the static FQN prefix written in source.
+            "resolved_by": RESOLVED_BY_QUALIFIED_NAME,
         })
 
 
@@ -6883,6 +6932,34 @@ def extract(
     # of these files with no import evidence is gated below (#1659).
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
     _go_module_cache: dict[Path, str | None] = {}
+
+    # Task 04: structured failure references. Raw calls this cross-file pass
+    # cannot bind (no definition anywhere, only wrong-family candidates, an
+    # external Go package, an ambiguous name with no unique pick, or a JS/TS
+    # call with no import evidence) are no longer silently dropped — each
+    # becomes ``{from_node, callee_name, line, file_path}``, the AST-native
+    # replacement for codegraph's unresolved_refs (knowledge gaps). Only raw
+    # calls this pass OWNS are recorded: member calls are the member-call
+    # resolvers' domain, bash calls the bash resolver's, mixins are not calls,
+    # and builtins are never gaps. Additive — no resolution behavior or emitted
+    # edge set changes.
+    failed_refs: list[dict] = []
+
+    def _record_failed_ref(rc: dict) -> None:
+        loc = rc.get("source_location") or ""
+        line = 0
+        if isinstance(loc, str) and loc.startswith("L"):
+            try:
+                line = int(loc[1:])
+            except ValueError:
+                line = 0
+        failed_refs.append({
+            "from_node": rc.get("caller_nid", ""),
+            "callee_name": rc.get("callee", ""),
+            "line": line,
+            "file_path": rc.get("source_file", ""),
+        })
+
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -6922,6 +6999,9 @@ def extract(
         if not candidates and _lang_is_case_insensitive(rc.get("source_file")):
             candidates = global_label_to_nids_ci.get(callee.lower(), [])
         if not candidates:
+            # No symbol anywhere in the corpus carries this callee name — an
+            # external/framework/library call with no in-corpus definition.
+            _record_failed_ref(rc)
             continue
         # Cross-language guard: never bind a call to a definition in a different
         # language family. Name-only matching was resolving a TSX callback passed
@@ -6939,6 +7019,9 @@ def extract(
                 or candidate_family == caller_family
             ]
             if not candidates:
+                # Only same-name definitions in a different language family —
+                # never bind a call across families, and report it unresolved.
+                _record_failed_ref(rc)
                 continue
         # Imported Go selectors carry exact package evidence. External package
         # calls yield no internal candidate instead of binding by bare name.
@@ -6952,6 +7035,9 @@ def extract(
                 ) == import_path
             ]
             if not candidates:
+                # An external package call (the exact import path matches no
+                # in-corpus module) — report it unresolved.
+                _record_failed_ref(rc)
                 continue
             go_exact_import = True
         caller = rc["caller_nid"]
@@ -7014,6 +7100,10 @@ def extract(
                         rc.get("source_file", ""),
                     )
                     if tgt is None:
+                        # Ambiguous common name (2+ definitions, no import
+                        # evidence, tie-breakers yield no unique pick) — the
+                        # #543/#1219 guard holds and the call stays unresolved.
+                        _record_failed_ref(rc)
                         continue
                     has_import_evidence = False
         if rc.get("indirect"):
@@ -7042,6 +7132,8 @@ def extract(
                     "source_file": rc.get("source_file", ""),
                     "source_location": rc.get("source_location"),
                     "weight": 1.0,
+                    "resolved_by": (RESOLVED_BY_QUALIFIED_NAME if has_import_evidence
+                                    else RESOLVED_BY_FUZZY),
                 })
             continue
         # #1659: a JS/TS DIRECT call with no import evidence is almost always an
@@ -7056,6 +7148,9 @@ def extract(
         # direct calls: the indirect_call path above is already conservative
         # (INFERRED, callable-target-gated) and independent of import evidence.
         if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
+            # #1659 gate: no import evidence in a JS/TS module means the call is
+            # almost certainly an unrelated same-named export — left unresolved.
+            _record_failed_ref(rc)
             continue
         if tgt != caller and (caller, tgt) not in existing_pairs:
             existing_pairs.add((caller, tgt))
@@ -7080,6 +7175,10 @@ def extract(
                 "source_file": rc.get("source_file", ""),
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
+                # EXTRACTED = import evidence (static reference) -> qualified-name;
+                # INFERRED = bare name matching with tie-breakers -> fuzzy.
+                "resolved_by": (RESOLVED_BY_QUALIFIED_NAME if has_import_evidence
+                                else RESOLVED_BY_FUZZY),
             })
 
     # Cross-file, language-specific member-call resolution. Runs after the shared
@@ -7299,6 +7398,11 @@ def extract(
         # manifest does not freeze them as processed (#2543). Callers that
         # only read nodes/edges ignore this key.
         "failed_sources": _failed_sources,
+        # Task 04: structured failure references from the shared cross-file
+        # call pass — {from_node, callee_name, line, file_path} per call that
+        # resolved to no edge. The AST-native knowledge-gap signal (replaces
+        # codegraph's unresolved_refs). Always a list; empty when nothing failed.
+        "failed_refs": failed_refs,
     }
 
 

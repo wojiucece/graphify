@@ -126,4 +126,7 @@ def resolve_pascal_inherited_calls(
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
+            # Inherited-method dispatch: a manual descendant calling a method it
+            # inherits from an ancestor class -> instance-method (spec resolved_by).
+            "resolved_by": "instance-method",
         })
