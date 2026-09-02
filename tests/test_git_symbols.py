@@ -95,6 +95,54 @@ def test_serve_registers_changed_symbols():
     meta2 = json.loads(out_absent.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
     assert meta2["verdict"] == "absent"
 
+def test_clean_repo_headers_equal_baseline(git_proj):
+    """Imp-1：基线==HEAD 且工作区干净（rebuild 刚完成后最常见调用）-> basis=git_head 空
+    文件集，正文 No changed files，不得谎报 "baseline unavailable"（基线明明锚定成功）。
+    对照：basis=graph_diff 空集仍报 unavailable（基线确实未锚定）."""
+    from graphify.serve import _format_changed_symbols
+    proj, _head = git_proj
+    cur = subprocess.run(["git", "rev-parse", "HEAD"], cwd=proj, capture_output=True,
+                         text=True).stdout.strip()
+    r = changed_symbols(proj, from_head=cur)   # HEAD==基线 -> git diff 空 + 工作区干净
+    assert r["basis"] == "git_head" and r["files"] == []
+    out = _format_changed_symbols(r, cur)
+    assert "No changed files" in out and "unavailable" not in out
+    r2 = {"files": [], "symbol_ids": [], "symbols": [], "basis": "graph_diff",
+          "git_available": False}
+    out2 = _format_changed_symbols(r2, None)
+    assert "unavailable" in out2
+
+def test_query_symbols_batches_large_file_set(git_proj, capsys):
+    """Minor-2：501 个文件 -> 2 批 IN 查询全部命中（防 SQLite 变量上限临界静默部分失败）
+    + 超过一批时 stderr 告警（防静默）."""
+    import sqlite3
+    from git_symbols import _query_symbols
+    proj, _head = git_proj
+    db = proj / ".codegraph" / "codegraph.db"; db.parent.mkdir()
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, "
+              "qualified_name TEXT, file_path TEXT)")
+    for i in range(501):
+        c.execute("INSERT INTO nodes VALUES(?, 'function', ?, ?, ?)",
+                  (f"id:{i}", f"f{i}", f"f{i}.f{i}", f"f{i:03d}.py"))
+    c.commit(); c.close()
+    files = [f"f{i:03d}.py" for i in range(501)]
+    syms = _query_symbols(proj, files)
+    assert len(syms) == 501
+    assert {s["id"] for s in syms} == {f"id:{i}" for i in range(501)}
+    err = capsys.readouterr().err
+    assert "批 IN 查询" in err and "2 批" in err   # 超过一批时 stderr 告警（防静默）
+
+def test_read_prev_git_head_non_dict(tmp_path):
+    """Minor-3：状态文件合法 JSON 但非 dict（如 []）-> 返回 None 不抛——AttributeError
+    防护（调用点在 rebuild() 的 try/finally 外，抛了会遗留 stale 锁）."""
+    import rebuild_entry
+    (tmp_path / "graphify-out").mkdir()
+    rebuild_entry._state_path(tmp_path).write_text("[]", encoding="utf-8")
+    assert rebuild_entry._read_prev_git_head(tmp_path) is None
+    rebuild_entry._state_path(tmp_path).write_text('"str"', encoding="utf-8")
+    assert rebuild_entry._read_prev_git_head(tmp_path) is None
+
 # --- rebuild_entry git_head 记账（Task 10 Step 4）---
 def _git_repo(tmp_path):
     """单 commit 的 tmp git 仓库（rebuild_entry git_head 记账测试用）."""

@@ -137,3 +137,19 @@ def test_parse_refresh_filters_empty_segments():
     assert rebuild_entry._parse_refresh("a.md,") == [Path("a.md")]
     assert rebuild_entry._parse_refresh("a.md,,b.md") == [Path("a.md"), Path("b.md")]
     assert rebuild_entry._parse_refresh(None) is None
+
+
+def test_log_changed_summary_orphan_head_silent(tmp_path, capsys):
+    """M2（用户补充审核）：孤儿 prev_head（传入但 git diff 失败）-> 静默返回——
+    stderr 无"变更摘要"且不抛异常（变更摘要是补充信息，孤儿 hash 不阻塞 rebuild）."""
+    import subprocess
+    import rebuild_entry
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    rebuild_entry._log_changed_summary(tmp_path, "0" * 40)   # 假孤儿 head（不存在）
+    err = capsys.readouterr().err
+    assert "变更摘要" not in err

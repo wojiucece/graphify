@@ -142,9 +142,13 @@ def _git_head(root: Path) -> str | None:
 
 def _read_prev_git_head(root: Path) -> str | None:
     """C3：读上一轮状态文件 git_head（rebuild 覆盖前缓存，变更摘要锚点）.
-    git_head 可缺省（G3）——文件缺失/损坏/非 str -> None（首次重建无锚点，摘要跳过）."""
+    git_head 可缺省（G3）——文件缺失/损坏/非 str/非 dict -> None（首次重建无锚点，摘要
+    跳过）。Minor-3：合法 JSON 但非 dict（如 []）必须 isinstance(d, dict) 防护——调用点在
+    rebuild() 的 try/finally 外，AttributeError 会冒泡且锁未清（stale 锁）；与 serve.py
+    侧已捕获 AttributeError 对称。"""
     try:
-        gh = json.loads(_state_path(root).read_text(encoding="utf-8")).get("git_head")
+        d = json.loads(_state_path(root).read_text(encoding="utf-8"))
+        gh = d.get("git_head") if isinstance(d, dict) else None
     except (OSError, ValueError, TypeError):
         return None
     return gh if isinstance(gh, str) and gh else None

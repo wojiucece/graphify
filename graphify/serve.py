@@ -2182,7 +2182,13 @@ def _format_changed_symbols(r: dict, from_head: str | None = None) -> str:
     anchor = f" since {from_head[:8]}" if from_head else ""
     lines = [f"Changed symbols{anchor} (basis={basis}, git_available={git_avail}):"]
     if not files:
-        lines.append("  (no change information — git baseline unavailable)")
+        # Imp-1：按 basis 分支——basis=git_head 空文件集 = 基线锚定成功且无变更（rebuild
+        # 刚完成后最常见调用），谎报 "baseline unavailable" 是假信息；只有 basis=graph_diff
+        # 才是真的未锚定。empty_graph 是 N1 scanned=0 的机械副产物，正文改了信号就对了。
+        if basis == "git_head":
+            lines.append("  No changed files since the recorded baseline.")
+        else:
+            lines.append("  (no change information — git baseline unavailable)")
         return "\n".join(lines)
     lines.append(f"  {len(files)} file(s) changed, {len(symbols)} symbol(s) affected")
     for f in files:
