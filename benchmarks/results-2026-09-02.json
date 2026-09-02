@@ -1,7 +1,7 @@
 {
   "benchmark": "efficiency_benchmark",
   "date": "2026-09-02",
-  "pinned_commit": "8f8159ac55c1dd3f74f4bb4fd2e299c347a83eca",
+  "pinned_commit": "b2a11dd792861f94c39054085bb660b74bd6af25",
   "root": "D:\\code\\graphify_fork",
   "root_source": "env GRAPHIFY_GOLDEN_ROOT",
   "token_count": "tiktoken",
@@ -168,10 +168,10 @@
       "grep_read": {
         "needle": "rebuild",
         "grep_hit_files": 88,
-        "grep_tokens": 28040,
+        "grep_tokens": 28121,
         "read_files": 12,
         "read_tokens": 27121,
-        "total_tokens": 55161,
+        "total_tokens": 55242,
         "hit5": 0.0,
         "rank": 12
       }
@@ -195,10 +195,10 @@
       "grep_read": {
         "needle": "rebuild_entry",
         "grep_hit_files": 24,
-        "grep_tokens": 3372,
+        "grep_tokens": 3417,
         "read_files": 2,
         "read_tokens": 4972,
-        "total_tokens": 8344,
+        "total_tokens": 8389,
         "hit5": 1.0,
         "rank": 2
       }
@@ -336,7 +336,7 @@
   "summary": {
     "tasks": 12,
     "merged_total_tokens": 28142,
-    "grep_read_total_tokens": 203039,
+    "grep_read_total_tokens": 203165,
     "merged_mean_hit5": 1.0,
     "grep_read_mean_hit5": 0.833,
     "merged_pct_of_grep_read": 13.9,
