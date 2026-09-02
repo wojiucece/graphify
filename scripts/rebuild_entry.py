@@ -1,9 +1,9 @@
-"""单一重建入口：codegraph sync -> graphify 分析重建（指纹收敛循环）。
+"""单一重建入口：codegraph sync -> graphify 分析重建（指纹复核：变化不再重跑）。
 
 三个触发面（watch.py 代码事件 / SessionEnd hook / PreCompact hook）都改指本入口。
 跨进程互斥用 mkdir 原子锁；完成信号用子进程退出码（codegraph 无对外 sync 事件，F1/F5）。"""
 from __future__ import annotations
-import argparse, os, sqlite3, subprocess, sys, tempfile, time
+import argparse, json, os, sqlite3, subprocess, sys, tempfile, time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +91,107 @@ def _acquire_lock(root: Path) -> bool:
         return False
 
 
+def _state_path(root: Path) -> Path:
+    """A1 路径联动总条款：状态文件随 active project root 推导."""
+    return root / "graphify-out" / ".rebuild-state.json"
+
+
+def _write_state(root: Path, lock: Path, payload: dict) -> None:
+    """写权单一化：仅锁 owner（pid 即自身）可写；serve 侧只读."""
+    try:
+        owner = int((lock / "pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if owner != os.getpid():
+        return
+    try:
+        _state_path(root).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        _log(f"状态文件写入失败（不阻塞 rebuild）: {e}")
+
+
+def _finish_state(root: Path, lock: Path, started: float, error: bool = False) -> None:
+    """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）.
+    C3/G3：git 可用时载荷加 git_head（rev-parse HEAD，基线锚点）——git 不可用/失败时
+    省略字段（schema 只增不改，可缺省；读者侧缺失语义 = "基线未锚定"）。成功/错误路径
+    都记（git_head 是仓库事实，与 build 成败无关；父注释"成功路径"取此义）。"""
+    payload = {"schema": 1, "phase": "error" if error else "complete",
+               "started": started, "finished": time.time(),
+               "last_duration": round(time.time() - started, 1),
+               "project": str(root)}
+    gh = _git_head(root)
+    if gh is not None:
+        payload["git_head"] = gh
+    _write_state(root, lock, payload)
+
+
+def _git_head(root: Path) -> str | None:
+    """C3：rev-parse HEAD 全 hash；git 不在 PATH/非 git 仓库/失败 -> None（省略字段语义）.
+    R5-1：subprocess 直调（无 shell 管道）；CREATE_NO_WINDOW 防 Windows 弹窗（F5 同款）."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _read_prev_git_head(root: Path) -> str | None:
+    """C3：读上一轮状态文件 git_head（rebuild 覆盖前缓存，变更摘要锚点）.
+    git_head 可缺省（G3）——文件缺失/损坏/非 str/非 dict -> None（首次重建无锚点，摘要
+    跳过）。Minor-3：合法 JSON 但非 dict（如 []）必须 isinstance(d, dict) 防护——调用点在
+    rebuild() 的 try/finally 外，AttributeError 会冒泡且锁未清（stale 锁）；与 serve.py
+    侧已捕获 AttributeError 对称。"""
+    try:
+        d = json.loads(_state_path(root).read_text(encoding="utf-8"))
+        gh = d.get("git_head") if isinstance(d, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+    return gh if isinstance(gh, str) and gh else None
+
+
+def _log_changed_summary(root: Path, prev_head: str | None) -> None:
+    """C3：rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD）——
+    进当时活跃会话上下文。prev_head 不可得（首次）或孤儿 hash（amend/rebase）-> 静默
+    （不阻塞 rebuild，stderr 一行日志权限内诚实降级）。"""
+    if not prev_head:
+        return
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run(["git", "diff", "--name-only", f"{prev_head}..HEAD"],
+                           cwd=str(root), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if r.returncode != 0:
+        return   # 孤儿 prev_head -> 无摘要（不告警不阻塞，等下次事件流重建）
+    names = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    if not names:
+        return
+    shown = ", ".join(names[:10])
+    if len(names) > 10:
+        shown += f" … +{len(names) - 10} more"
+    _log(f"变更摘要（{len(names)} 文件，自 {prev_head[:8]}）：{shown}")
+
+
+def _read_prev_duration(root: Path) -> float:
+    """N2：读上一轮 complete 的 last_duration——rebuilding 载荷覆盖整个文件，
+    不继承则时效逃生 max(2*last_duration, 1800) 中的 2x 项恒为 0（设计静默失效）."""
+    try:
+        d = json.loads(_state_path(root).read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            # 终审 Imp-1 连带：非 dict（如 []）直接 .get 会 AttributeError——一次重建
+            # 崩溃后自愈；与 serve._derive_freshness 同防护（兄弟读取器三处统一）。
+            return 0.0
+        return float(d.get("last_duration", 0))
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
 def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | None = None,
             semantic_seed: Path | None = None, semantic_refresh: list[Path] | None = None,
             skip_sync: bool = False) -> Path:
@@ -113,26 +214,59 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
         _log("锁被占用，另一重建正在进行 -> exit 3")
         sys.exit(EXIT_LOCK)
     lock = _lock_path(root)
+    prev_git_head = _read_prev_git_head(root)   # C3：覆盖前缓存上一轮 git_head（变更摘要锚点）
+    t0 = time.time()
+    exc_happened = False
     try:
         # db 存在性检查在锁之后（测试 test_lock_held_exits_3 预建锁 -> 应 exit 3 而非 FileNotFoundError）
         if not db.exists():
             raise FileNotFoundError(f"{db} 不存在--先跑 codegraph init")
-        for _ in range(2):                                    # 指纹收敛，最多两轮
+        for _ in range(2):                                    # 指纹复核，最多两轮
             if not skip_sync:
                 code = _sync_with_retry(root)                 # 非零短退避重试后仍失败 -> 降级退出
                 if code != 0:
                     _log(f"sync 重试后仍失败（exit {code}），放弃本轮，交下个触发面兜底")
                     sys.exit(EXIT_SYNC_FAIL)
             f0 = db_fingerprint(db)
+            # A1a: rebuilding 标记（幂等）。db_fingerprint 复用 f0——不额外调 db_fingerprint
+            # （少一次只读查询）；f0 即本轮收敛基线，语义与重查一致。N2: 继承上轮
+            # last_duration（否则时效逃生 2x 项恒 0，设计静默失效）。写权在锁 owner；
+            # serve 只读无写竞态。
+            _write_state(root, lock, {
+                "schema": 1, "phase": "rebuilding", "started": t0,
+                "project": str(root), "db_fingerprint": list(f0),
+                "last_duration": _read_prev_duration(root)})
             from run_analysis import run                        # 懒导入（scripts/ 在 sys.path）
             run(db, output_dir=out, root=str(root),
                 semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
+            # B4: cache GC 挂载（成功路径末尾、finally 前，锁内）。manifest 锚定
+            # mark-and-sweep + 频率门控摊销扫描；GC 失败绝不影响 rebuild 结果。
+            # root 显式传项目根（live 重算的 file_hash path-salt 锚点；--out-dir 自定义
+            # 时 cache_root.parent 不是项目根）。
+            try:
+                from cache_gc import gc_cache
+                gc_cache(out, out / "manifest.json", root=root)
+            except Exception as e:   # GC 失败绝不影响 rebuild 结果
+                _log(f"cache gc 异常（忽略）: {e}")
+            # C3: rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD，
+            # 进当时活跃会话上下文）。prev_head 不可得/孤儿 hash -> 内部静默。
+            _log_changed_summary(root, prev_git_head)
+            # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
+            # watch/hook 事件流兜底（变化本身说明后续触发面已排队/即将触发，重跑只
+            # 增加锁内阻塞时长）。循环结构保留（range(2) 仅走一轮），便于回滚对比。
             if db_fingerprint(db) == f0:
                 return out
-            _log("重建期间 DB 变化（daemon 并发写入），再排一轮")
+            _log("重建期间 DB 变化（daemon 并发写入），已记录日志；不再重跑，交下个触发面兜底")
+            return out
         _log("两轮不收敛，交下个触发面兜底")                    # watch/hook 事件流保证最终触发
         return out
+    except BaseException:
+        exc_happened = True
+        raise
     finally:
+        # A1a: 状态收尾必须在锁清理之前（_write_state 读锁 pid 判断 owner；锁没了则拒写）。
+        # 写序不变量 E1：run() 落盘 graph.json 先于此处 complete 标记。
+        _finish_state(root, lock, t0, error=exc_happened)
         # 误接管防御：若本进程超 _LOCK_STALE_S 被另进程接管，锁目录已含对方的 pid 文件，
         # 非空目录 rmdir 抛 OSError，会掩盖本进程的正常返回或原始异常。包 except 吞掉。
         # 修正（Task 13 E2E 发现）：brief 原文仅 rmdir 非空目录 -> 恒 OSError 被吞 ->

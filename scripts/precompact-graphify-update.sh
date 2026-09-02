@@ -29,6 +29,10 @@ if mkdir "$LOCK_DIR" 2>/dev/null; then
         SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
         PYTHON="${GRAPHIFY_PYTHON:-python}"
         nohup "$PYTHON" "$SCRIPT_DIR/rebuild_entry.py" --project "$cwd" > /tmp/graphify-rebuild.log 2>&1 &
+        # A4 (v1.13): 零等待——直接读当前磁盘 graph.json 实时算快照落盘（主机制）；
+        # SessionStart(matcher:compact) hook 负责注入，本脚本只落盘不注入。
+        # 不等待 rebuild（timeout 实配 30s，同步等待分钟级 rebuild 必超时强杀致锁残留，见 E 裁决注释）
+        PYTHONUTF8=1 python "$SCRIPT_DIR/session_snapshot.py" "$cwd" > /tmp/graphify-snapshot.log 2>&1
     else
         graphify update . > /tmp/graphify-precompact-update.log 2>&1
     fi

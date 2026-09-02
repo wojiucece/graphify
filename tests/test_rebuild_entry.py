@@ -19,22 +19,23 @@ def test_sync_runs_before_analysis(monkeypatch, tmp_path):
     assert calls.index("sync") < calls.index("run")
 
 
-def test_rebuild_requeued_on_db_changes_during_rebuild(monkeypatch, tmp_path):
-    """db_fingerprint 首查 f0、二查返回不同值 -> run 被调两次（收敛重排）."""
+def test_rebuild_change_logs_without_rerun(monkeypatch, tmp_path, capsys):
+    """A3（Task 6 裁决）：重建期间 DB 变化 -> 记录日志、不再重跑（watch/hook 事件流兜底）.
+    db_fingerprint 首查 f0、重建后二查返回不同值 -> run 只调一次 + stderr 含变化日志."""
     import rebuild_entry
     import sqlite3
     db = tmp_path / ".codegraph" / "codegraph.db"; db.parent.mkdir(parents=True)
     c = sqlite3.connect(db); c.execute("CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,applied_at INTEGER,description TEXT)"); c.execute("CREATE TABLE files(path TEXT PRIMARY KEY,content_hash TEXT,language TEXT,size INTEGER,modified_at INTEGER,indexed_at INTEGER,node_count INTEGER,errors TEXT,generated INTEGER)"); c.execute("INSERT INTO schema_versions VALUES(9,0,'x')"); c.commit(); c.close()
     monkeypatch.setattr(rebuild_entry, "run_codegraph_sync", lambda r: 0)
-    # 循环每轮调 db_fingerprint 两次（f0 快照 + 重建后比对），两轮共 4 次：
-    # f0=(1,0) -> 比对(2,0)变 -> 二轮 f0=(2,0) -> 比对(2,0)收敛。
-    # （brief 原文只给 3 值，第 4 次 next() 会 StopIteration——修正为 4 值。）
-    fingerprints = iter([(1, 0), (2, 0), (2, 0), (2, 0)])
+    # A3 后循环单轮即返回：f0 快照 + 重建后比对各一次，共 2 次（无第二轮）。
+    fingerprints = iter([(1, 0), (2, 0)])
     monkeypatch.setattr(rebuild_entry, "db_fingerprint", lambda d: next(fingerprints))
     run_calls = []
     monkeypatch.setattr("run_analysis.run", lambda *a, **k: run_calls.append(1) or Path(tmp_path))
     rebuild_entry.rebuild(tmp_path, db_path=db, out_dir=tmp_path/"out")
-    assert len(run_calls) == 2
+    assert len(run_calls) == 1   # 不再重跑
+    err = capsys.readouterr().err
+    assert "DB 变化" in err and "不再重跑" in err
 
 
 def test_sync_failure_retries_then_degrades(monkeypatch, tmp_path):
@@ -128,6 +129,16 @@ def test_stale_lock_taken_over(tmp_path):
         rebuild_entry.rebuild(tmp_path)
 
 
+def test_read_prev_duration_non_dict_returns_zero(tmp_path):
+    """终审 Imp-1 连带：状态文件非 dict（[]）→ _read_prev_duration 返回 0.0 不崩.
+    修复前 .get 在 list 上 AttributeError，一次重建崩溃后自愈；与 serve
+    _derive_freshness 三处兄弟读取器统一防护."""
+    import rebuild_entry
+    state = tmp_path / "graphify-out" / ".rebuild-state.json"
+    state.parent.mkdir()
+    state.write_text("[]", encoding="utf-8")
+    assert rebuild_entry._read_prev_duration(tmp_path) == 0.0
+
 def test_parse_refresh_filters_empty_segments():
     """M1（用户审查）：CLI refresh 解析过滤空段。"a.md," 此前产生
     Path('') -> Path('.')，refresh 指向整个 CWD；与 run_analysis.py CLI 已有的
@@ -136,3 +147,19 @@ def test_parse_refresh_filters_empty_segments():
     assert rebuild_entry._parse_refresh("a.md,") == [Path("a.md")]
     assert rebuild_entry._parse_refresh("a.md,,b.md") == [Path("a.md"), Path("b.md")]
     assert rebuild_entry._parse_refresh(None) is None
+
+
+def test_log_changed_summary_orphan_head_silent(tmp_path, capsys):
+    """M2（用户补充审核）：孤儿 prev_head（传入但 git diff 失败）-> 静默返回——
+    stderr 无"变更摘要"且不抛异常（变更摘要是补充信息，孤儿 hash 不阻塞 rebuild）."""
+    import subprocess
+    import rebuild_entry
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    rebuild_entry._log_changed_summary(tmp_path, "0" * 40)   # 假孤儿 head（不存在）
+    err = capsys.readouterr().err
+    assert "变更摘要" not in err

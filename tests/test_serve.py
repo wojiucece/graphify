@@ -1735,3 +1735,170 @@ def test_resolve_single_node_shared_by_get_node_and_get_neighbors():
     nid, err = _resolve_single_node(G, "nonexistent")
     assert nid is None
     assert "No node matching" in err
+
+
+# === CUSTOM: C1 find_dead_code（Task 12）=======================================
+
+
+def test_find_dead_code_registered_in_search_tools():
+    """C1 登记：find_dead_code 必须进 _SEARCH_TOOLS——否则响应不合并 _meta 信封、
+    verdict_override（low_confidence）失效。"""
+    from graphify.serve import _SEARCH_TOOLS
+    assert "find_dead_code" in _SEARCH_TOOLS
+
+
+def test_format_dead_code_normal_ok_path():
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    DG.add_node("a", kind="function", label="foo()", source_file="x.py")
+    DG.add_node("b", kind="function", label="bar()", source_file="y.py")
+    r = {"unreachable": ["b"], "entry_mode": "application", "scanned": 2,
+         "unreachable_rate": 0.5, "gate_failed": False, "degraded_to": None}
+    text = _format_dead_code(DG, r)
+    assert "advisory" in text
+    assert "bar()" in text and "foo()" not in text
+    assert "degraded" not in text
+
+
+def test_format_dead_code_gate_failed_degraded_wording():
+    """>50% 闸门降级措辞：orphan-symbol hints + 显式声明非确定性（合法降级交付，
+    不是失败——报告语义不声称判定死代码）。"""
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    for i in range(3):
+        DG.add_node(f"n{i}", kind="function", label=f"s{i}()", source_file="z.py")
+    r = {"unreachable": ["n0", "n1", "n2"], "entry_mode": "application", "scanned": 3,
+         "unreachable_rate": 1.0, "gate_failed": True, "degraded_to": "orphan_hint"}
+    text = _format_dead_code(DG, r)
+    assert "degraded to orphan-symbol hints" in text
+    assert "exceeds the 50% gate" in text
+    assert "NOT a deterministic" in text
+
+
+def test_format_dead_code_no_symbol_nodes_honest():
+    """退化形态：图无代码符号节点（缺 kind 属性，如 graphify 原生 AST 图）——诚实声明
+    "no code symbol nodes"，不谎报 0/0 unreachable。"""
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    DG.add_node("n1", label="x")   # 无 kind 属性
+    r = {"unreachable": [], "entry_mode": "application", "scanned": 0,
+         "unreachable_rate": 0.0, "gate_failed": False, "degraded_to": None}
+    text = _format_dead_code(DG, r)
+    assert "no code symbol nodes" in text
+    assert "0 of 0" not in text
+
+
+def test_find_dead_code_envelope_low_confidence():
+    """N1+C 信封：find_dead_code 闭包 4 元组（text, found=True, scanned=42, override=
+    low_confidence）过出口 -> _meta.verdict=low_confidence（verdict_override 直通，C 信封
+    纪律；override 路径下 meta 为空 {}——与 B2/B3 override 工具同契约，scanned 值仍在
+    闭包返回元组，不经出口 surface）。"""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("find_dead_code", ("Dead-code scan ...", True, 42, "low_confidence"),
+                          freshness="fresh")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
+
+
+# === CUSTOM: C2 get_untested_symbols（Task 13）=================================
+
+
+def test_get_untested_symbols_registered_in_search_tools():
+    """C2 登记：get_untested_symbols 必须进 _SEARCH_TOOLS——否则响应不合并 _meta 信封、
+    verdict_override（low_confidence）失效。"""
+    from graphify.serve import _SEARCH_TOOLS
+    assert "get_untested_symbols" in _SEARCH_TOOLS
+
+
+def test_format_untested_normal_ok_path():
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("test_x", kind="file", source_file="tests/test_x.py")
+    DG.add_node("fn", kind="function", label="fn()", source_file="x.py")
+    DG.add_node("gy", kind="function", label="gy()", source_file="y.py")
+    DG.add_edge("test_x", "fn", relation="imports")
+    r = {"untested": ["gy"], "test_files": ["test_x"], "scanned": 2,
+         "untested_rate": 0.25, "gate_failed": False, "degraded_to": None}
+    text = _format_untested(DG, r)
+    assert "advisory" in text
+    assert "gy()" in text and "fn()" not in text
+    assert "degraded" not in text
+
+
+def test_format_untested_gate_failed_degraded_wording():
+    """>30% 误报闸门降级措辞：suspected-untested hints + 显式声明非确定性（合法降级交付，
+    不是失败——报告语义不声称确认的覆盖结论）。"""
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("n0", kind="function", label="s0()", source_file="z.py")
+    r = {"untested": ["n0"], "test_files": [], "scanned": 10,
+         "untested_rate": 0.9, "gate_failed": True, "degraded_to": "suspected_untested"}
+    text = _format_untested(DG, r)
+    assert "suspected-untested hints" in text
+    assert "exceeds the 30% gate" in text
+    assert "NOT a confirmed" in text
+
+
+def test_format_untested_no_symbol_nodes_honest():
+    """退化形态：图无代码符号节点（缺 kind 属性，如 graphify 原生 AST 图）——诚实声明
+    "no code symbol nodes"，不谎报 0/0 untested。"""
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("n1", label="x")   # 无 kind 属性
+    r = {"untested": [], "test_files": [], "scanned": 0, "untested_rate": 0.0,
+         "gate_failed": False, "degraded_to": None}
+    text = _format_untested(DG, r)
+    assert "no code symbol nodes" in text
+
+
+def test_get_untested_envelope_low_confidence():
+    """N1+C 信封：get_untested_symbols 闭包 4 元组（text, found=True, scanned=42,
+    override=low_confidence）过出口 -> _meta.verdict=low_confidence（C 信封纪律：空结果
+    ≠absent，"全部符号已被测试覆盖"是有效回答）。"""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("get_untested_symbols", ("Untested-symbol scan ...", True, 42,
+                                                   "low_confidence"),
+                          freshness="fresh")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
+
+
+def test_call_tool_exception_path_redacts_fake_key(tmp_path, monkeypatch):
+    """终审升格 2：call_tool 的 except Exception 错误路径同样过 _redact——异常消息含
+    假密钥（sk-...）→ 响应文本 [REDACTED:...]，密钥零泄漏（Q7 出口统一承诺缺口）。
+    触发：monkeypatch serve._load_graph 抛 RuntimeError 带假密钥——call_tool 的
+    _select_graph → _load_ctx → cache miss → _load_entry → _load_graph（已 patch）
+    raise，被 except Exception 捕获拼进错误文本。需要 mcp+starlette（HTTP 传输），
+    缺失时 importorskip 跳过（与 test_serve_http 同门）。"""
+    import json as _json
+    pytest.importorskip("mcp")
+    pytest.importorskip("starlette")
+    from starlette.testclient import TestClient as _TC
+    from graphify import serve as _serve_mod
+    fake = "sk-" + "aA0" * 11 + "x"   # openai L1 假密钥形态（同 test_redaction HITS）
+
+    def _boom(_path):
+        raise RuntimeError(f"graph load failed: {fake}")
+
+    monkeypatch.setattr(_serve_mod, "_load_graph", _boom)
+    gfile = tmp_path / "graph.json"
+    gfile.write_text(_json.dumps({"directed": True, "nodes": [], "links": []}),
+                     encoding="utf-8")
+    app = _serve_mod._build_http_app(str(gfile), json_response=True)
+    hdrs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                       "clientInfo": {"name": "test", "version": "0"}}}
+    with _TC(app, base_url="http://127.0.0.1") as client:
+        r = client.post("/mcp", headers=hdrs, json=init)
+        assert r.status_code == 200
+        h = {**hdrs, "mcp-session-id": r.headers.get("mcp-session-id")}
+        client.post("/mcp", headers=h, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = client.post("/mcp", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_node", "arguments": {"label": "x"}}})
+        text = resp.json()["result"]["content"][0]["text"]
+    assert fake not in text, "错误响应必须脱敏假密钥"
+    assert "[REDACTED:openai]" in text, f"应为 [REDACTED:openai]，got: {text[:120]!r}"

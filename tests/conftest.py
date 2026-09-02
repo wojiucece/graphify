@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -85,3 +86,35 @@ from pathlib import Path
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+
+# === CUSTOM: B1 金标门（M3）====================================================
+# 金标集（tests/fixtures/ranked_golden.json）是只读质量闸门，依赖真实 codegraph DB——
+# DB 缺失时整体跳过（'skipped (golden)' 进测试摘要，不静默消失）。默认根保留本机
+# D:/code/graphify_fork 可跑；GRAPHIFY_GOLDEN_ROOT 环境变量覆盖（CI/其他环境指向
+# 已重建 DB 的 fork）。`-m 'not golden'` 可整组排除金标闸门。
+_GOLDEN_DEFAULT_ROOT = r"D:/code/graphify_fork"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "golden: B1 只读金标集质量闸门（recall/no-degrade），依赖真实 codegraph DB；"
+        "DB 缺失时以 'skipped (golden)' 跳过，`-m 'not golden'` 可整组排除"
+        "（金标根默认 D:/code/graphify_fork，GRAPHIFY_GOLDEN_ROOT 覆盖）",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _golden_gate(request) -> None:
+    """金标门：带 golden marker 的测试在真实 DB 缺失时显式跳过。
+
+    原来在测试体内 `if not exists: pytest.skip` 硬编码 D:/code/graphify_fork——
+    质量闸门在其他环境静默消失且无 marker 可筛选。现在：marker 注册（pytest_configure
+    上面）+ env 覆盖 + 统一 gate，'skipped (golden)' 在测试摘要可见。
+    """
+    if request.node.get_closest_marker("golden"):
+        root = Path(os.environ.get("GRAPHIFY_GOLDEN_ROOT", _GOLDEN_DEFAULT_ROOT))
+        if not (root / ".codegraph" / "codegraph.db").exists():
+            pytest.skip(
+                f"skipped (golden): GRAPHIFY_GOLDEN_ROOT={root} 无 .codegraph/codegraph.db"
+            )
