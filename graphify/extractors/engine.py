@@ -3045,6 +3045,10 @@ def _extract_generic(
             merged.setdefault("scope_chain", list(scope_stack))
         # Symbol nodes carry an exact start `L<line>:C<col>`; the file node and
         # non-Python call sites pass no col and keep the legacy line-only form.
+        # `C` is the 1-based BYTE offset of the symbol start (tree-sitter
+        # start_point[1] + 1), NOT the character column — same byte coordinate
+        # system as end_byte, so a Chinese-containing line yields a larger C
+        # than the editor's character column (L14:C15 vs char col 11).
         # end_line/end_byte are symbol-only too (build has no whitelist, so any
         # of these pass straight through into graph.json).
         node = {

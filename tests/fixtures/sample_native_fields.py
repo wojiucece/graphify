@@ -25,3 +25,7 @@ class Empty:
 
 
 CONSTANT = 42
+
+
+class Cjk:
+    中文属性 = "值"; def after_cjk(self) -> str: return 中文属性

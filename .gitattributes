@@ -4,3 +4,7 @@
 worked/**/*.html linguist-vendored=true
 graphify-out/**/*.html linguist-vendored=true
 *.html linguist-detectable=false
+
+# Task 01 提取契约 fixture：固定 LF 行尾，保证 source_location C 列 / end_byte
+# 的字节偏移在 Windows（core.autocrlf=true）检出下不被 CRLF 化而偏移。
+tests/fixtures/*.py text eol=lf

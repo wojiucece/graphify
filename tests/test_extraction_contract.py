@@ -110,6 +110,24 @@ def test_symbol_nodes_carry_end_line_and_end_byte_integers():
         assert n["end_byte"] >= 0
 
 
+def test_source_location_column_is_byte_offset_not_character():
+    """C column is the 1-based BYTE offset of the symbol start (same byte
+    coordinate system as end_byte), NOT the editor's character column."""
+    result = _extract()
+    n = _by_label(result["nodes"], ".after_cjk()")[0]
+    lines = FIXTURE.read_text(encoding="utf-8").splitlines()
+    line_idx = next(i for i, l in enumerate(lines) if "def after_cjk" in l)
+    line = lines[line_idx]
+    # `def` sits after the multibyte 中文属性 = "值"; on the same line, so its
+    # byte offset (27) differs from the character offset (17).
+    byte_col = len(line.encode("utf-8").split(b"def after_cjk")[0]) + 1
+    char_col = len(line.split("def after_cjk")[0]) + 1
+    assert byte_col != char_col  # fixture must actually exercise the distinction
+    assert n["source_location"] == f"L{line_idx + 1}:C{byte_col}"
+    assert f":C{char_col}" not in n["source_location"]
+    assert n["qualified_name"] == "Cjk::after_cjk"
+
+
 def test_file_node_keeps_no_contract_fields():
     f = _by_label(_extract()["nodes"], FIXTURE.name)[0]
     for field in ("signature", "qualified_name", "end_line", "end_byte"):
