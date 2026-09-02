@@ -1563,7 +1563,8 @@ _REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
 _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
                            "god_nodes", "shortest_path", "graph_stats",
                            "get_ranked_context",  # CUSTOM: B1 融合检索登记
-                           "get_changed_symbols"})  # CUSTOM: C3 git 轴登记（Task 10）
+                           "get_changed_symbols",  # CUSTOM: C3 git 轴登记（Task 10）
+                           "get_hotspots"})  # CUSTOM: C4 热区（churn×度数代理）登记（Task 11）
 
 
 def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
@@ -2203,6 +2204,38 @@ def _format_changed_symbols(r: dict, from_head: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# === CUSTOM: C4 get_hotspots 正文装配（Phase 4 Task 11）========================
+
+
+def _format_hotspots(r: dict) -> str:
+    """C4 正文装配：top-N 热区（file + churn/degree/score 三轴）。**declared 纪律**：
+    头行声明 score = churn × 度数是代理值、明示非圈复杂度（graph 无每文件复杂度属性，
+    方案 §5-C4 实测条款）。空结果按缺失轴分支说真话（C3 Imp-1 同款纪律）：
+    非 git（churn 轴缺）/ 无提交史（churn 空）/ DB 缺失（度数轴缺）/ churn 文件无图边
+    （交叉积为 0）。"""
+    items = r.get("hotspots", [])
+    git_avail = r.get("git_available", False)
+    deg_avail = r.get("degree_available", False)
+    scanned = r.get("scanned", 0)
+    if not items:
+        if not git_avail:
+            return "Code hotspots: git unavailable — no churn axis, no hotspot information."
+        if scanned == 0:
+            return ("Code hotspots: no commit history (empty repo, or git log failed) "
+                    "— no churn signal.")
+        if not deg_avail:
+            return ("Code hotspots: codegraph DB unavailable — degree axis empty, "
+                    "churn alone cannot rank hotspots.")
+        return ("Code hotspots: no hotspots — churn files carry no graph edges "
+                "(score = churn × degree = 0).")
+    lines = ["Code hotspots (declared proxies: score = churn × degree, not cyclomatic "
+             "complexity — the graph carries no per-file complexity attribute):"]
+    for i, h in enumerate(items, 1):
+        lines.append(f"  {i}. {sanitize_label(h['file'])}  churn={h['churn']}  "
+                     f"degree={h['degree']}  score={h['score']}")
+    return "\n".join(lines)
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2426,6 +2459,28 @@ def _build_server(graph_path: str):
                     "Untracked new files are not included (git diff semantics)."
                 ),
                 inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                # CUSTOM: C4 热区（scripts/git_symbols.py，Task 11）。declared 代理：
+                # churn（git log 频次）× 度数（edges source 端 GROUP BY）都是代理值，
+                # 描述明示非圈复杂度（方案 §5-C4 实测条款）。
+                name="get_hotspots",
+                description=(
+                    "Rank files by development activity x graph connectivity (hotspot "
+                    "analysis): score = churn (number of commits touching the file, full "
+                    "history) x degree (graph edges grouped by the source-side file). "
+                    "Both are declared proxies — the graph carries no per-file complexity "
+                    "attribute, so this is NOT cyclomatic complexity. Returns top-N files "
+                    "with both a churn and a connectivity signal."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "top_n": {"type": "integer", "enum": [5, 10, 20, 50],
+                                  "default": 10,
+                                  "description": "Number of hotspot files to return"},
+                    },
+                },
             ),
             types.Tool(
                 name="list_prs",
@@ -2769,6 +2824,22 @@ def _build_server(graph_path: str):
         # （非 git / 基线未锚定）-> absent（"没有变更信息"≠ok，最诚实形态）。
         return _format_changed_symbols(r, from_head), bool(r["symbol_ids"]), len(r["files"])
 
+    def _tool_get_hotspots(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: C4 三元组
+        # C4 热区（scripts/git_symbols.py）。路径联动总条款：root 从当前 active graph
+        # 推导（与 _derive_freshness / B1/B2/B3/C3 同构）。
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from git_symbols import hotspots
+        root = Path(active_graph_path).parent.parent
+        top_n = int(arguments.get("top_n", 10))
+        r = hotspots(root, top_n=top_n)
+        # N1：found=hotspots 非空，scanned=参与排序的文件数（churn>0 文件数）。
+        # C 信封纪律：不走 verdict_override——有热区 -> ok；无信号（非 git/无提交史/
+        # DB 缺失/churn 文件无图边）-> absent（"没有热区信息"≠ok，最诚实形态）。
+        return _format_hotspots(r), bool(r["hotspots"]), int(r["scanned"])
+
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -2864,6 +2935,7 @@ def _build_server(graph_path: str):
         "shortest_path": _tool_shortest_path,
         "get_ranked_context": _tool_get_ranked_context,  # CUSTOM: B1
         "get_changed_symbols": _tool_get_changed_symbols,  # CUSTOM: C3
+        "get_hotspots": _tool_get_hotspots,  # CUSTOM: C4
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,
