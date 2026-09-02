@@ -1560,8 +1560,10 @@ _REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
 
 # 检索型工具清单（判据 = 响应内容反映图数据现状）；新工具（B1/B3/C 系）登记处——
 # 清单外工具裸 str 直通，新增检索型工具若拒绝登记则出口不予合并。
-# C 工具族空结果语义（M2，Task 13 前统一登记，防第三种发明）：
+# C 工具族空结果语义（M2，Task 12 前统一登记，防第三种发明；Task 13 补 C2 行——
+# C2 归 C1 派：空 = 有效结论）：
 #   C1 find_dead_code       空 = 有效结论（无死代码），found 恒 True + low_confidence
+#   C2 get_untested_symbols 空 = 有效结论（全部符号已被测试覆盖），found 恒 True + low_confidence
 #   C3 get_changed_symbols  空 = absent（无变更信息 ≠ ok）
 #   C4 get_hotspots         空 = absent（通常环境缺轴：非 git/无 DB）
 _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
@@ -1569,7 +1571,8 @@ _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_comm
                            "get_ranked_context",  # CUSTOM: B1 融合检索登记
                            "get_changed_symbols",  # CUSTOM: C3 git 轴登记（Task 10）
                            "get_hotspots",  # CUSTOM: C4 热区（churn×度数代理）登记（Task 11）
-                           "find_dead_code"})  # CUSTOM: C1 死代码（入口闭包+闸门）登记（Task 12）
+                           "find_dead_code",  # CUSTOM: C1 死代码（入口闭包+闸门）登记（Task 12）
+                           "get_untested_symbols"})  # CUSTOM: C2 未覆盖符号（测试子图可达）登记（Task 13）
 
 
 def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
@@ -2291,6 +2294,43 @@ def _format_dead_code(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
     return "\n".join(lines)
 
 
+# === CUSTOM: C2 get_untested_symbols 正文装配（Phase 4 Task 13）================
+
+
+def _format_untested(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
+    """C2 正文装配：未覆盖符号清单（advisory——图边是唯一覆盖证据，声明不声称确定性）。
+    gate_failed（未覆盖率 >30%，C2 误报闸门代理）时降级为"疑似未覆盖"措辞——覆盖率
+    证据稀疏，正文显式声明非确定性判定（legitimate degraded delivery，不是失败）。
+    label/kind/source_file 取自 _digraph_view 节点属性（R3-2 短名事实源）。"""
+    untested = r["untested"]
+    rate = r["untested_rate"]
+    scanned = int(r["scanned"])
+    n_tests = len(r["test_files"])
+    if scanned == 0:
+        # 退化形态：图中无代码符号节点（节点缺 kind 属性——非 codegraph-merged 图，
+        # 如 graphify 原生 AST 图）。诚实声明，不谎报 "0 of 0 untested"。
+        return ("Untested-symbol scan: no code symbol nodes in this graph (nodes lack kind "
+                "attributes — not a codegraph-merged graph). Advisory only.")
+    if r.get("gate_failed"):
+        head = (f"Untested-symbol scan degraded to suspected-untested hints (advisory): "
+                f"{len(untested)} of {scanned} symbols ({rate:.1%}) not reached from "
+                f"{n_tests} test files exceeds the 30% gate — coverage evidence is sparse, "
+                f"so this is a SUSPECTED list, NOT a confirmed coverage verdict.")
+    else:
+        head = (f"Untested-symbol scan (advisory — graph edges are the only coverage "
+                f"evidence): {len(untested)} of {scanned} symbols ({rate:.1%}) not reached "
+                f"from {n_tests} test files.")
+    lines = [head]
+    for nid in untested[:show]:
+        d = DG.nodes[nid]
+        lines.append(f"  + {sanitize_label(str(d.get('label') or nid))} "
+                     f"[{sanitize_label(str(d.get('kind') or ''))}] "
+                     f"({sanitize_label(str(d.get('source_file') or ''))})")
+    if len(untested) > show:
+        lines.append(f"  ... and {len(untested) - show} more")
+    return "\n".join(lines)
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2552,6 +2592,23 @@ def _build_server(graph_path: str):
                     "dynamic dispatch (reflection/import hooks), so this is a hint list, "
                     "not a deterministic verdict. Degrades to orphan-symbol hints when "
                     "the unreachable rate exceeds 50%."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                # CUSTOM: C2 未覆盖符号（scripts/structure_queries.py，Task 13）。检索型
+                # 工具（_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。Python
+                # 单约定 test_*.py 判定测试文件；go/ts 约定留配置项（patterns 参数）。
+                name="get_untested_symbols",
+                description=(
+                    "Find symbols in the knowledge graph not reached from any test file "
+                    "(Python test_*.py convention; go/ts test patterns left as config, "
+                    "not enabled by default). A symbol counts as covered when a test file "
+                    "reaches it through the graph, including import edges. Reports the "
+                    "untested symbol list with the coverage rate. Advisory only — graph "
+                    "edges are the only coverage evidence, so this is a hint list, not a "
+                    "test-coverage tool. Degrades to suspected-untested hints when the "
+                    "untested rate exceeds 30%."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
@@ -2930,6 +2987,24 @@ def _build_server(graph_path: str):
         # "low_confidence"（动态分发是静态图天生盲区，不声称确定性）。
         return _format_dead_code(DG, r), True, int(r["scanned"]), "low_confidence"
 
+    def _tool_untested_symbols(arguments: dict) -> tuple[str, bool, int, str]:  # CUSTOM: C2 四元组
+        # C2 未覆盖符号（scripts/structure_queries.py，Task 13）。R4-1：有向视图
+        # （DiGraph）——生产 _load_graph 产 nx.Graph，无向图上传入会让测试子图可达退化为
+        # 连通分量遍历（test_x.py 的可达集把整个连通分量误判"已覆盖"）；untested_symbols
+        # 内部 TypeError 防御，serve 侧挂载经 _digraph_view 重建方向（同 C1）。
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from structure_queries import untested_symbols
+        DG = _digraph_view(active_graph_path)
+        r = untested_symbols(DG)
+        # N1：found 恒 True（分析报告恒有效——空结果≠absent，"全部符号已被测试覆盖"是
+        # 有效回答，C2 归 C1 派 M2 语义），scanned=符号总数（r["scanned"]）。
+        # C 信封纪律：verdict_override="low_confidence"（图边是唯一覆盖证据，
+        # conftest 自动发现 fixture 等静态盲区，不声称确定性）。
+        return _format_untested(DG, r), True, int(r["scanned"]), "low_confidence"
+
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -3027,6 +3102,7 @@ def _build_server(graph_path: str):
         "get_changed_symbols": _tool_get_changed_symbols,  # CUSTOM: C3
         "get_hotspots": _tool_get_hotspots,  # CUSTOM: C4
         "find_dead_code": _tool_find_dead_code,  # CUSTOM: C1
+        "get_untested_symbols": _tool_untested_symbols,  # CUSTOM: C2
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,

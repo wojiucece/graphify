@@ -1,4 +1,6 @@
-"""C1：find_dead_code（Phase 4 Task 12）——入口策略 + 86.4% 闸门降级。
+"""C1/C2：find_dead_code（Task 12）+ untested_symbols（Task 13）——入口/测试子图可达。
+
+C1：入口策略 + 86.4% 闸门降级。
 
 入口双态：
 - 应用型 = main 脚本/CLI 入口（__main__.py 文件节点，或 main/__main__ 短名符号）；
@@ -35,6 +37,7 @@ C 信封纪律：verdict 由 serve 闭包定 low_confidence——动态分发（
 """
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 
 import networkx as nx
@@ -138,4 +141,66 @@ def find_dead_code(G, entry_mode: str = "auto", project_root: Path | None = None
         "unreachable_rate": round(rate, 4),
         "gate_failed": gate_failed,
         "degraded_to": "orphan_hint" if gate_failed else None,
+    }
+
+
+# C2 误报闸门阈值：未覆盖率 >30%（图可达性证据稀疏 → 误报风险高）→ 降级"疑似未覆盖"
+# 措辞。注：>30% 误报率的真值只能在 fork 实测时人工抽样核对（brief Step 3，抽样 20 个），
+# 代码闸门是结构性代理——与 find_dead_code 的 >50% 闸门同机制（rate 高 → 结果不可靠 →
+# 降级措辞），不是误报率本身。
+_UNTESTED_GATE = 0.3
+
+
+def untested_symbols(G, patterns=("test_*.py",)) -> dict:
+    """C2 静态测试覆盖扫描：测试子图正向可达集外 = 未覆盖符号 + 30% 误报闸门降级。
+
+    G 必须为 nx.DiGraph（R4-1：无向 G 上测试子图可达退化为连通分量遍历——测试文件
+    test_x.py 的可达集会把整个连通分量误判"已覆盖"，未覆盖集系统性趋空）。
+
+    测试文件判定：kind=='file' 且 source_file 基名 fnmatch 命中 patterns（Python 单
+    约定 test_*.py 启动——fork 实测 252 文件；go/ts 测试约定留配置项：patterns 参数
+    可传 ('*_test.go',) 等，不默认启用）。
+    测试子图 = 测试文件节点正向可达。import 推导复用（与 find_dead_code 同一套闭包
+    机制）：闭包沿全部有向边遍历，可达测试文件的 import 目标（imports/imports_from
+    边）即"被测试覆盖"；kind='import' 节点本身不算符号、不入分母。
+    未覆盖 = 符号全集 − 可达集。
+
+    >30% 误报闸门（代理）：未覆盖率 > _UNTESTED_GATE → gate_failed=True +
+    degraded_to="suspected_untested"（输出改"疑似未覆盖（advisory）"措辞，advisory
+    语义不变——合法降级交付，不是失败）。
+
+    C 信封纪律：verdict 由 serve 闭包定 low_confidence——图边是唯一覆盖证据，静态图
+    看不见反射/动态加载的测试路径（conftest 自动发现 fixture 等），本模块不声称确定性。
+
+    返回 dict：
+      untested      未覆盖符号节点 id 列表（有序，R3-2 短名事实源）
+      test_files    命中的测试文件节点 id 列表
+      scanned       符号总数（N1 契约：serve 闭包 scanned=符号总数）
+      untested_rate 未覆盖率（round 4 位）
+      gate_failed   rate > 0.3
+      degraded_to   "suspected_untested"（gate_failed 时）| None
+    """
+    if not G.is_directed():
+        raise TypeError("要求 _digraph_view 产物；无向 G 上测试子图可达退化为连通分量遍历，未覆盖判定失效")
+    test_files = {n for n, d in G.nodes(data=True)
+                  if d.get("kind") == "file"
+                  and any(fnmatch.fnmatch(Path(str(d.get("source_file", ""))).name, p)
+                          for p in patterns)}
+    # 测试子图正向可达（全边遍历，import 边天然作透传证据——同一套闭包机制，不需特判）。
+    reachable: set[str] = set()
+    for tf in test_files:
+        if tf in G:
+            reachable |= set(nx.descendants(G, tf))
+    symbol_nodes = {n for n, d in G.nodes(data=True) if d.get("kind") in _SYMBOL_KINDS}
+    untested = sorted(symbol_nodes - reachable)
+    total = len(symbol_nodes)
+    rate = (len(untested) / total) if total else 0.0
+    gate_failed = rate > _UNTESTED_GATE
+    return {
+        "untested": untested,
+        "test_files": sorted(test_files),
+        "scanned": total,
+        "untested_rate": round(rate, 4),
+        "gate_failed": gate_failed,
+        "degraded_to": "suspected_untested" if gate_failed else None,
     }

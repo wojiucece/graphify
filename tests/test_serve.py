@@ -1799,3 +1799,67 @@ def test_find_dead_code_envelope_low_confidence():
                           freshness="fresh")
     meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
     assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
+
+
+# === CUSTOM: C2 get_untested_symbols（Task 13）=================================
+
+
+def test_get_untested_symbols_registered_in_search_tools():
+    """C2 登记：get_untested_symbols 必须进 _SEARCH_TOOLS——否则响应不合并 _meta 信封、
+    verdict_override（low_confidence）失效。"""
+    from graphify.serve import _SEARCH_TOOLS
+    assert "get_untested_symbols" in _SEARCH_TOOLS
+
+
+def test_format_untested_normal_ok_path():
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("test_x", kind="file", source_file="tests/test_x.py")
+    DG.add_node("fn", kind="function", label="fn()", source_file="x.py")
+    DG.add_node("gy", kind="function", label="gy()", source_file="y.py")
+    DG.add_edge("test_x", "fn", relation="imports")
+    r = {"untested": ["gy"], "test_files": ["test_x"], "scanned": 2,
+         "untested_rate": 0.5, "gate_failed": False, "degraded_to": None}
+    text = _format_untested(DG, r)
+    assert "advisory" in text
+    assert "gy()" in text and "fn()" not in text
+    assert "degraded" not in text
+
+
+def test_format_untested_gate_failed_degraded_wording():
+    """>30% 误报闸门降级措辞：suspected-untested hints + 显式声明非确定性（合法降级交付，
+    不是失败——报告语义不声称确认的覆盖结论）。"""
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("n0", kind="function", label="s0()", source_file="z.py")
+    r = {"untested": ["n0"], "test_files": [], "scanned": 10,
+         "untested_rate": 0.9, "gate_failed": True, "degraded_to": "suspected_untested"}
+    text = _format_untested(DG, r)
+    assert "suspected-untested hints" in text
+    assert "exceeds the 30% gate" in text
+    assert "NOT a confirmed" in text
+
+
+def test_format_untested_no_symbol_nodes_honest():
+    """退化形态：图无代码符号节点（缺 kind 属性，如 graphify 原生 AST 图）——诚实声明
+    "no code symbol nodes"，不谎报 0/0 untested。"""
+    from graphify.serve import _format_untested
+    DG = nx.DiGraph()
+    DG.add_node("n1", label="x")   # 无 kind 属性
+    r = {"untested": [], "test_files": [], "scanned": 0, "untested_rate": 0.0,
+         "gate_failed": False, "degraded_to": None}
+    text = _format_untested(DG, r)
+    assert "no code symbol nodes" in text
+
+
+def test_get_untested_envelope_low_confidence():
+    """N1+C 信封：get_untested_symbols 闭包 4 元组（text, found=True, scanned=42,
+    override=low_confidence）过出口 -> _meta.verdict=low_confidence（C 信封纪律：空结果
+    ≠absent，"全部符号已被测试覆盖"是有效回答）。"""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("get_untested_symbols", ("Untested-symbol scan ...", True, 42,
+                                                   "low_confidence"),
+                          freshness="fresh")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
