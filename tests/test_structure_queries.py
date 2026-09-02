@@ -53,17 +53,19 @@ def test_find_dead_code_rejects_undirected_graph():
 def test_auto_mode_package_level_main_py(tmp_path):
     """M1（owner 审核）：包内 __main__.py（非根目录）→ auto 探测走 application 分支。
     全图扫 source_file.endswith('__main__.py') 任意深度——Python 惯例是包内 __main__.py
-    （fork 自己是 graphify/__main__.py），根目录 project_root/__main__.py 形态近乎不出现；
-    修复前根目录单点检查对该形态永不命中，39 个同名 main 成唯一工作路径 = 入口过宽。"""
+    （fork 自己是 graphify/__main__.py），根目录 project_root/__main__.py 形态近乎不出现。
+    re-review Minor-1：入口节点命名 run（短名非 main/__main__）——若走短名回退分支（旧代码
+    根目录检查失败后落短名/空 → library），entry_mode 断言即失败，真正 discriminate
+    __main__.py 分支；命名 main 会让旧代码经短名回退也通过，守卫形同虚设。"""
     (tmp_path / "pkg").mkdir()
-    (tmp_path / "pkg" / "__main__.py").write_text("def main(): ...\n", encoding="utf-8")
-    G = _G([("main", "util")],
-           {"main": "function", "util": "function", "orphan": "function"})
+    (tmp_path / "pkg" / "__main__.py").write_text("def run(): ...\n", encoding="utf-8")
+    G = _G([("run", "util")],
+           {"run": "function", "util": "function", "orphan": "function"})
     for n in G.nodes:
-        G.nodes[n]["source_file"] = "pkg/__main__.py" if n == "main" else "pkg/mod.py"
+        G.nodes[n]["source_file"] = "pkg/__main__.py" if n == "run" else "pkg/mod.py"
     r = find_dead_code(G, project_root=tmp_path)
-    assert r["entry_mode"] == "application"      # 走 __main__.py 分支，非短名 main 判定
-    assert "main" not in r["unreachable"]        # 入口可达
+    assert r["entry_mode"] == "application"      # 走 __main__.py 分支（短名回退无法到达）
+    assert "run" not in r["unreachable"]         # 入口可达
     assert "orphan" in r["unreachable"]
 
 def test_import_derivation_pass_through_evidence():
