@@ -46,6 +46,15 @@ def test_freshness_no_state_file_is_fresh(tmp_path):
     """守卫回退原则：未迁移项目无状态文件，不得全标 stale."""
     assert _derive_freshness(tmp_path / "nonexistent" / ".rebuild-state.json") == "fresh"
 
+def test_freshness_non_dict_state_file_is_fresh(tmp_path):
+    """终审 Imp-1：状态文件是损坏的非 dict（如 []）→ freshness 判 fresh 不崩.
+    call_tool 对每个工具（含 list_prs）都求值 freshness，AttributeError 会把所有
+    调用变 Error executing、serve 永不自愈；非 dict 即损坏形态守卫回退."""
+    state = tmp_path / "graphify-out" / ".rebuild-state.json"
+    state.parent.mkdir()
+    state.write_text("[]", encoding="utf-8")
+    assert _derive_freshness(state) == "fresh"
+
 def test_freshness_missing_graph_json_is_stale(tmp_path):
     """R5-3：complete 态但 graph.json 缺失 -> stale_index 不崩（freshness 是附加层，
     无权杀死响应；产物缺失即最陈旧形态）."""

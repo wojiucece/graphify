@@ -1863,3 +1863,42 @@ def test_get_untested_envelope_low_confidence():
                           freshness="fresh")
     meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
     assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
+
+
+def test_call_tool_exception_path_redacts_fake_key(tmp_path, monkeypatch):
+    """终审升格 2：call_tool 的 except Exception 错误路径同样过 _redact——异常消息含
+    假密钥（sk-...）→ 响应文本 [REDACTED:...]，密钥零泄漏（Q7 出口统一承诺缺口）。
+    触发：monkeypatch serve._load_graph 抛 RuntimeError 带假密钥——call_tool 的
+    _select_graph → _load_ctx → cache miss → _load_entry → _load_graph（已 patch）
+    raise，被 except Exception 捕获拼进错误文本。需要 mcp+starlette（HTTP 传输），
+    缺失时 importorskip 跳过（与 test_serve_http 同门）。"""
+    import json as _json
+    pytest.importorskip("mcp")
+    pytest.importorskip("starlette")
+    from starlette.testclient import TestClient as _TC
+    from graphify import serve as _serve_mod
+    fake = "sk-" + "aA0" * 11 + "x"   # openai L1 假密钥形态（同 test_redaction HITS）
+
+    def _boom(_path):
+        raise RuntimeError(f"graph load failed: {fake}")
+
+    monkeypatch.setattr(_serve_mod, "_load_graph", _boom)
+    gfile = tmp_path / "graph.json"
+    gfile.write_text(_json.dumps({"directed": True, "nodes": [], "links": []}),
+                     encoding="utf-8")
+    app = _serve_mod._build_http_app(str(gfile), json_response=True)
+    hdrs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                       "clientInfo": {"name": "test", "version": "0"}}}
+    with _TC(app, base_url="http://127.0.0.1") as client:
+        r = client.post("/mcp", headers=hdrs, json=init)
+        assert r.status_code == 200
+        h = {**hdrs, "mcp-session-id": r.headers.get("mcp-session-id")}
+        client.post("/mcp", headers=h, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = client.post("/mcp", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_node", "arguments": {"label": "x"}}})
+        text = resp.json()["result"]["content"][0]["text"]
+    assert fake not in text, "错误响应必须脱敏假密钥"
+    assert "[REDACTED:openai]" in text, f"应为 [REDACTED:openai]，got: {text[:120]!r}"

@@ -182,8 +182,12 @@ def _read_prev_duration(root: Path) -> float:
     """N2：读上一轮 complete 的 last_duration——rebuilding 载荷覆盖整个文件，
     不继承则时效逃生 max(2*last_duration, 1800) 中的 2x 项恒为 0（设计静默失效）."""
     try:
-        return float(json.loads(_state_path(root).read_text(encoding="utf-8"))
-                     .get("last_duration", 0))
+        d = json.loads(_state_path(root).read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            # 终审 Imp-1 连带：非 dict（如 []）直接 .get 会 AttributeError——一次重建
+            # 崩溃后自愈；与 serve._derive_freshness 同防护（兄弟读取器三处统一）。
+            return 0.0
+        return float(d.get("last_duration", 0))
     except (OSError, ValueError, TypeError):
         return 0.0
 

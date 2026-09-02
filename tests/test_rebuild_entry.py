@@ -129,6 +129,16 @@ def test_stale_lock_taken_over(tmp_path):
         rebuild_entry.rebuild(tmp_path)
 
 
+def test_read_prev_duration_non_dict_returns_zero(tmp_path):
+    """终审 Imp-1 连带：状态文件非 dict（[]）→ _read_prev_duration 返回 0.0 不崩.
+    修复前 .get 在 list 上 AttributeError，一次重建崩溃后自愈；与 serve
+    _derive_freshness 三处兄弟读取器统一防护."""
+    import rebuild_entry
+    state = tmp_path / "graphify-out" / ".rebuild-state.json"
+    state.parent.mkdir()
+    state.write_text("[]", encoding="utf-8")
+    assert rebuild_entry._read_prev_duration(tmp_path) == 0.0
+
 def test_parse_refresh_filters_empty_segments():
     """M1（用户审查）：CLI refresh 解析过滤空段。"a.md," 此前产生
     Path('') -> Path('.')，refresh 指向整个 CWD；与 run_analysis.py CLI 已有的

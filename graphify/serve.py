@@ -1594,6 +1594,12 @@ def _derive_freshness(state_path):
         d = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return "fresh"  # 无状态文件 = 未迁移项目，守卫回退
+    if not isinstance(d, dict):
+        # 终审 Imp-1：损坏状态文件（如 [] 等非 dict）——call_tool 对每个工具（含
+        # list_prs）都求值 freshness，AttributeError 会把所有调用变 Error executing，
+        # serve 永不自愈。非 dict 即损坏形态，守卫回退 fresh（与兄弟读取器
+        # _tool_get_changed_symbols / rebuild_entry._read_prev_git_head 同防护）。
+        return "fresh"
     if d.get("phase") == "rebuilding":
         limit = max(2 * float(d.get("last_duration", 0)), _REBUILD_STALE_FLOOR_S)
         if time.time() - float(d.get("started", 0)) > limit:
@@ -3247,7 +3253,10 @@ def _build_server(graph_path: str):
             # an error result; the 2.x path catches it in _on_call_tool).
             raise
         except Exception as exc:
-            return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
+            # 终审升格 2：错误路径同样过 _redact——Q7 出口统一承诺缺口（异常消息可能
+            # 带密钥/敏感值，裸拼会泄漏）。except ToolError: raise 路径不动（upstream
+            # 错误通道既定纪律）。
+            return [types.TextContent(type="text", text=_redact(f"Error executing {name}: {exc}"))]
 
     if hasattr(Server, "list_tools"):
         # mcp 1.x: decorator-based registration. The SDK wraps the raw returns

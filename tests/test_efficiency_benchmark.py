@@ -2,9 +2,13 @@
 
 覆盖 review 补丁的切片/root 解析逻辑（用户 M1/L1 + SDD Minor-4/Imp-1）：
 --tasks 显式全量生效（不再封顶 12）；root 解析优先级 --root > env > 本仓根。
+终审补丁（用户升格 1）：--tasks 0/负 报参数错误而非除零崩溃。
 """
+import argparse
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 import efficiency_benchmark as eb  # noqa: E402
@@ -45,3 +49,15 @@ def test_resolve_root_defaults_to_repo_root(monkeypatch):
     root, src = eb._resolve_root(None)
     assert root == eb._BENCH_ROOT
     assert "repo" in src
+
+
+def test_positive_tasks_rejects_zero_and_negative():
+    """用户升格 1：--tasks 0/-1 → 参数错误（argparse.ArgumentTypeError），
+    非跑完全部任务后 summary 均值除零（golden[:0]=[] → n=0）. """
+    with pytest.raises(argparse.ArgumentTypeError):
+        eb._positive_tasks("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        eb._positive_tasks("-3")
+    with pytest.raises(argparse.ArgumentTypeError):
+        eb._positive_tasks("abc")
+    assert eb._positive_tasks("15") == 15

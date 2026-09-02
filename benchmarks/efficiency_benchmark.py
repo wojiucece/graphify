@@ -59,6 +59,19 @@ def _select_tasks(golden: list, n: int) -> list:
     return golden[:n]
 
 
+def _positive_tasks(raw: str) -> int:
+    """--tasks 校验（用户升格 1）：必须 >= 1——0/负会 golden[:0]=[] → n=0 → summary
+    均值除零，且是跑完所有任务后才崩（浪费一轮基准）。argparse type 校验在参数解析期
+    报错退出，绝不进入基准主体。"""
+    try:
+        n = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--tasks 必须是正整数，got {raw!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--tasks 必须 >= 1，got {n}")
+    return n
+
+
 def _resolve_root(args_root: str | None) -> tuple[Path, str]:
     """root 解析（用户 L1 + SDD Imp-1）：--root 显式 > GRAPHIFY_GOLDEN_ROOT env >
     脚本所在仓根（benchmarks/ 的父目录——自指可复现，替代硬编码 D:/code/graphify_fork）。
@@ -244,7 +257,8 @@ def main() -> None:
     ap.add_argument("--root", default=None,
                     help="代码根（显式最高优先；缺省 GRAPHIFY_GOLDEN_ROOT env，再缺省本仓根）")
     ap.add_argument("--budget", type=int, default=2000, help="ranked_context token_budget")
-    ap.add_argument("--tasks", type=int, default=_DEFAULT_TASKS, help="金标集任务数（默认前 12，显式全量生效）")
+    ap.add_argument("--tasks", type=_positive_tasks, default=_DEFAULT_TASKS,
+                    help="金标集任务数（默认前 12，显式全量生效；>=1，0/负报参数错误）")
     ap.add_argument("--rebuild", dest="rebuild", action="store_true", default=True,
                     help="基准前对 --root 跑 rebuild_entry 全量重建（默认开，保证同一起跑线）")
     ap.add_argument("--skip-rebuild", dest="rebuild", action="store_false",
