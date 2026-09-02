@@ -1819,7 +1819,7 @@ def test_format_untested_normal_ok_path():
     DG.add_node("gy", kind="function", label="gy()", source_file="y.py")
     DG.add_edge("test_x", "fn", relation="imports")
     r = {"untested": ["gy"], "test_files": ["test_x"], "scanned": 2,
-         "untested_rate": 0.5, "gate_failed": False, "degraded_to": None}
+         "untested_rate": 0.25, "gate_failed": False, "degraded_to": None}
     text = _format_untested(DG, r)
     assert "advisory" in text
     assert "gy()" in text and "fn()" not in text

@@ -2534,8 +2534,8 @@ _TOOL_SPECS: list[dict] = [
         "name": "get_untested_symbols",
         "description": (
             "Find symbols in the knowledge graph not reached from any test file "
-            "(Python test_*.py convention; go/ts test patterns left as config, "
-            "not enabled by default). A symbol counts as covered when a test file "
+            "(Python test_*.py convention; non-Python test conventions (go/ts) "
+            "are not supported yet). A symbol counts as covered when a test file "
             "reaches it through the graph, including import edges. Reports the "
             "untested symbol list with the coverage rate. Advisory only — graph "
             "edges are the only coverage evidence, so this is a hint list, not a "
