@@ -225,7 +225,7 @@ def test_golden_matrix_recall_and_no_degrade():
     """金标 10 条：命中@5 ≥ 50%，且融合 ≥ BM25-only 对照（不降）；1000/2000 两档预算.
     DB 缺失时由 conftest golden gate 跳过（'skipped (golden)' 进摘要）."""
     golden = _load_golden()
-    assert len(golden) == 10, "第一批矩阵最小集 = 10 条"
+    assert len(golden) == 20, "第一批矩阵最小集 10 条 + 第二批 querylog 替代语料 10 条 = 20 条"
     for budget in (1000, 2000):
         fusion_hits = bm25_hits = 0.0
         rows = []

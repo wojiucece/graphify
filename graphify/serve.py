@@ -2331,6 +2331,305 @@ def _format_untested(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
     return "\n".join(lines)
 
 
+# CUSTOM: §8 schema 预算——15 个工具的唯一事实源（name/description/inputSchema 纯 dict）。
+# list_tools()（在 _build_server 闭包内）从此构建 types.Tool；_all_tool_schemas() 返回
+# 与 list_tools 发布形态逐字节一致的纯 schema dict（含 _meta 后缀 + project_path 注入），
+# 测试不启 MCP server 也能量预算（tests/test_schema_budget.py）。加工具/改 schema 只动此处。
+_TOOL_SPECS: list[dict] = [
+    {
+        "name": "query_graph",
+        "description": "Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Natural language question or keyword search"},
+                "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs",
+                         "description": "bfs=broad context, dfs=trace a specific path"},
+                "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
+                "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                "context_filter": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional explicit edge-context filter, e.g. ['call', 'field']",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        # CUSTOM: B2 include_source 四档（受限取值参数 → JSON schema enum，
+        # 无效值走参数校验失败 isError）。缺省 signature（DB 名片增强），
+        # none 档输出与扩展前逐字节一致（回归锚点）。
+        "name": "get_node",
+        "description": (
+            "Get full details for a specific node by label or ID. include_source "
+            "controls source slicing: signature (default; def line + signature + "
+            "docstring head), body (source slice), body+context (±3 lines + "
+            "1-hop neighbor signatures), or none (card only)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Node label or ID to look up"},
+                "include_source": {
+                    "type": "string",
+                    "enum": ["none", "signature", "body", "body+context"],
+                    "default": "signature",
+                    "description": (
+                        "Source slicing mode (default signature): none=card only; "
+                        "signature=def line + signature + docstring head; body=source "
+                        "slice; body+context=±3 lines + 1-hop neighbor signatures"
+                    ),
+                },
+            },
+            "required": ["label"],
+        },
+    },
+    {
+        "name": "get_neighbors",
+        "description": (
+            "Get neighbors of a node with edge details. depth=1 lists direct "
+            "neighbors (undirected); depth>1 returns the blast radius on the "
+            "directed view (callers for direction=in, callees for direction=out) "
+            "with dispatch/fanout annotations and low-confidence verdict. "
+            "edge_kinds restricts traversal to the given relation kinds."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"},
+                "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
+                "direction": {"type": "string", "enum": ["out", "in", "both"],
+                              "description": "Edge direction on the directed view (default: undirected legacy)"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1,
+                          "description": "BFS depth; 1=direct neighbors, >1=blast radius"},
+                "edge_kinds": {"type": "array", "items": {"type": "string"},
+                               "description": "Optional: restrict traversal to these relation kinds"},
+                "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+            },
+            "required": ["label"],
+        },
+    },
+    {
+        "name": "get_community",
+        "description": "Get all nodes in a community by community ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "community_id": {"type": "integer", "description": "Community ID (0-indexed by size)"},
+                "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+            },
+            "required": ["community_id"],
+        },
+    },
+    {
+        "name": "god_nodes",
+        "description": "Return the most connected nodes - the core abstractions of the knowledge graph.",
+        "inputSchema": {"type": "object", "properties": {"top_n": {"type": "integer", "default": 10}}},
+    },
+    {
+        "name": "graph_stats",
+        "description": "Return summary statistics: node count, edge count, communities, confidence breakdown.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "shortest_path",
+        "description": (
+            "Find the shortest path between two concepts in the knowledge graph. "
+            "Follows stored edge direction by default; set undirected=true to ignore it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Source concept label or keyword"},
+                "target": {"type": "string", "description": "Target concept label or keyword"},
+                "max_hops": {"type": "integer", "default": 8, "description": "Maximum hops to consider"},
+                "undirected": {"type": "boolean", "default": False,
+                               "description": "Ignore stored edge direction when searching"},
+            },
+            "required": ["source", "target"],
+        },
+    },
+    {
+        # CUSTOM: B1 融合检索（scripts/ranked.py，四通道）。token_budget 用
+        # enum（受限取值参数 → JSON schema enum，无效值走参数校验失败 isError）。
+        "name": "get_ranked_context",
+        "description": (
+            "Rank code symbols by mixed retrieval: FTS5 BM25 x exact-name "
+            "pinning x graph centrality under a token budget. Best first step "
+            "to locate relevant symbols for a code query. Then fetch the actual "
+            "implementation with get_node(label=..., include_source='body') "
+            "(two-step: search here, fetch there)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "Code query: identifier tokens (English) route to FTS/pinning, CJK tokens to graph labels"},
+                "token_budget": {"type": "integer", "default": 2000,
+                                 "enum": [500, 1000, 2000, 4000, 8000],
+                                 "description": "Max output tokens (tier)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        # CUSTOM: C3 git 轴（scripts/git_symbols.py，Task 10）。检索型工具
+        # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（list_tools 循环）。
+        "name": "get_changed_symbols",
+        "description": (
+            "Get knowledge-graph symbols changed since the last rebuild "
+            "(anchored to the git HEAD recorded in the rebuild state file). "
+            "Lists the changed files (matching git diff --stat) and the "
+            "graph symbols inside them. Falls back to an unanchored basis "
+            "when git or the git baseline is unavailable. "
+            "Untracked new files are not included (git diff semantics)."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        # CUSTOM: C4 热区（scripts/git_symbols.py，Task 11）。declared 代理：
+        # churn（git log 频次）× 度数（edges 双端点 GROUP BY——I1 fan-in 纳入，
+        # 与 god_nodes 合并图度数 in+out 方向对齐）都是代理值，描述明示非圈
+        # 复杂度（方案 §5-C4 实测条款）。
+        "name": "get_hotspots",
+        "description": (
+            "Rank files by development activity x graph connectivity (hotspot "
+            "analysis): score = churn (number of commits touching the file, full "
+            "history) x degree (graph edges grouped by both endpoints, matching "
+            "the god-nodes in+out degree). "
+            "Both are declared proxies — the graph carries no per-file complexity "
+            "attribute, so this is NOT cyclomatic complexity. Returns top-N files "
+            "with both a churn and a connectivity signal."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "top_n": {"type": "integer", "enum": [5, 10, 20, 50],
+                          "default": 10,
+                          "description": "Number of hotspot files to return"},
+            },
+        },
+    },
+    {
+        # CUSTOM: C1 死代码（scripts/structure_queries.py，Task 12）。检索型工具
+        # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（list_tools 循环）。
+        "name": "find_dead_code",
+        "description": (
+            "Scan the knowledge graph for potentially dead code: symbols "
+            "unreachable from the project's entry points (main script / CLI "
+            "for application projects, __init__ re-exports for libraries; "
+            "auto-detected). Reports the unreachable symbol list with the "
+            "unreachable rate. Advisory only — static reachability cannot see "
+            "dynamic dispatch (reflection/import hooks), so this is a hint list, "
+            "not a deterministic verdict. Degrades to orphan-symbol hints when "
+            "the unreachable rate exceeds 50%."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        # CUSTOM: C2 未覆盖符号（scripts/structure_queries.py，Task 13）。检索型
+        # 工具（_SEARCH_TOOLS）描述自动追加 _meta 信封契约（list_tools 循环）。
+        # Python 单约定 test_*.py 判定测试文件；go/ts 约定留配置项（patterns 参数）。
+        "name": "get_untested_symbols",
+        "description": (
+            "Find symbols in the knowledge graph not reached from any test file "
+            "(Python test_*.py convention; go/ts test patterns left as config, "
+            "not enabled by default). A symbol counts as covered when a test file "
+            "reaches it through the graph, including import edges. Reports the "
+            "untested symbol list with the coverage rate. Advisory only — graph "
+            "edges are the only coverage evidence, so this is a hint list, not a "
+            "test-coverage tool. Degrades to suspected-untested hints when the "
+            "untested rate exceeds 30%."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_prs",
+        "description": (
+            "List open GitHub PRs with CI status, review state, and graph impact "
+            "(which communities each PR touches, blast radius). Use this before starting "
+            "work to check if a PR already covers the area you're about to change."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "base": {"type": "string", "description": "Base branch to filter PRs by (auto-detected if omitted)"},
+                "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
+            },
+        },
+    },
+    {
+        "name": "get_pr_impact",
+        "description": (
+            "Get detailed graph impact for a specific PR: which files it changes, "
+            "which knowledge-graph communities are affected, and how many nodes are touched. "
+            "Use this to assess merge risk or check for overlap with your current work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pr_number": {"type": "integer", "description": "PR number to analyse"},
+                "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
+            },
+            "required": ["pr_number"],
+        },
+    },
+    {
+        "name": "triage_prs",
+        "description": (
+            "Return all actionable open PRs (correct base, not stale) with full graph impact data "
+            "so you can reason about review priority, merge order, and conflict risk. "
+            "Call this when the user asks 'what PRs should I review?' or 'what's ready to merge?'"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "base": {"type": "string", "description": "Base branch to filter PRs by (auto-detected if omitted)"},
+                "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
+            },
+        },
+    },
+]
+
+# CUSTOM: §8 检索型工具的 _meta 信封契约后缀 + 全工具的 project_path 注入值——
+# 抽成常量让 list_tools() 与 _all_tool_schemas() 逐字节同源（预算测的就是实际发布形态）。
+_META_SUFFIX = (" Responses carry a trailing `_meta:` JSON line "
+                "(verdict/freshness; body unchanged).")
+_PROJECT_PATH_PROP = {
+    "type": "string",
+    "description": (
+        "Absolute path to a project directory containing "
+        "graphify-out/graph.json. Optional — defaults to the graph "
+        "this server was started with."
+    ),
+}
+
+
+def _all_tool_schemas() -> list[dict]:
+    """§8 schema 预算：与 list_tools() 发布形态一致的纯 schema dict 列表.
+
+    CUSTOM：唯一事实源 _TOOL_SPECS（模块级）——list_tools() 在其上构建 types.Tool，
+    本函数在其上应用同款变换（_meta 后缀 + project_path 注入）返回纯 dict，测试
+    （tests/test_schema_budget.py）不启 MCP server 即可对全部工具做 token 预算断言。
+    注入值用 deepcopy：绝不污染 _TOOL_SPECS 共享源（list_tools 的 types.Tool 是
+    pydantic 模型，本身隔离；此处对纯 dict 显式隔离）。
+    """
+    import copy as _copy
+    schemas = []
+    for _spec in _TOOL_SPECS:
+        _s = {
+            "name": _spec["name"],
+            "description": _spec["description"],
+            "inputSchema": _copy.deepcopy(_spec["inputSchema"]),
+        }
+        if _s["name"] in _SEARCH_TOOLS:
+            _s["description"] += _META_SUFFIX
+        _s["inputSchema"].setdefault("properties", {})["project_path"] = _copy.deepcopy(_PROJECT_PATH_PROP)
+        schemas.append(_s)
+    return schemas
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2403,268 +2702,15 @@ def _build_server(graph_path: str):
     # mcp 1.x exposes the @server.list_tools()/... decorator API, mcp 2.x
     # replaced it with on_list_tools=/... constructor callbacks.
     async def list_tools() -> list[types.Tool]:
-        _tools = [
-            types.Tool(
-                name="query_graph",
-                description="Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string", "description": "Natural language question or keyword search"},
-                        "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs",
-                                 "description": "bfs=broad context, dfs=trace a specific path"},
-                        "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
-                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
-                        "context_filter": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional explicit edge-context filter, e.g. ['call', 'field']",
-                        },
-                    },
-                    "required": ["question"],
-                },
-            ),
-            types.Tool(
-                # CUSTOM: B2 include_source 四档（受限取值参数 → JSON schema enum，
-                # 无效值走参数校验失败 isError）。缺省 signature（DB 名片增强），
-                # none 档输出与扩展前逐字节一致（回归锚点）。
-                name="get_node",
-                description=(
-                    "Get full details for a specific node by label or ID. include_source "
-                    "controls source slicing: signature (default; def line + signature + "
-                    "docstring head), body (source slice), body+context (±3 lines + "
-                    "1-hop neighbor signatures), or none (card only)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string", "description": "Node label or ID to look up"},
-                        "include_source": {
-                            "type": "string",
-                            "enum": ["none", "signature", "body", "body+context"],
-                            "default": "signature",
-                            "description": (
-                                "Source slicing mode (default signature): none=card only; "
-                                "signature=def line + signature + docstring head; body=source "
-                                "slice; body+context=±3 lines + 1-hop neighbor signatures"
-                            ),
-                        },
-                    },
-                    "required": ["label"],
-                },
-            ),
-            types.Tool(
-                name="get_neighbors",
-                description=(
-                    "Get neighbors of a node with edge details. depth=1 lists direct "
-                    "neighbors (undirected); depth>1 returns the blast radius on the "
-                    "directed view (callers for direction=in, callees for direction=out) "
-                    "with dispatch/fanout annotations and low-confidence verdict. "
-                    "edge_kinds restricts traversal to the given relation kinds."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
-                        "direction": {"type": "string", "enum": ["out", "in", "both"],
-                                      "description": "Edge direction on the directed view (default: undirected legacy)"},
-                        "depth": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1,
-                                  "description": "BFS depth; 1=direct neighbors, >1=blast radius"},
-                        "edge_kinds": {"type": "array", "items": {"type": "string"},
-                                       "description": "Optional: restrict traversal to these relation kinds"},
-                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
-                    },
-                    "required": ["label"],
-                },
-            ),
-            types.Tool(
-                name="get_community",
-                description="Get all nodes in a community by community ID.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "community_id": {"type": "integer", "description": "Community ID (0-indexed by size)"},
-                        "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
-                    },
-                    "required": ["community_id"],
-                },
-            ),
-            types.Tool(
-                name="god_nodes",
-                description="Return the most connected nodes - the core abstractions of the knowledge graph.",
-                inputSchema={"type": "object", "properties": {"top_n": {"type": "integer", "default": 10}}},
-            ),
-            types.Tool(
-                name="graph_stats",
-                description="Return summary statistics: node count, edge count, communities, confidence breakdown.",
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            types.Tool(
-                name="shortest_path",
-                description=(
-                    "Find the shortest path between two concepts in the knowledge graph. "
-                    "Follows stored edge direction by default; set undirected=true to ignore it."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "source": {"type": "string", "description": "Source concept label or keyword"},
-                        "target": {"type": "string", "description": "Target concept label or keyword"},
-                        "max_hops": {"type": "integer", "default": 8, "description": "Maximum hops to consider"},
-                        "undirected": {"type": "boolean", "default": False,
-                                       "description": "Ignore stored edge direction when searching"},
-                    },
-                    "required": ["source", "target"],
-                },
-            ),
-            types.Tool(
-                # CUSTOM: B1 融合检索（scripts/ranked.py，四通道）。token_budget 用
-                # enum（受限取值参数 → JSON schema enum，无效值走参数校验失败 isError）。
-                name="get_ranked_context",
-                description=(
-                    "Rank code symbols by mixed retrieval: FTS5 BM25 x exact-name "
-                    "pinning x graph centrality under a token budget. Best first step "
-                    "to locate relevant symbols for a code query. Then fetch the actual "
-                    "implementation with get_node(label=..., include_source='body') "
-                    "(two-step: search here, fetch there)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string",
-                                  "description": "Code query: identifier tokens (English) route to FTS/pinning, CJK tokens to graph labels"},
-                        "token_budget": {"type": "integer", "default": 2000,
-                                         "enum": [500, 1000, 2000, 4000, 8000],
-                                         "description": "Max output tokens (tier)"},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            types.Tool(
-                # CUSTOM: C3 git 轴（scripts/git_symbols.py，Task 10）。检索型工具
-                # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。
-                name="get_changed_symbols",
-                description=(
-                    "Get knowledge-graph symbols changed since the last rebuild "
-                    "(anchored to the git HEAD recorded in the rebuild state file). "
-                    "Lists the changed files (matching git diff --stat) and the "
-                    "graph symbols inside them. Falls back to an unanchored basis "
-                    "when git or the git baseline is unavailable. "
-                    "Untracked new files are not included (git diff semantics)."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            types.Tool(
-                # CUSTOM: C4 热区（scripts/git_symbols.py，Task 11）。declared 代理：
-                # churn（git log 频次）× 度数（edges 双端点 GROUP BY——I1 fan-in 纳入，
-                # 与 god_nodes 合并图度数 in+out 方向对齐）都是代理值，描述明示非圈
-                # 复杂度（方案 §5-C4 实测条款）。
-                name="get_hotspots",
-                description=(
-                    "Rank files by development activity x graph connectivity (hotspot "
-                    "analysis): score = churn (number of commits touching the file, full "
-                    "history) x degree (graph edges grouped by both endpoints, matching "
-                    "the god-nodes in+out degree). "
-                    "Both are declared proxies — the graph carries no per-file complexity "
-                    "attribute, so this is NOT cyclomatic complexity. Returns top-N files "
-                    "with both a churn and a connectivity signal."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "top_n": {"type": "integer", "enum": [5, 10, 20, 50],
-                                  "default": 10,
-                                  "description": "Number of hotspot files to return"},
-                    },
-                },
-            ),
-            types.Tool(
-                # CUSTOM: C1 死代码（scripts/structure_queries.py，Task 12）。检索型工具
-                # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。
-                name="find_dead_code",
-                description=(
-                    "Scan the knowledge graph for potentially dead code: symbols "
-                    "unreachable from the project's entry points (main script / CLI "
-                    "for application projects, __init__ re-exports for libraries; "
-                    "auto-detected). Reports the unreachable symbol list with the "
-                    "unreachable rate. Advisory only — static reachability cannot see "
-                    "dynamic dispatch (reflection/import hooks), so this is a hint list, "
-                    "not a deterministic verdict. Degrades to orphan-symbol hints when "
-                    "the unreachable rate exceeds 50%."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            types.Tool(
-                # CUSTOM: C2 未覆盖符号（scripts/structure_queries.py，Task 13）。检索型
-                # 工具（_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。Python
-                # 单约定 test_*.py 判定测试文件；go/ts 约定留配置项（patterns 参数）。
-                name="get_untested_symbols",
-                description=(
-                    "Find symbols in the knowledge graph not reached from any test file "
-                    "(Python test_*.py convention; go/ts test patterns left as config, "
-                    "not enabled by default). A symbol counts as covered when a test file "
-                    "reaches it through the graph, including import edges. Reports the "
-                    "untested symbol list with the coverage rate. Advisory only — graph "
-                    "edges are the only coverage evidence, so this is a hint list, not a "
-                    "test-coverage tool. Degrades to suspected-untested hints when the "
-                    "untested rate exceeds 30%."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            types.Tool(
-                name="list_prs",
-                description=(
-                    "List open GitHub PRs with CI status, review state, and graph impact "
-                    "(which communities each PR touches, blast radius). Use this before starting "
-                    "work to check if a PR already covers the area you're about to change."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "base": {"type": "string", "description": "Base branch to filter PRs by (auto-detected if omitted)"},
-                        "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
-                    },
-                },
-            ),
-            types.Tool(
-                name="get_pr_impact",
-                description=(
-                    "Get detailed graph impact for a specific PR: which files it changes, "
-                    "which knowledge-graph communities are affected, and how many nodes are touched. "
-                    "Use this to assess merge risk or check for overlap with your current work."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "pr_number": {"type": "integer", "description": "PR number to analyse"},
-                        "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
-                    },
-                    "required": ["pr_number"],
-                },
-            ),
-            types.Tool(
-                name="triage_prs",
-                description=(
-                    "Return all actionable open PRs (correct base, not stale) with full graph impact data "
-                    "so you can reason about review priority, merge order, and conflict risk. "
-                    "Call this when the user asks 'what PRs should I review?' or 'what's ready to merge?'"
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "base": {"type": "string", "description": "Base branch to filter PRs by (auto-detected if omitted)"},
-                        "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
-                    },
-                },
-            ),
-        ]
+        # CUSTOM: §8 schema 预算——从模块级唯一事实源 _TOOL_SPECS（纯 dict）构建
+        # types.Tool（pydantic model，隔离共享源）；_meta 后缀与 project_path 注入
+        # 与 _all_tool_schemas() 逐字节同源（预算测的就是实际发布形态）。
+        _tools = [types.Tool(**spec) for spec in _TOOL_SPECS]
         # CUSTOM: A1b 清单标注——检索型工具（_SEARCH_TOOLS）的描述声明 _meta 信封契约，
         # 调用方在 tool discovery 时即知响应尾部有 verdict/freshness 行（正文不变）。
         for _t in _tools:
             if _t.name in _SEARCH_TOOLS:
-                _t.description += (" Responses carry a trailing `_meta:` JSON line "
-                                   "(verdict/freshness; body unchanged).")
+                _t.description += _META_SUFFIX
         # Multi-project support: every tool accepts an optional project_path.
         # Injected here (rather than repeated in 11 literal schemas) so the set
         # stays in lockstep as tools are added. Omitting it keeps the historical
@@ -2675,14 +2721,7 @@ def _build_server(graph_path: str):
             _schema = getattr(_t, "inputSchema", None)
             if _schema is None:
                 _schema = _t.input_schema
-            _schema.setdefault("properties", {})["project_path"] = {
-                "type": "string",
-                "description": (
-                    "Absolute path to a project directory containing "
-                    "graphify-out/graph.json. Optional — defaults to the graph "
-                    "this server was started with."
-                ),
-            }
+            _schema.setdefault("properties", {})["project_path"] = _PROJECT_PATH_PROP
         return _tools
 
     def _tool_query_graph(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组

@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""§8 效率基准：合并栈（get_ranked_context + get_node）vs read/grep 脚本模拟.
+
+对比口径（G4 非 agent 模拟——必须可复现；R4-3 执行环境 Windows 无 grep → 用 Python
+等价实现；R5-1 禁 shell 管道 → 全程 subprocess/标准库，无 | 拼接）：
+
+- (a) 合并栈：ranked_context(root, q) → top 结果；对 top-1 复刻 get_node
+      include_source='body' 的输出（serve._format_node_card + _signature_line +
+      _slice_source 同源装配）→ 累计 search 输出 + fetch 输出 token。
+- (b) read/grep 模拟：Path(root).rglob("*.py") 收集文件 → 逐文件读内容做首 token
+      子串扫描（`token in text`）得命中列表（≈ grep -rln）→ 按序模拟 agent 读取
+      （每命中文件读头部 200 行）→ 命中期望符号所在文件则停 → tiktoken 累计
+      grep 命中行 + 读取内容。
+
+只量 token 与命中@5，不量耗时（耗时受本机 IO 影响不可复现；token 与检索排名是
+纯函数口径）。基准前先 rebuild 保证同一起跑线（freshness=fresh，--skip-rebuild
+可跳过，结果 JSON 会如实标注）。任务集 = 金标集（tests/fixtures/ranked_golden.json，
+同一份人工标注服务两处：金标测试的期望符号集 + 本基准的检索任务）。
+
+用法：
+    python benchmarks/efficiency_benchmark.py [--root D:/code/graphify_fork]
+        [--budget 2000] [--tasks 12] [--skip-rebuild] [--out benchmarks/results-<date>.json]
+
+声明：默认 --rebuild 会对 --root 跑 scripts/rebuild_entry.py 全量重建（写 root 的
+.codegraph/ + graphify-out/，是 fork 的既定重建入口；id 是内容 hash 幂等收敛，
+重建不改变未变代码的节点 id）。只读跑基准请 --skip-rebuild。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+_BENCH_ROOT = Path(__file__).resolve().parent.parent          # 本 fork（worktree）
+_GOLDEN_FILE = _BENCH_ROOT / "tests" / "fixtures" / "ranked_golden.json"
+if str(_BENCH_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BENCH_ROOT))                      # graphify 包
+if str(_BENCH_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_BENCH_ROOT / "scripts"))          # scripts/ranked.py
+
+from ranked import ranked_context, format_ranked, _count_tokens  # noqa: E402
+from graphify import serve as _serve                            # noqa: E402
+
+_READ_HEAD_LINES = 200      # read/grep 模拟：每命中文件读头部行数
+_DEFAULT_TASKS = 12         # 固定任务数（金标集前 N 条，确定性切片）
+_DEFAULT_ROOT = r"D:/code/graphify_fork"  # 与金标测试 GRAPHIFY_GOLDEN_ROOT 同源
+
+
+def _pinned_commit() -> str:
+    """pinned commit：本 fork 当前 HEAD（单条命令，无管道）。"""
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_BENCH_ROOT,
+                             capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() if out.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _run_rebuild(root: Path) -> dict:
+    """基准前 rebuild（单一入口，子进程隔离——rebuild_entry 锁冲突/sync 失败会 sys.exit）。"""
+    t0 = __import__("time").perf_counter()
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_BENCH_ROOT / "scripts" / "rebuild_entry.py"),
+             "--project", str(root)],
+            capture_output=True, text=True, timeout=1800)
+        elapsed = round(__import__("time").perf_counter() - t0, 1)
+        return {"ran": True, "ok": proc.returncode == 0,
+                "exit": proc.returncode, "elapsed_s": elapsed}
+    except subprocess.TimeoutExpired:
+        return {"ran": True, "ok": False, "exit": "timeout", "elapsed_s": 1800}
+    except Exception as e:  # 重建失败绝不影响基准产出——标注后继续
+        return {"ran": True, "ok": False, "exit": type(e).__name__, "elapsed_s": 0.0}
+
+
+def _db_conn(root: Path) -> sqlite3.Connection | None:
+    db = root / ".codegraph" / "codegraph.db"
+    if not db.exists():
+        return None
+    return sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+
+
+# ---------------------------------------------------------------------------
+# (a) 合并栈：ranked_context + get_node(body) 复刻
+# ---------------------------------------------------------------------------
+
+def _merged_stack(root: Path, conn: sqlite3.Connection | None, G, query: str, budget: int) -> dict:
+    """搜索（ranked_context 输出全文）+ 取 top-1 复刻 get_node body 输出，累计 token."""
+    r = ranked_context(root, query, token_budget=budget)
+    search_out = format_ranked(r)
+    search_tokens, _ = _count_tokens(search_out)
+    res = r.get("results", [])
+    top5_ids = [x["id"] for x in res[:5]]
+    fetch_tokens, fetch_label, fetch_ok = 0, None, False
+    if res and conn is not None:
+        nid = res[0]["id"]
+        row = conn.execute(
+            "SELECT file_path, start_line, end_line, signature, docstring "
+            "FROM nodes WHERE id = ?", (nid,)).fetchone()
+        if row is None:
+            m = re.match(r"^(.*)__cg\d+$", nid)
+            if m:
+                row = conn.execute(
+                    "SELECT file_path, start_line, end_line, signature, docstring "
+                    "FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
+        if row is not None and row[0]:
+            d = G.nodes[nid] if (G is not None and nid in G) else {}
+            short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
+            card = [_serve._format_node_card(G, nid, d)] if (G is not None and nid in G) else [
+                f"Node: {nid}"]
+            sig = (row[3] or "").strip()
+            doc = (row[4] or "").strip()
+            sig_line = _serve._signature_line(sig, short) if sig else ""
+            if sig_line:
+                card.append(f"  Signature: {sig_line}")
+            if doc:
+                card.append(f"  Doc: {_serve.sanitize_label(doc.splitlines()[0])}")
+            text, ok, _s, _e = _serve._slice_source(
+                root, row[0], row[1], row[2], short,
+                signature=sig_line or None, pad=0)
+            if ok:
+                card.append("Code:")
+                card.extend(f"  {ln}" for ln in text.splitlines())
+            else:
+                card.append("Code: (slice unavailable — line drift detected; source body omitted)")
+            fetch_out = "\n".join(card)
+            fetch_tokens, _ = _count_tokens(fetch_out)
+            fetch_label = str(d.get("label", nid)) if d else nid
+            fetch_ok = ok
+    return {
+        "search_tokens": search_tokens,
+        "fetch_tokens": fetch_tokens,
+        "fetch_label": fetch_label,
+        "fetch_ok": fetch_ok,
+        "total_tokens": search_tokens + fetch_tokens,
+        "top5_ids": top5_ids,
+    }
+
+
+def _recall(results_top5: list[str], expect: list[str], ids_only: bool = True) -> float:
+    """命中@5：期望符号 id 出现在 top5 结果 id 中的比例（与金标测试 _recall 同口径）。"""
+    hit = sum(1 for eid in expect if eid in results_top5)
+    return hit / len(expect)
+
+
+# ---------------------------------------------------------------------------
+# (b) read/grep 脚本模拟（Python 等价，R4-3；零 shell 管道，R5-1）
+# ---------------------------------------------------------------------------
+
+def _grep_read_sim(root: Path, conn: sqlite3.Connection | None, expect: list[str],
+                   query: str) -> dict:
+    """首 token 子串扫描（≈grep -rln）+ 按序读命中文件头部 200 行，tiktoken 累计.
+
+    命中检测 ground truth：expect 符号 id → DB file_path（基准只读一次 DB 做期望定位，
+    模拟的搜索行为只用查询首 token，不泄漏图知识进搜索）。file: 前缀 id 直接取路径。
+    """
+    needle = query.split()[0] if query.split() else query
+    # ground truth：期望符号所在文件
+    gt_files: list[str] = []
+    if conn is not None:
+        for eid in expect:
+            row = conn.execute("SELECT file_path FROM nodes WHERE id = ?", (eid,)).fetchone()
+            if row and row[0]:
+                gt_files.append(row[0].replace("\\", "/"))
+            elif eid.startswith("file:"):
+                gt_files.append(eid[len("file:"):].replace("\\", "/"))
+    gt_set = set(gt_files)
+
+    # 1) rglob 收集 *.py → 逐文件首 token 子串扫描得命中列表（≈ grep -rln）
+    hit_files: list[str] = []
+    matched_lines: list[str] = []
+    try:
+        for p in root.rglob("*.py"):
+            rel = p.relative_to(root).as_posix()
+            if ".venv" in rel or "/build/" in rel or rel.startswith("build/"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if needle in text:
+                hit_files.append(rel)
+                matched_lines.extend(
+                    ln for ln in text.splitlines() if needle in ln)
+    except OSError:
+        pass
+
+    # 2) 按序模拟 agent 读取（每命中文件读头部 200 行），命中期望符号则停
+    read_tokens = 0
+    read_files: list[str] = []
+    rank = None
+    for rel in hit_files:
+        read_files.append(rel)
+        try:
+            lines = (root / rel).read_text(encoding="utf-8", errors="ignore").splitlines()[:_READ_HEAD_LINES]
+        except OSError:
+            lines = []
+        read_tokens += _count_tokens("\n".join(lines))[0]
+        if rel in gt_set:
+            rank = len(read_files)
+            break
+    grep_tokens = _count_tokens("\n".join(matched_lines))[0]
+    return {
+        "needle": needle,
+        "grep_hit_files": len(hit_files),
+        "grep_tokens": grep_tokens,
+        "read_files": len(read_files),
+        "read_tokens": read_tokens,
+        "total_tokens": grep_tokens + read_tokens,
+        "hit5": 1.0 if rank is not None and rank <= 5 else 0.0,
+        "rank": rank,
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="§8 效率基准：合并栈 vs read/grep（token/命中@5）")
+    ap.add_argument("--root", default=_DEFAULT_ROOT, help="代码根（默认与金标 GRAPHIFY_GOLDEN_ROOT 同源）")
+    ap.add_argument("--budget", type=int, default=2000, help="ranked_context token_budget")
+    ap.add_argument("--tasks", type=int, default=_DEFAULT_TASKS, help="金标集固定任务数（默认前 12）")
+    ap.add_argument("--rebuild", dest="rebuild", action="store_true", default=True,
+                    help="基准前对 --root 跑 rebuild_entry 全量重建（默认开，保证同一起跑线）")
+    ap.add_argument("--skip-rebuild", dest="rebuild", action="store_false",
+                    help="跳过 rebuild（DB 已 fresh 的只读跑用；结果 JSON 如实标注）")
+    ap.add_argument("--out", default=None, help="结果 JSON 路径（默认 benchmarks/results-<date>.json）")
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    golden = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
+    tasks = golden[:_DEFAULT_TASKS] if args.tasks >= _DEFAULT_TASKS else golden[:args.tasks]
+
+    rebuild_info = _run_rebuild(root) if args.rebuild else {
+        "ran": False, "ok": None, "exit": "skipped",
+        "elapsed_s": 0.0, "note": "DB 与任务集已核对 fresh（golden 门过）",
+    }
+
+    conn = _db_conn(root)
+    # 合并栈 fetch 需要图（_format_node_card/_slice_source）——用 serve._load_graph
+    # （nx.Graph，与 get_node handler 的 G 同源），不是 ranked._load_graph（B1 视图返回
+    # (degree, collision_bases, nodes) 元组，无 .nodes/.degree）。
+    G = None
+    if conn is not None:
+        try:
+            G = _serve._load_graph(str(root / "graphify-out" / "graph.json"))
+        except Exception:
+            G = None
+
+    rows = []
+    for item in tasks:
+        q = item["q"]
+        expect = item["expect"]
+        merged = _merged_stack(root, conn, G, q, args.budget)
+        merged["hit5"] = _recall(merged.pop("top5_ids"), expect)
+        gr = _grep_read_sim(root, conn, expect, q)
+        rows.append({"q": q, "type": item.get("type"), "expect": expect, "merged": merged, "grep_read": gr})
+
+    n = len(rows)
+    m_total = sum(r["merged"]["total_tokens"] for r in rows)
+    g_total = sum(r["grep_read"]["total_tokens"] for r in rows)
+    m_hit5 = sum(r["merged"]["hit5"] for r in rows) / n
+    g_hit5 = sum(r["grep_read"]["hit5"] for r in rows) / n
+    summary = {
+        "tasks": n,
+        "merged_total_tokens": m_total,
+        "grep_read_total_tokens": g_total,
+        "merged_mean_hit5": round(m_hit5, 3),
+        "grep_read_mean_hit5": round(g_hit5, 3),
+        "merged_pct_of_grep_read": round(100.0 * m_total / g_total, 1) if g_total else None,
+    }
+
+    _date = date.today().isoformat()
+    out_path = Path(args.out) if args.out else _BENCH_ROOT / "benchmarks" / f"results-{_date}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result = {
+        "benchmark": "efficiency_benchmark",
+        "date": _date,
+        "pinned_commit": _pinned_commit(),
+        "root": str(root),
+        "token_count": _count_tokens("")[1],   # tiktoken | estimate（declared）
+        "rebuild": rebuild_info,
+        "task_set": {"source": "tests/fixtures/ranked_golden.json",
+                     "slice": f"first {n} entries", "n": n},
+        "tasks": rows,
+        "summary": summary,
+    }
+    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "pinned_commit": result["pinned_commit"],
+        "rebuild": rebuild_info,
+        "summary": summary,
+    }, ensure_ascii=False, indent=2))
+    print(f"results -> {out_path}")
+
+
+if __name__ == "__main__":
+    main()

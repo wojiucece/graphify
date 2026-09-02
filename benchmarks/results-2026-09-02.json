@@ -1,0 +1,343 @@
+{
+  "benchmark": "efficiency_benchmark",
+  "date": "2026-09-02",
+  "pinned_commit": "012df3a035673cdb631ee6c071af678ab2ab69ba",
+  "root": "D:\\code\\graphify_fork",
+  "token_count": "estimate",
+  "rebuild": {
+    "ran": false,
+    "ok": null,
+    "exit": "skipped",
+    "elapsed_s": 0.0,
+    "note": "DB 与任务集已核对 fresh（golden 门过）"
+  },
+  "task_set": {
+    "source": "tests/fixtures/ranked_golden.json",
+    "slice": "first 12 entries",
+    "n": 12
+  },
+  "tasks": [
+    {
+      "q": "sanitize_label",
+      "type": "identifier",
+      "expect": [
+        "function:fdcadfc04d5b1d422f7269791519d40a",
+        "function:16cf7454816d964391dae08b38ca4ddb"
+      ],
+      "merged": {
+        "search_tokens": 508,
+        "fetch_tokens": 163,
+        "fetch_label": "sanitize_label",
+        "fetch_ok": true,
+        "total_tokens": 671,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "sanitize_label",
+        "grep_hit_files": 20,
+        "grep_tokens": 2785,
+        "read_files": 4,
+        "read_tokens": 7880,
+        "total_tokens": 10665,
+        "hit5": 1.0,
+        "rank": 4
+      }
+    },
+    {
+      "q": "normalize_id",
+      "type": "identifier",
+      "expect": [
+        "function:555c22d0aaf1717e8bb1824c08198272",
+        "function:688e77cebb686b03a1e8b26d08cbdc6e"
+      ],
+      "merged": {
+        "search_tokens": 680,
+        "fetch_tokens": 495,
+        "fetch_label": "normalize_id",
+        "fetch_ok": true,
+        "total_tokens": 1175,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "normalize_id",
+        "grep_hit_files": 24,
+        "grep_tokens": 3084,
+        "read_files": 3,
+        "read_tokens": 5706,
+        "total_tokens": 8790,
+        "hit5": 1.0,
+        "rank": 3
+      }
+    },
+    {
+      "q": "god_nodes",
+      "type": "identifier",
+      "expect": [
+        "function:802eccc5d881726469dd7574f42e11e8",
+        "variable:39e9ec56d8871edf5598b407b4000277",
+        "function:856f99c8da87cbc610f90db87294e5b0"
+      ],
+      "merged": {
+        "search_tokens": 1341,
+        "fetch_tokens": 289,
+        "fetch_label": "god_nodes",
+        "fetch_ok": true,
+        "total_tokens": 1630,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "god_nodes",
+        "grep_hit_files": 50,
+        "grep_tokens": 3353,
+        "read_files": 1,
+        "read_tokens": 1961,
+        "total_tokens": 5314,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "query_graph",
+      "type": "identifier",
+      "expect": [
+        "function:3cec8f34ca5c1ffc042b0e24629121bd",
+        "function:3a21d01cc593032c2b74b8b9d6eaa214"
+      ],
+      "merged": {
+        "search_tokens": 727,
+        "fetch_tokens": 228,
+        "fetch_label": "_query_graph",
+        "fetch_ok": true,
+        "total_tokens": 955,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "query_graph",
+        "grep_hit_files": 15,
+        "grep_tokens": 1484,
+        "read_files": 2,
+        "read_tokens": 3801,
+        "total_tokens": 5285,
+        "hit5": 1.0,
+        "rank": 2
+      }
+    },
+    {
+      "q": "watch 防抖 降级",
+      "type": "cjk",
+      "expect": [
+        "file:graphify/watch.py",
+        "function:5c7a654bb706eeb7bddd8499a971f087"
+      ],
+      "merged": {
+        "search_tokens": 1573,
+        "fetch_tokens": 49,
+        "fetch_label": "graphify/watch.py",
+        "fetch_ok": false,
+        "total_tokens": 1622,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "watch",
+        "grep_hit_files": 73,
+        "grep_tokens": 13606,
+        "read_files": 12,
+        "read_tokens": 26903,
+        "total_tokens": 40509,
+        "hit5": 0.0,
+        "rank": 12
+      }
+    },
+    {
+      "q": "rebuild 状态文件",
+      "type": "cjk",
+      "expect": [
+        "function:23976b645364b9dcf281440db703e0d4",
+        "function:d21fdd901881866c348635e43d9f4307",
+        "file:scripts/rebuild_entry.py"
+      ],
+      "merged": {
+        "search_tokens": 1835,
+        "fetch_tokens": 400,
+        "fetch_label": "test_rebuild_requeued_on_db_changes_during_rebuild",
+        "fetch_ok": true,
+        "total_tokens": 2235,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "rebuild",
+        "grep_hit_files": 88,
+        "grep_tokens": 27441,
+        "read_files": 12,
+        "read_tokens": 26012,
+        "total_tokens": 53453,
+        "hit5": 0.0,
+        "rank": 12
+      }
+    },
+    {
+      "q": "rebuild_entry 锁 触发流程",
+      "type": "traversal",
+      "expect": [
+        "file:scripts/rebuild_entry.py",
+        "function:a553e9de347b2741165f50cb0027be3b",
+        "file:tests/test_rebuild_entry.py"
+      ],
+      "merged": {
+        "search_tokens": 186,
+        "fetch_tokens": 1969,
+        "fetch_label": "scripts/rebuild_entry.py",
+        "fetch_ok": true,
+        "total_tokens": 2155,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "rebuild_entry",
+        "grep_hit_files": 24,
+        "grep_tokens": 2605,
+        "read_files": 2,
+        "read_tokens": 3860,
+        "total_tokens": 6465,
+        "hit5": 1.0,
+        "rank": 2
+      }
+    },
+    {
+      "q": "fetch_prs 到 compute_pr_impact 的调用链",
+      "type": "traversal",
+      "expect": [
+        "function:b802f43512b0ac51afdbea3b6a0d9ccf",
+        "function:2acd4998b992cf3fa9331da048850259"
+      ],
+      "merged": {
+        "search_tokens": 158,
+        "fetch_tokens": 379,
+        "fetch_label": "fetch_prs",
+        "fetch_ok": true,
+        "total_tokens": 537,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "fetch_prs",
+        "grep_hit_files": 6,
+        "grep_tokens": 305,
+        "read_files": 1,
+        "read_tokens": 1712,
+        "total_tokens": 2017,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "errno 处理",
+      "type": "gap",
+      "expect": [
+        "import:5b516cb733bd313b102f29ab2f059f2b"
+      ],
+      "merged": {
+        "search_tokens": 112,
+        "fetch_tokens": 45,
+        "fetch_label": "errno",
+        "fetch_ok": true,
+        "total_tokens": 157,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "errno",
+        "grep_hit_files": 2,
+        "grep_tokens": 41,
+        "read_files": 1,
+        "read_tokens": 1489,
+        "total_tokens": 1530,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "sys 模块",
+      "type": "gap",
+      "expect": [
+        "import:8422154bebe703b2341e84565bd82906",
+        "import:f1bd18f4f6157f4b42f212bc266947f9"
+      ],
+      "merged": {
+        "search_tokens": 1437,
+        "fetch_tokens": 44,
+        "fetch_label": "sys",
+        "fetch_ok": true,
+        "total_tokens": 1481,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "sys",
+        "grep_hit_files": 295,
+        "grep_tokens": 45483,
+        "read_files": 2,
+        "read_tokens": 3349,
+        "total_tokens": 48832,
+        "hit5": 1.0,
+        "rank": 2
+      }
+    },
+    {
+      "q": "build_from_json",
+      "type": "identifier",
+      "expect": [
+        "function:d54c718a29da41047b341435e4660790",
+        "function:f753a8ed308aed6d84ff6feefa1e3422"
+      ],
+      "merged": {
+        "search_tokens": 1704,
+        "fetch_tokens": 8028,
+        "fetch_label": "build_from_json",
+        "fetch_ok": true,
+        "total_tokens": 9732,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "build_from_json",
+        "grep_hit_files": 128,
+        "grep_tokens": 8664,
+        "read_files": 1,
+        "read_tokens": 2297,
+        "total_tokens": 10961,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "graph_diff",
+      "type": "identifier",
+      "expect": [
+        "function:54b6f1e092a5eeaa2301c8ad53dcbfe0",
+        "function:f5b1fa51a04e25e4134b64467adfc13e"
+      ],
+      "merged": {
+        "search_tokens": 531,
+        "fetch_tokens": 817,
+        "fetch_label": "graph_diff",
+        "fetch_ok": true,
+        "total_tokens": 1348,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "graph_diff",
+        "grep_hit_files": 14,
+        "grep_tokens": 894,
+        "read_files": 1,
+        "read_tokens": 1961,
+        "total_tokens": 2855,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    }
+  ],
+  "summary": {
+    "tasks": 12,
+    "merged_total_tokens": 23698,
+    "grep_read_total_tokens": 196676,
+    "merged_mean_hit5": 1.0,
+    "grep_read_mean_hit5": 0.833,
+    "merged_pct_of_grep_read": 12.0
+  }
+}

@@ -8,5 +8,15 @@
   {"q": "rebuild_entry 锁 触发流程", "type": "traversal", "expect": ["file:scripts/rebuild_entry.py", "function:a553e9de347b2741165f50cb0027be3b", "file:tests/test_rebuild_entry.py"]},
   {"q": "fetch_prs 到 compute_pr_impact 的调用链", "type": "traversal", "expect": ["function:b802f43512b0ac51afdbea3b6a0d9ccf", "function:2acd4998b992cf3fa9331da048850259"]},
   {"q": "errno 处理", "type": "gap", "gap": true, "expect": ["import:5b516cb733bd313b102f29ab2f059f2b"]},
-  {"q": "sys 模块", "type": "gap", "gap": true, "expect": ["import:8422154bebe703b2341e84565bd82906", "import:f1bd18f4f6157f4b42f212bc266947f9"]}
+  {"q": "sys 模块", "type": "gap", "gap": true, "expect": ["import:8422154bebe703b2341e84565bd82906", "import:f1bd18f4f6157f4b42f212bc266947f9"]},
+  {"q": "build_from_json", "type": "identifier", "expect": ["function:d54c718a29da41047b341435e4660790", "function:f753a8ed308aed6d84ff6feefa1e3422"]},
+  {"q": "graph_diff", "type": "identifier", "expect": ["function:54b6f1e092a5eeaa2301c8ad53dcbfe0", "function:f5b1fa51a04e25e4134b64467adfc13e"]},
+  {"q": "check_graph_file_size_cap", "type": "identifier", "expect": ["function:7f0e4f454047804eb2d5e740628198a4", "import:7ad496e699da101bb74d10bff9131361", "import:85de9a02ae898b9a89674e11f230a5ae"]},
+  {"q": "detect_backend", "type": "identifier", "expect": ["function:45d4a76c947815b90b7e4ff7967c0397"]},
+  {"q": "find_import_cycles", "type": "identifier", "expect": ["function:6bcb27a6e7284bb706fcba4fd6f2c835"]},
+  {"q": "to_obsidian", "type": "identifier", "expect": ["function:cd331a16a3ec7994bfec1626560fec1a"]},
+  {"q": "build_from_json 到 report 的调用链", "type": "traversal", "expect": ["function:d54c718a29da41047b341435e4660790", "function:f753a8ed308aed6d84ff6feefa1e3422"]},
+  {"q": "rebuild_entry 重建 锁", "type": "cjk", "expect": ["file:scripts/rebuild_entry.py", "function:a553e9de347b2741165f50cb0027be3b"]},
+  {"q": "datetime 处理", "type": "gap", "gap": true, "expect": ["import:938a443651af82378a61eccb7d03943d", "import:a7af471ea3ea41ac28f768f6ffdf4945"]},
+  {"q": "os.path 处理", "type": "gap", "gap": true, "expect": ["function:8f0e6f67cf3ecadee2f0ead44549e440", "function:dae7f18cc1ca095c4149e94428c5dc32"]}
 ]
