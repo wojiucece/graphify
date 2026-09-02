@@ -26,6 +26,12 @@ def _source_location(line: int | str | None) -> str | None:
         return line if line.startswith("L") else f"L{line}"
     return f"L{line}"
 
+def _qualified_name(scope_chain: tuple, name: str) -> str:
+    """Readable `Class::method` scope-chain name; bare name at module level."""
+    if scope_chain:
+        return "::".join((*scope_chain, name))
+    return name
+
 def _semantic_reference_edge(
     source: str,
     target: str,
@@ -1116,6 +1122,29 @@ def _scala_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple
         for c in node.children:
             if c.is_named:
                 _scala_collect_type_refs(c, source, generic, out)
+
+def _python_function_signature(node, source: bytes, *, drop_self: bool) -> str:
+    """Python function/method signature text, name excluded: `(a: int, b: str = "x") -> bool`.
+
+    Built from the `parameters` / `return_type` field nodes (not a raw source
+    slice) so params re-join canonically and a leading `self`/`cls` binding
+    param can be dropped for the CALL shape (`UserService(name: str)`) when
+    ``drop_self`` is set — i.e. for methods, where the receiver is implicit.
+    """
+    parts: list[str] = []
+    params_node = node.child_by_field_name("parameters")
+    if params_node is not None:
+        for child in params_node.children:
+            if child.is_named:
+                parts.append(_read_text(child, source))
+    if drop_self and parts and parts[0] in ("self", "cls"):
+        parts.pop(0)
+    sig = f"({', '.join(parts)})"
+    return_type = node.child_by_field_name("return_type")
+    if return_type is not None:
+        sig += " -> " + _read_text(return_type, source)
+    return sig
+
 
 def _python_collect_param_refs(params_node, source: bytes) -> list[tuple[str, str]]:
     """Collect type refs from each typed parameter under a `parameters` node."""
@@ -3002,7 +3031,10 @@ def _extract_generic(
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
     def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
-                 metadata: dict | None = None) -> None:
+                 metadata: dict | None = None, col: int | None = None,
+                 end_line: int | None = None, end_byte: int | None = None,
+                 signature: str | None = None,
+                 qualified_name: str | None = None) -> None:
         if nid in seen_ids:
             return
         seen_ids.add(nid)
@@ -3011,13 +3043,25 @@ def _extract_generic(
             merged.setdefault("namespace", ".".join(namespace_stack))
         if scope_stack and node_type != "namespace":
             merged.setdefault("scope_chain", list(scope_stack))
+        # Symbol nodes carry an exact start `L<line>:C<col>`; the file node and
+        # non-Python call sites pass no col and keep the legacy line-only form.
+        # end_line/end_byte are symbol-only too (build has no whitelist, so any
+        # of these pass straight through into graph.json).
         node = {
             "id": nid,
             "label": label,
             "file_type": "code",
             "source_file": str_path,
-            "source_location": f"L{line}",
+            "source_location": f"L{line}" if col is None else f"L{line}:C{col}",
         }
+        if end_line is not None:
+            node["end_line"] = end_line
+        if end_byte is not None:
+            node["end_byte"] = end_byte
+        if signature is not None:
+            node["signature"] = signature
+        if qualified_name is not None:
+            node["qualified_name"] = qualified_name
         if node_type:
             node["type"] = node_type
         if merged:
@@ -3070,7 +3114,12 @@ def _extract_generic(
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
-    def walk(node, parent_class_nid: str | None = None) -> None:
+    def walk(node, parent_class_nid: str | None = None,
+             qname_chain: tuple[str, ...] = ()) -> None:
+        # qname_chain: enclosing class-name segments for qualified_name. It is
+        # threaded exactly where parent_class_nid is (class body recursion
+        # extends it, the default recurse resets it), so it can never drift
+        # from the containment tree. Only the Python path consumes it today.
         t = node.type
 
         # Import types
@@ -3105,7 +3154,7 @@ def _extract_generic(
                 has_source = any(c.type == "string" for c in node.children)
                 if not has_source:
                     for child in node.children:
-                        walk(child, parent_class_nid)
+                        walk(child, parent_class_nid, qname_chain)
             return
 
         # Class types
@@ -3149,7 +3198,16 @@ def _extract_generic(
                 ):
                     metadata = dict(metadata or {})
                     metadata["is_partial"] = True
-            add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_python":
+                add_node(
+                    class_nid, class_name, line, metadata=metadata,
+                    col=node.start_point[1] + 1,
+                    end_line=node.end_point[0] + 1,
+                    end_byte=node.end_byte,
+                    qualified_name=_qualified_name(qname_chain, class_name),
+                )
+            else:
+                add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)
             # A nested class/object/trait is contained by its ENCLOSING type, not
@@ -3747,7 +3805,11 @@ def _extract_generic(
                 ruby_namespace.extend(ruby_segments)
                 try:
                     for child in body.children:
-                        walk(child, parent_class_nid=class_nid)
+                        walk(
+                            child,
+                            parent_class_nid=class_nid,
+                            qname_chain=qname_chain + (class_name,),
+                        )
                 finally:
                     if ruby_segments:
                         del ruby_namespace[-len(ruby_segments):]
@@ -4227,13 +4289,27 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
+            if config.ts_module == "tree_sitter_python":
+                # Methods (parent_class_nid set) drop the implicit self/cls
+                # binding param so the signature describes the CALL shape.
+                py_extra = dict(
+                    col=node.start_point[1] + 1,
+                    end_line=node.end_point[0] + 1,
+                    end_byte=node.end_byte,
+                    signature=_python_function_signature(
+                        node, source, drop_self=bool(parent_class_nid)
+                    ),
+                    qualified_name=_qualified_name(qname_chain, func_name),
+                )
+            else:
+                py_extra = {}
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, sanitized_name)
-                add_node(func_nid, f".{func_name}()", line)
+                add_node(func_nid, f".{func_name}()", line, **py_extra)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, sanitized_name)
-                add_node(func_nid, f"{func_name}()", line)
+                add_node(func_nid, f"{func_name}()", line, **py_extra)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":
@@ -4826,7 +4902,7 @@ def _extract_generic(
                             add_edge(owner_nid, target, "references", deco_line,
                                      context="decorator")
             for child in node.children:
-                walk(child, parent_class_nid=parent_class_nid)
+                walk(child, parent_class_nid=parent_class_nid, qname_chain=qname_chain)
             return
 
         # #2565: a `companion object` is not an attribution scope of its own —
@@ -4840,9 +4916,11 @@ def _extract_generic(
             for child in node.children:
                 if child.type == "class_body":
                     for member in child.children:
-                        walk(member, parent_class_nid=parent_class_nid)
+                        walk(member, parent_class_nid=parent_class_nid,
+                             qname_chain=qname_chain)
                 else:
-                    walk(child, parent_class_nid=parent_class_nid)
+                    walk(child, parent_class_nid=parent_class_nid,
+                         qname_chain=qname_chain)
             return
 
         # #2551: tree-sitter ERROR recovery can wrap declarations that plainly
@@ -4853,7 +4931,7 @@ def _extract_generic(
         # class linkage for whatever declarations were recovered inside it.
         if t == "ERROR":
             for child in node.children:
-                walk(child, parent_class_nid=parent_class_nid)
+                walk(child, parent_class_nid=parent_class_nid, qname_chain=qname_chain)
             return
 
         # Default: recurse
