@@ -53,12 +53,20 @@ _SYMBOL_KINDS = frozenset({
 
 
 def _application_entries(project_root: Path | None, G: nx.DiGraph) -> set[str]:
-    """应用型入口：project_root 给定且存在 __main__.py 时取该文件内节点；
-    否则 main/__main__ 短名符号（合并图节点无 name 属性——R3-2 label 末段）。
-    实测 fork 合并图 main/__main__ 命中 39 个（含 import 节点，无出边、无害），锚点充足。"""
-    if project_root is not None and (project_root / "__main__.py").exists():
-        return {n for n, d in G.nodes(data=True)
-                if str(d.get("source_file", "")).endswith("__main__.py")}
+    """应用型入口：图内存在 __main__.py 节点（任意深度，Python 惯例是包内
+    __main__.py——fork 自己就是 graphify/__main__.py，根目录 project_root/__main__.py
+    形态近乎不出现）时取这些文件内节点；否则 main/__main__ 短名符号（合并图节点无
+    name 属性——R3-2 label 末段）。
+    M1（owner 审核）：存在性检查放宽为全图扫 source_file.endswith("__main__.py")
+    节点非空即走 application 分支——与下方过滤分支同用 endswith 任意深度（L2 两分支
+    口径对齐）；修复前根目录单点检查对包内 __main__.py 永不命中，39 个同名 main
+    （含 28 个 import 型无出边节点 + 11 个 function 型 bench/fixture main）成为唯一
+    工作路径 = 入口集过宽、死代码系统性少报。project_root 参数 M1 后不再参与
+    __main__.py 检测（保留签名以兼容 brief 接口与 serve 闭包调用）。"""
+    main_py_nodes = {n for n, d in G.nodes(data=True)
+                     if str(d.get("source_file", "")).endswith("__main__.py")}
+    if main_py_nodes:
+        return main_py_nodes
     mains = {n for n, d in G.nodes(data=True)
              if _symbol_short_name(d, n) in ("main", "__main__")}
     if mains:

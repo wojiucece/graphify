@@ -49,3 +49,36 @@ def test_find_dead_code_rejects_undirected_graph():
     UG = nx.Graph(); UG.add_edge("main", "util")
     with _pt.raises(TypeError):
         find_dead_code(UG)
+
+def test_auto_mode_package_level_main_py(tmp_path):
+    """M1（owner 审核）：包内 __main__.py（非根目录）→ auto 探测走 application 分支。
+    全图扫 source_file.endswith('__main__.py') 任意深度——Python 惯例是包内 __main__.py
+    （fork 自己是 graphify/__main__.py），根目录 project_root/__main__.py 形态近乎不出现；
+    修复前根目录单点检查对该形态永不命中，39 个同名 main 成唯一工作路径 = 入口过宽。"""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__main__.py").write_text("def main(): ...\n", encoding="utf-8")
+    G = _G([("main", "util")],
+           {"main": "function", "util": "function", "orphan": "function"})
+    for n in G.nodes:
+        G.nodes[n]["source_file"] = "pkg/__main__.py" if n == "main" else "pkg/mod.py"
+    r = find_dead_code(G, project_root=tmp_path)
+    assert r["entry_mode"] == "application"      # 走 __main__.py 分支，非短名 main 判定
+    assert "main" not in r["unreachable"]        # 入口可达
+    assert "orphan" in r["unreachable"]
+
+def test_import_derivation_pass_through_evidence():
+    """SDD review Minor-2：import 推导隔离锁定（此前只在真实图 fork 实测验证）。
+    kind='import' 节点本身不算不可达、不进符号总数分母；relation='imports' 边是使用
+    证据——入口经 import 边可达的被导入符号不算死代码；真孤儿仍报。"""
+    G = nx.DiGraph()
+    G.add_node("main", kind="function", label="main")
+    G.add_node("imp", kind="import", label="pkg.mod")     # import 语句节点（仅 contains 挂载）
+    G.add_node("used", kind="function", label="used()")   # 被入口 import 的符号
+    G.add_node("dead", kind="function", label="dead()")   # 真孤儿
+    G.add_edge("main", "imp", relation="contains")        # import 节点经 contains 挂文件下
+    G.add_edge("main", "used", relation="imports")        # import 边：使用证据
+    r = find_dead_code(G, entry_mode="application")
+    assert "imp" not in r["unreachable"]      # import 节点不算不可达
+    assert "used" not in r["unreachable"]     # import 边使 used 可达（透传证据）
+    assert "dead" in r["unreachable"]         # 孤儿仍报
+    assert r["scanned"] == 3                  # 分母=3 符号（import 节点不入分母）

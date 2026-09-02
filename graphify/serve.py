@@ -1560,6 +1560,10 @@ _REBUILD_STALE_FLOOR_S = 1800  # 自愈上限 30 分钟，不依赖人工干预
 
 # 检索型工具清单（判据 = 响应内容反映图数据现状）；新工具（B1/B3/C 系）登记处——
 # 清单外工具裸 str 直通，新增检索型工具若拒绝登记则出口不予合并。
+# C 工具族空结果语义（M2，Task 13 前统一登记，防第三种发明）：
+#   C1 find_dead_code       空 = 有效结论（无死代码），found 恒 True + low_confidence
+#   C3 get_changed_symbols  空 = absent（无变更信息 ≠ ok）
+#   C4 get_hotspots         空 = absent（通常环境缺轴：非 git/无 DB）
 _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_community",
                            "god_nodes", "shortest_path", "graph_stats",
                            "get_ranked_context",  # CUSTOM: B1 融合检索登记
