@@ -1,9 +1,10 @@
 {
   "benchmark": "efficiency_benchmark",
   "date": "2026-09-02",
-  "pinned_commit": "19d9a75ad16d3a318ab5dfeeb4fe9faee5c88ece",
+  "pinned_commit": "8f8159ac55c1dd3f74f4bb4fd2e299c347a83eca",
   "root": "D:\\code\\graphify_fork",
-  "token_count": "estimate",
+  "root_source": "env GRAPHIFY_GOLDEN_ROOT",
+  "token_count": "tiktoken",
   "rebuild": {
     "ran": false,
     "ok": null,
@@ -25,20 +26,20 @@
         "function:16cf7454816d964391dae08b38ca4ddb"
       ],
       "merged": {
-        "search_tokens": 508,
-        "fetch_tokens": 163,
+        "search_tokens": 789,
+        "fetch_tokens": 174,
         "fetch_label": "sanitize_label",
         "fetch_ok": true,
-        "total_tokens": 671,
+        "total_tokens": 963,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "sanitize_label",
         "grep_hit_files": 20,
-        "grep_tokens": 2785,
+        "grep_tokens": 2821,
         "read_files": 4,
-        "read_tokens": 7880,
-        "total_tokens": 10665,
+        "read_tokens": 7632,
+        "total_tokens": 10453,
         "hit5": 1.0,
         "rank": 4
       }
@@ -51,20 +52,20 @@
         "function:688e77cebb686b03a1e8b26d08cbdc6e"
       ],
       "merged": {
-        "search_tokens": 680,
-        "fetch_tokens": 495,
+        "search_tokens": 1058,
+        "fetch_tokens": 535,
         "fetch_label": "normalize_id",
         "fetch_ok": true,
-        "total_tokens": 1175,
+        "total_tokens": 1593,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "normalize_id",
         "grep_hit_files": 24,
-        "grep_tokens": 3084,
+        "grep_tokens": 3164,
         "read_files": 3,
-        "read_tokens": 5706,
-        "total_tokens": 8790,
+        "read_tokens": 5582,
+        "total_tokens": 8746,
         "hit5": 1.0,
         "rank": 3
       }
@@ -78,20 +79,20 @@
         "function:856f99c8da87cbc610f90db87294e5b0"
       ],
       "merged": {
-        "search_tokens": 1341,
-        "fetch_tokens": 289,
+        "search_tokens": 2058,
+        "fetch_tokens": 300,
         "fetch_label": "god_nodes",
         "fetch_ok": true,
-        "total_tokens": 1630,
+        "total_tokens": 2358,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "god_nodes",
-        "grep_hit_files": 50,
-        "grep_tokens": 3353,
+        "grep_hit_files": 51,
+        "grep_tokens": 3661,
         "read_files": 1,
-        "read_tokens": 1961,
-        "total_tokens": 5314,
+        "read_tokens": 2054,
+        "total_tokens": 5715,
         "hit5": 1.0,
         "rank": 1
       }
@@ -104,20 +105,20 @@
         "function:3a21d01cc593032c2b74b8b9d6eaa214"
       ],
       "merged": {
-        "search_tokens": 727,
-        "fetch_tokens": 228,
+        "search_tokens": 1106,
+        "fetch_tokens": 307,
         "fetch_label": "_query_graph",
         "fetch_ok": true,
-        "total_tokens": 955,
+        "total_tokens": 1413,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "query_graph",
-        "grep_hit_files": 15,
-        "grep_tokens": 1484,
+        "grep_hit_files": 16,
+        "grep_tokens": 1629,
         "read_files": 2,
-        "read_tokens": 3801,
-        "total_tokens": 5285,
+        "read_tokens": 4246,
+        "total_tokens": 5875,
         "hit5": 1.0,
         "rank": 2
       }
@@ -130,20 +131,20 @@
         "function:5c7a654bb706eeb7bddd8499a971f087"
       ],
       "merged": {
-        "search_tokens": 1573,
-        "fetch_tokens": 49,
+        "search_tokens": 2097,
+        "fetch_tokens": 58,
         "fetch_label": "graphify/watch.py",
         "fetch_ok": false,
-        "total_tokens": 1622,
+        "total_tokens": 2155,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "watch",
         "grep_hit_files": 73,
-        "grep_tokens": 13606,
+        "grep_tokens": 13568,
         "read_files": 12,
-        "read_tokens": 26903,
-        "total_tokens": 40509,
+        "read_tokens": 27559,
+        "total_tokens": 41127,
         "hit5": 0.0,
         "rank": 12
       }
@@ -157,20 +158,20 @@
         "file:scripts/rebuild_entry.py"
       ],
       "merged": {
-        "search_tokens": 1835,
-        "fetch_tokens": 400,
+        "search_tokens": 2089,
+        "fetch_tokens": 525,
         "fetch_label": "test_rebuild_requeued_on_db_changes_during_rebuild",
         "fetch_ok": true,
-        "total_tokens": 2235,
+        "total_tokens": 2614,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "rebuild",
         "grep_hit_files": 88,
-        "grep_tokens": 27441,
+        "grep_tokens": 28040,
         "read_files": 12,
-        "read_tokens": 26012,
-        "total_tokens": 53453,
+        "read_tokens": 27121,
+        "total_tokens": 55161,
         "hit5": 0.0,
         "rank": 12
       }
@@ -184,20 +185,20 @@
         "file:tests/test_rebuild_entry.py"
       ],
       "merged": {
-        "search_tokens": 186,
-        "fetch_tokens": 1969,
+        "search_tokens": 267,
+        "fetch_tokens": 2773,
         "fetch_label": "scripts/rebuild_entry.py",
         "fetch_ok": true,
-        "total_tokens": 2155,
+        "total_tokens": 3040,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "rebuild_entry",
         "grep_hit_files": 24,
-        "grep_tokens": 2605,
+        "grep_tokens": 3372,
         "read_files": 2,
-        "read_tokens": 3860,
-        "total_tokens": 6465,
+        "read_tokens": 4972,
+        "total_tokens": 8344,
         "hit5": 1.0,
         "rank": 2
       }
@@ -210,20 +211,20 @@
         "function:2acd4998b992cf3fa9331da048850259"
       ],
       "merged": {
-        "search_tokens": 158,
-        "fetch_tokens": 379,
+        "search_tokens": 239,
+        "fetch_tokens": 388,
         "fetch_label": "fetch_prs",
         "fetch_ok": true,
-        "total_tokens": 537,
+        "total_tokens": 627,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "fetch_prs",
         "grep_hit_files": 6,
-        "grep_tokens": 305,
+        "grep_tokens": 350,
         "read_files": 1,
-        "read_tokens": 1712,
-        "total_tokens": 2017,
+        "read_tokens": 1820,
+        "total_tokens": 2170,
         "hit5": 1.0,
         "rank": 1
       }
@@ -235,20 +236,20 @@
         "import:5b516cb733bd313b102f29ab2f059f2b"
       ],
       "merged": {
-        "search_tokens": 112,
-        "fetch_tokens": 45,
+        "search_tokens": 169,
+        "fetch_tokens": 68,
         "fetch_label": "errno",
         "fetch_ok": true,
-        "total_tokens": 157,
+        "total_tokens": 237,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "errno",
         "grep_hit_files": 2,
-        "grep_tokens": 41,
+        "grep_tokens": 46,
         "read_files": 1,
-        "read_tokens": 1489,
-        "total_tokens": 1530,
+        "read_tokens": 1508,
+        "total_tokens": 1554,
         "hit5": 1.0,
         "rank": 1
       }
@@ -261,20 +262,20 @@
         "import:f1bd18f4f6157f4b42f212bc266947f9"
       ],
       "merged": {
-        "search_tokens": 1437,
-        "fetch_tokens": 44,
+        "search_tokens": 2124,
+        "fetch_tokens": 65,
         "fetch_label": "sys",
         "fetch_ok": true,
-        "total_tokens": 1481,
+        "total_tokens": 2189,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "sys",
-        "grep_hit_files": 295,
-        "grep_tokens": 45483,
+        "grep_hit_files": 296,
+        "grep_tokens": 46276,
         "read_files": 2,
-        "read_tokens": 3349,
-        "total_tokens": 48832,
+        "read_tokens": 3434,
+        "total_tokens": 49710,
         "hit5": 1.0,
         "rank": 2
       }
@@ -287,20 +288,20 @@
         "function:f753a8ed308aed6d84ff6feefa1e3422"
       ],
       "merged": {
-        "search_tokens": 1704,
-        "fetch_tokens": 8028,
+        "search_tokens": 2070,
+        "fetch_tokens": 7214,
         "fetch_label": "build_from_json",
         "fetch_ok": true,
-        "total_tokens": 9732,
+        "total_tokens": 9284,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "build_from_json",
         "grep_hit_files": 128,
-        "grep_tokens": 8664,
+        "grep_tokens": 8562,
         "read_files": 1,
-        "read_tokens": 2297,
-        "total_tokens": 10961,
+        "read_tokens": 2319,
+        "total_tokens": 10881,
         "hit5": 1.0,
         "rank": 1
       }
@@ -313,20 +314,20 @@
         "function:f5b1fa51a04e25e4134b64467adfc13e"
       ],
       "merged": {
-        "search_tokens": 531,
-        "fetch_tokens": 817,
+        "search_tokens": 834,
+        "fetch_tokens": 835,
         "fetch_label": "graph_diff",
         "fetch_ok": true,
-        "total_tokens": 1348,
+        "total_tokens": 1669,
         "hit5": 1.0
       },
       "grep_read": {
         "needle": "graph_diff",
         "grep_hit_files": 14,
-        "grep_tokens": 894,
+        "grep_tokens": 1249,
         "read_files": 1,
-        "read_tokens": 1961,
-        "total_tokens": 2855,
+        "read_tokens": 2054,
+        "total_tokens": 3303,
         "hit5": 1.0,
         "rank": 1
       }
@@ -334,10 +335,11 @@
   ],
   "summary": {
     "tasks": 12,
-    "merged_total_tokens": 23698,
-    "grep_read_total_tokens": 196676,
+    "merged_total_tokens": 28142,
+    "grep_read_total_tokens": 203039,
     "merged_mean_hit5": 1.0,
     "grep_read_mean_hit5": 0.833,
-    "merged_pct_of_grep_read": 12.0
+    "merged_pct_of_grep_read": 13.9,
+    "hit5_note": "merged=expect 集上 recall 分数均值（连续）；grep_read=前 5 次读取内命中首期望文件的二值均值——两臂口径不同，不可直接比较"
   }
 }
