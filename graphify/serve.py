@@ -2422,7 +2422,8 @@ def _build_server(graph_path: str):
                     "(anchored to the git HEAD recorded in the rebuild state file). "
                     "Lists the changed files (matching git diff --stat) and the "
                     "graph symbols inside them. Falls back to an unanchored basis "
-                    "when git or the git baseline is unavailable."
+                    "when git or the git baseline is unavailable. "
+                    "Untracked new files are not included (git diff semantics)."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
