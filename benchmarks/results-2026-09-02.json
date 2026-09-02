@@ -1,7 +1,7 @@
 {
   "benchmark": "efficiency_benchmark",
   "date": "2026-09-02",
-  "pinned_commit": "012df3a035673cdb631ee6c071af678ab2ab69ba",
+  "pinned_commit": "19d9a75ad16d3a318ab5dfeeb4fe9faee5c88ece",
   "root": "D:\\code\\graphify_fork",
   "token_count": "estimate",
   "rebuild": {
