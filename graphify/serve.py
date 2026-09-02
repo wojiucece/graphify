@@ -1564,7 +1564,8 @@ _SEARCH_TOOLS = frozenset({"query_graph", "get_node", "get_neighbors", "get_comm
                            "god_nodes", "shortest_path", "graph_stats",
                            "get_ranked_context",  # CUSTOM: B1 融合检索登记
                            "get_changed_symbols",  # CUSTOM: C3 git 轴登记（Task 10）
-                           "get_hotspots"})  # CUSTOM: C4 热区（churn×度数代理）登记（Task 11）
+                           "get_hotspots",  # CUSTOM: C4 热区（churn×度数代理）登记（Task 11）
+                           "find_dead_code"})  # CUSTOM: C1 死代码（入口闭包+闸门）登记（Task 12）
 
 
 def _envelope(text: str, verdict: str, freshness: str, **extra) -> str:
@@ -1881,13 +1882,17 @@ def _digraph_view(graph_path) -> nx.DiGraph:
     json.loads；独立 _DIGRAPH_CACHE 已删除。serve 接 scripts 走既有 lazy sys.path+import
     先例（_tool_get_ranked_context 同款，graphify 包不反向依赖 scripts/ 只在调用时挂
     sys.path——rebuild_entry 先例，非破例）。
-    节点/边属性（kind/label/source_file/relation/confidence）原样带上（E2/N4 纪律）。"""
+    节点/边属性（kind/label/source_file/relation/confidence）原样带上（E2/N4 纪律）。
+    I4（Task 12 实测）：serve 侧 active_graph_path 恒为 str（_default_graph_path 与
+    _select_graph 均 str(Path(...))）——ranked.get_digraph/_cache_load 走 graph_path.stat()
+    要求 Path，str 直传会 AttributeError。入口统一 Path() 归一化（B3 与 C1 两个调用点
+    同受益；Task 9 仅以 Path 测试，str 生产路径为未覆盖的集成盲区，Task 12 闭包实测撞出）。"""
     import sys as _sys
     _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
     if _scripts_dir not in _sys.path:
         _sys.path.insert(0, _scripts_dir)
     from ranked import get_digraph
-    return get_digraph(graph_path)
+    return get_digraph(Path(graph_path))
 
 
 def _reverse_closure(DG: nx.DiGraph, node, depth, top_k) -> tuple[list[str], int]:
@@ -2245,6 +2250,43 @@ def _parse_top_n(arguments: dict) -> int:
         return 10
 
 
+# === CUSTOM: C1 find_dead_code 正文装配（Phase 4 Task 12）=====================
+
+
+def _format_dead_code(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
+    """C1 正文装配：不可达符号清单（advisory——静态可达性看不见动态分发，声明不声称
+    确定性）。gate_failed（不可达率 >50%）时降级为孤儿符号提示措辞——样本过大/图覆盖
+    demo/test 内容或边稀疏，正文显式声明非确定性判定（legitimate degraded delivery，
+    不是失败）。label/kind/source_file 取自 _digraph_view 节点属性（R3-2 短名事实源）。"""
+    mode = r["entry_mode"]
+    unreach = r["unreachable"]
+    rate = r["unreachable_rate"]
+    scanned = int(r["scanned"])
+    if scanned == 0:
+        # 退化形态：图中无代码符号节点（节点缺 kind 属性——非 codegraph-merged 图，
+        # 如 graphify 原生 AST 图）。诚实声明，不谎报 "0 of 0 unreachable"。
+        return ("Dead-code scan: no code symbol nodes in this graph (nodes lack kind "
+                "attributes — not a codegraph-merged graph). Advisory only.")
+    if r.get("gate_failed"):
+        head = (f"Dead-code scan degraded to orphan-symbol hints (advisory): unreachable "
+                f"rate {rate:.1%} ({len(unreach)}/{scanned}) exceeds the 50% gate — the "
+                f"graph likely covers demo/test content or has sparse call edges, so this "
+                f"is NOT a deterministic dead-code verdict.")
+    else:
+        head = (f"Dead-code scan (advisory — static reachability cannot see dynamic "
+                f"dispatch): {len(unreach)} of {scanned} symbols unreachable "
+                f"({rate:.1%}), entry_mode={mode}.")
+    lines = [head]
+    for nid in unreach[:show]:
+        d = DG.nodes[nid]
+        lines.append(f"  + {sanitize_label(str(d.get('label') or nid))} "
+                     f"[{sanitize_label(str(d.get('kind') or ''))}] "
+                     f"({sanitize_label(str(d.get('source_file') or ''))})")
+    if len(unreach) > show:
+        lines.append(f"  ... and {len(unreach) - show} more")
+    return "\n".join(lines)
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2492,6 +2534,22 @@ def _build_server(graph_path: str):
                                   "description": "Number of hotspot files to return"},
                     },
                 },
+            ),
+            types.Tool(
+                # CUSTOM: C1 死代码（scripts/structure_queries.py，Task 12）。检索型工具
+                # （_SEARCH_TOOLS）描述自动追加 _meta 信封契约（下方循环）。
+                name="find_dead_code",
+                description=(
+                    "Scan the knowledge graph for potentially dead code: symbols "
+                    "unreachable from the project's entry points (main script / CLI "
+                    "for application projects, __init__ re-exports for libraries; "
+                    "auto-detected). Reports the unreachable symbol list with the "
+                    "unreachable rate. Advisory only — static reachability cannot see "
+                    "dynamic dispatch (reflection/import hooks), so this is a hint list, "
+                    "not a deterministic verdict. Degrades to orphan-symbol hints when "
+                    "the unreachable rate exceeds 50%."
+                ),
+                inputSchema={"type": "object", "properties": {}},
             ),
             types.Tool(
                 name="list_prs",
@@ -2850,6 +2908,24 @@ def _build_server(graph_path: str):
         # DB 缺失/churn 文件无图边）-> absent（"没有热区信息"≠ok，最诚实形态）。
         return _format_hotspots(r), bool(r["hotspots"]), int(r["scanned"])
 
+    def _tool_find_dead_code(arguments: dict) -> tuple[str, bool, int, str]:  # CUSTOM: C1 四元组
+        # C1 死代码（scripts/structure_queries.py，Task 12）。R4-1：有向视图（DiGraph）——
+        # 生产 _load_graph 产 nx.Graph，无向图上传入会让 nx.descendants 退化为连通分量
+        # 遍历（unreachable 系统性趋空、闸门永不触发）；find_dead_code 内部 TypeError
+        # 防御（同 Task 9 手法），serve 侧挂载经 _digraph_view 重建方向。路径联动总条款：
+        # project_root 从当前 active graph 推导（与 B1/B2/B3/C3/C4 同构）。
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from structure_queries import find_dead_code
+        DG = _digraph_view(active_graph_path)
+        r = find_dead_code(DG, project_root=Path(active_graph_path).parent.parent)
+        # N1：found 恒 True（分析报告恒有效——空结果≠absent，"没有 dead code"是有效
+        # 回答），scanned=符号总数（r["scanned"]）。C 信封纪律：verdict_override=
+        # "low_confidence"（动态分发是静态图天生盲区，不声称确定性）。
+        return _format_dead_code(DG, r), True, int(r["scanned"]), "low_confidence"
+
     def _tool_list_prs(arguments: dict) -> str:
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -2946,6 +3022,7 @@ def _build_server(graph_path: str):
         "get_ranked_context": _tool_get_ranked_context,  # CUSTOM: B1
         "get_changed_symbols": _tool_get_changed_symbols,  # CUSTOM: C3
         "get_hotspots": _tool_get_hotspots,  # CUSTOM: C4
+        "find_dead_code": _tool_find_dead_code,  # CUSTOM: C1
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,

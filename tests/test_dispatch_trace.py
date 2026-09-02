@@ -180,6 +180,19 @@ def test_digraph_view_carries_kind_and_label_attrs(tmp_path):
     assert DG.edges["class:b01", "function:f01"]["relation"] == "contains"
     assert DG.edges["class:b01", "function:f01"]["source_file"] == "pkg/base.py"
 
+def test_digraph_view_accepts_str_path(tmp_path):
+    """I4（Task 12 实测）：serve 侧 active_graph_path 恒为 str（str(Path(...)) 归一化），
+    ranked.get_digraph/_cache_load 走 graph_path.stat() 要求 Path——str 直传会
+    AttributeError。_digraph_view 入口统一 Path()（B3 与 C1 两个调用点同受益，
+    Task 9 仅以 Path 测试，str 生产路径是未覆盖的集成盲区）。"""
+    from graphify.serve import _digraph_view
+    g = tmp_path / "graph.json"
+    g.write_text(json.dumps({
+        "nodes": [{"id": "a", "kind": "function", "label": "a()"}],
+        "links": [], "directed": False}), encoding="utf-8")
+    DG = _digraph_view(str(g))   # serve 生产形态：str
+    assert DG.number_of_nodes() == 1
+
 def test_apply_envelope_five_tuple_carries_closure_size():
     """B3 N1 扩展：5 元组 (text, found, scanned, override, extra_meta) 时 extra_meta 并入
     _meta（blast-radius 的 _meta.closure_size）；3/4 元组路径不受影响（回归锚点在

@@ -1735,3 +1735,67 @@ def test_resolve_single_node_shared_by_get_node_and_get_neighbors():
     nid, err = _resolve_single_node(G, "nonexistent")
     assert nid is None
     assert "No node matching" in err
+
+
+# === CUSTOM: C1 find_dead_code（Task 12）=======================================
+
+
+def test_find_dead_code_registered_in_search_tools():
+    """C1 登记：find_dead_code 必须进 _SEARCH_TOOLS——否则响应不合并 _meta 信封、
+    verdict_override（low_confidence）失效。"""
+    from graphify.serve import _SEARCH_TOOLS
+    assert "find_dead_code" in _SEARCH_TOOLS
+
+
+def test_format_dead_code_normal_ok_path():
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    DG.add_node("a", kind="function", label="foo()", source_file="x.py")
+    DG.add_node("b", kind="function", label="bar()", source_file="y.py")
+    r = {"unreachable": ["b"], "entry_mode": "application", "scanned": 2,
+         "unreachable_rate": 0.5, "gate_failed": False, "degraded_to": None}
+    text = _format_dead_code(DG, r)
+    assert "advisory" in text
+    assert "bar()" in text and "foo()" not in text
+    assert "degraded" not in text
+
+
+def test_format_dead_code_gate_failed_degraded_wording():
+    """>50% 闸门降级措辞：orphan-symbol hints + 显式声明非确定性（合法降级交付，
+    不是失败——报告语义不声称判定死代码）。"""
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    for i in range(3):
+        DG.add_node(f"n{i}", kind="function", label=f"s{i}()", source_file="z.py")
+    r = {"unreachable": ["n0", "n1", "n2"], "entry_mode": "application", "scanned": 3,
+         "unreachable_rate": 1.0, "gate_failed": True, "degraded_to": "orphan_hint"}
+    text = _format_dead_code(DG, r)
+    assert "degraded to orphan-symbol hints" in text
+    assert "exceeds the 50% gate" in text
+    assert "NOT a deterministic" in text
+
+
+def test_format_dead_code_no_symbol_nodes_honest():
+    """退化形态：图无代码符号节点（缺 kind 属性，如 graphify 原生 AST 图）——诚实声明
+    "no code symbol nodes"，不谎报 0/0 unreachable。"""
+    from graphify.serve import _format_dead_code
+    DG = nx.DiGraph()
+    DG.add_node("n1", label="x")   # 无 kind 属性
+    r = {"unreachable": [], "entry_mode": "application", "scanned": 0,
+         "unreachable_rate": 0.0, "gate_failed": False, "degraded_to": None}
+    text = _format_dead_code(DG, r)
+    assert "no code symbol nodes" in text
+    assert "0 of 0" not in text
+
+
+def test_find_dead_code_envelope_low_confidence():
+    """N1+C 信封：find_dead_code 闭包 4 元组（text, found=True, scanned=42, override=
+    low_confidence）过出口 -> _meta.verdict=low_confidence（verdict_override 直通，C 信封
+    纪律；override 路径下 meta 为空 {}——与 B2/B3 override 工具同契约，scanned 值仍在
+    闭包返回元组，不经出口 surface）。"""
+    import json as _json
+    from graphify.serve import _apply_envelope
+    out = _apply_envelope("find_dead_code", ("Dead-code scan ...", True, 42, "low_confidence"),
+                          freshness="fresh")
+    meta = _json.loads(out.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
+    assert meta["verdict"] == "low_confidence" and meta["freshness"] == "fresh"
