@@ -2236,6 +2236,15 @@ def _format_hotspots(r: dict) -> str:
     return "\n".join(lines)
 
 
+def _parse_top_n(arguments: dict) -> int:
+    """C4 top_n 解析（Minor-2）：MCP schema enum [5,10,20,50] 之外的防御层——客户端
+    不守 enum / handler 直调时非整数回退缺省 10，不抛 ValueError 崩出口。"""
+    try:
+        return int(arguments.get("top_n", 10))
+    except (TypeError, ValueError):
+        return 10
+
+
 def _build_server(graph_path: str):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -2462,13 +2471,15 @@ def _build_server(graph_path: str):
             ),
             types.Tool(
                 # CUSTOM: C4 热区（scripts/git_symbols.py，Task 11）。declared 代理：
-                # churn（git log 频次）× 度数（edges source 端 GROUP BY）都是代理值，
-                # 描述明示非圈复杂度（方案 §5-C4 实测条款）。
+                # churn（git log 频次）× 度数（edges 双端点 GROUP BY——I1 fan-in 纳入，
+                # 与 god_nodes 合并图度数 in+out 方向对齐）都是代理值，描述明示非圈
+                # 复杂度（方案 §5-C4 实测条款）。
                 name="get_hotspots",
                 description=(
                     "Rank files by development activity x graph connectivity (hotspot "
                     "analysis): score = churn (number of commits touching the file, full "
-                    "history) x degree (graph edges grouped by the source-side file). "
+                    "history) x degree (graph edges grouped by both endpoints, matching "
+                    "the god-nodes in+out degree). "
                     "Both are declared proxies — the graph carries no per-file complexity "
                     "attribute, so this is NOT cyclomatic complexity. Returns top-N files "
                     "with both a churn and a connectivity signal."
@@ -2833,8 +2844,7 @@ def _build_server(graph_path: str):
             _sys.path.insert(0, _scripts_dir)
         from git_symbols import hotspots
         root = Path(active_graph_path).parent.parent
-        top_n = int(arguments.get("top_n", 10))
-        r = hotspots(root, top_n=top_n)
+        r = hotspots(root, top_n=_parse_top_n(arguments))
         # N1：found=hotspots 非空，scanned=参与排序的文件数（churn>0 文件数）。
         # C 信封纪律：不走 verdict_override——有热区 -> ok；无信号（非 git/无提交史/
         # DB 缺失/churn 文件无图边）-> absent（"没有热区信息"≠ok，最诚实形态）。

@@ -41,11 +41,15 @@ def _mk_git_repo(tmp_path):
     return tmp_path
 
 
-def _mk_db(root, degrees, dangling=0):
+def _mk_db(root, degrees, dangling=0, fan_in=None):
     """最小 codegraph DB：nodes/edges 引用列与生产 schema 同形（test_git_symbols 同口径）.
 
-    hotspots 的度数查询只引用 nodes(id,file_path) + edges(source)——fixture 按引用列
-    同形创建（禁手写理想化：列名与真实 DB 对齐）。dangling>0 时追加 source 端点缺失的边。"""
+    hotspots 的度数查询引用 nodes(id,file_path) + edges(source,target)——fixture 按
+    引用列同形创建（禁手写理想化：列名与真实 DB 对齐）。
+    degrees={file: 出边数}（source 端，target 用虚构 t{n}——不在 nodes，仅 source 端计入）；
+    fan_in={file: 入边数}（I1 双端语义：target 端，source 用真实插入的 xsrc 虚节点
+    ——INNER JOIN 要求端点存在，xsrc 节点自身无边不进度数表）；
+    dangling=两端点都缺失的边数（source/target 两段 JOIN 都剔除）。"""
     import sqlite3
     db = root / ".codegraph" / "codegraph.db"
     db.parent.mkdir(exist_ok=True)
@@ -67,6 +71,17 @@ def _mk_db(root, degrees, dangling=0):
         n += 1
         c.execute("INSERT INTO edges VALUES(?,?,?,?,?)",
                   (f"e{n}", f"ghost{i}", f"t{n}", "calls", "raw"))
+    for file, cnt in (fan_in or {}).items():
+        tid = f"id:{file}"
+        c.execute("INSERT OR IGNORE INTO nodes VALUES(?,?,?,?,?)",
+                  (tid, "function", "f", f"f.{file}", file))   # target 节点须存在（JOIN 端点）
+        for j in range(cnt):
+            n += 1
+            src = f"id:xsrc{j}_{file}"
+            c.execute("INSERT INTO nodes VALUES(?,?,?,?,?)",
+                      (src, "function", "x", f"x.x{j}", f"xsrc{j}_{file}.py"))
+            c.execute("INSERT INTO edges VALUES(?,?,?,?,?)",
+                      (f"e{n}", src, tid, "imports", "raw"))
     c.commit(); c.close()
 
 
@@ -98,15 +113,19 @@ def test_churn_git_failure_returns_empty(tmp_path):
 # --- hotspots 排序与口径 ---
 def test_hotspots_rank_by_churn_times_degree(tmp_path):
     """排序 = churn×degree 交叉积而非 churn 单轴：c.py churn=2 度数=10 score=20 居首；
-    a.py churn 同为 2 但度数=1 score=2 居次；b.py score=2 靠 churn 平局裁决垫底."""
+    a.py churn 同为 2、度数=1 出边+4 入边=5（I1 双端计数）score=10 居次；b.py score=2
+    靠 churn 平局裁决垫底."""
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
+    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"a.py": 4})
     r = hotspots(proj, top_n=10)
     assert [h["file"] for h in r["hotspots"]] == ["c.py", "a.py", "b.py"]
     by_file = {h["file"]: h for h in r["hotspots"]}
     assert by_file["c.py"]["score"] == 20 and by_file["c.py"]["churn"] == 2
     assert by_file["c.py"]["degree"] == 10
-    assert by_file["a.py"]["score"] == 2 and by_file["b.py"]["score"] == 2
+    # a.py 度数 = 出边 1 + 入边 4 = 5（in+out 双端计数——source-only 实现下此处 degree=1
+    # score=2 与 b.py 平局、断言红：fixture 对 BOTH 语义有区分度）
+    assert by_file["a.py"]["degree"] == 5
+    assert by_file["a.py"]["score"] == 10 and by_file["b.py"]["score"] == 2
     assert r["git_available"] is True and r["degree_available"] is True
 
 
@@ -152,11 +171,29 @@ def test_db_missing_degree_unavailable(tmp_path):
 
 
 def test_degree_dangling_edge_excluded(tmp_path):
-    """dangling 边（source 端点缺失）经 JOIN 剔除——NULL file_path 分组不计数（宁少标：
-    无 source 文件的边无处归属，不计入任何文件度数）."""
+    """dangling 边（两端点都缺失）双端 JOIN 均剔除——不计入任何文件度数（宁少标：
+    无真实端点文件的边无处归属）。I1 后按双端语义：source/target 两段各自 INNER JOIN，
+    两端都不存在 -> 两段都不产生该边计数."""
     proj = _mk_git_repo(tmp_path)
     _mk_db(proj, {"a.py": 1}, dangling=2)
     assert _degree(proj) == {"a.py": 1}
+
+
+def test_hotspots_high_fan_in_low_fan_out_is_hotspot(tmp_path):
+    """I1（owner 审核）：fan-in 纳入度数——models.py 被多文件 import（高 fan-in）
+    但自己不调用别人（0 出边）也应为热区（"常改 × 波及大"的波及=别人依赖你）。
+    source-only 实现下 models.py degree=0 永不成热区（方向反了）——本用例对其红."""
+    proj = _mk_git_repo(tmp_path)
+    (proj / "models.py").write_text("K = 1\n", encoding="utf-8")
+    _git_run(proj, "add", "."); _git_run(proj, "commit", "-m", "c6")   # models.py churn=1
+    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"models.py": 3})
+    r = hotspots(proj, top_n=10)
+    by_file = {h["file"]: h for h in r["hotspots"]}
+    assert "models.py" in by_file          # source-only 下不在结果（degree=0 score=0）
+    assert by_file["models.py"]["degree"] == 3 and by_file["models.py"]["score"] == 3
+    assert by_file["models.py"]["churn"] == 1
+    # 排序：c(20) > models(3) > a(2)=b(2)——fan-in 文件进热区前列
+    assert [h["file"] for h in r["hotspots"]][:2] == ["c.py", "models.py"]
 
 
 # --- serve 注册（N1 契约）---
@@ -171,6 +208,17 @@ def test_serve_registers_hotspots():
     out_absent = _apply_envelope("get_hotspots", ("Hotspots...", False, 0), freshness="fresh")
     meta2 = json.loads(out_absent.rstrip("\n").split("\n")[-1].removeprefix("_meta: "))
     assert meta2["verdict"] == "absent"
+
+
+def test_parse_top_n_defensive():
+    """Minor-2：top_n 非法（缺失/非数/None）回退缺省 10 不炸——MCP schema enum
+    [5,10,20,50] 之外的防御层（客户端不守 enum / handler 直调时不抛 ValueError）."""
+    from graphify.serve import _parse_top_n
+    assert _parse_top_n({}) == 10
+    assert _parse_top_n({"top_n": 20}) == 20
+    assert _parse_top_n({"top_n": "50"}) == 50
+    assert _parse_top_n({"top_n": "abc"}) == 10
+    assert _parse_top_n({"top_n": None}) == 10
 
 
 def test_format_hotspots_declares_proxies():

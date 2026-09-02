@@ -8,8 +8,8 @@ from_head 由 serve 侧从状态文件 git_head 读出传入（G3 语义：字�
 untracked 文件不计入变更集（git diff --name-only 语义——新文件未跟踪不属于 git diff）。
 
 C4：hotspots（Task 11）——churn（git log --name-only 文件 commit 频次）× 度数代理
-（codegraph DB edges 按 source 端 file_path GROUP BY）交叉积排序 top-N。两个轴都是
-declared 代理值（无文件行数/圈复杂度属性，不假装有复杂度信号）。
+（codegraph DB edges 按双端点 file_path GROUP BY，fan-in 纳入）交叉积排序 top-N。
+两个轴都是 declared 代理值（无文件行数/圈复杂度属性，不假装有复杂度信号）。
 
 R5-1：git 命令一律 subprocess 直调（禁 shell 管道——Windows 无 grep/sort/uniq）。
 """
@@ -142,14 +142,20 @@ def _churn(root: Path) -> dict[str, int]:
 
 
 def _degree(root: Path) -> dict[str, int] | None:
-    """合并图度数代理：edges 按 source 端 file_path 一次 GROUP BY（JOIN nodes）。
+    """合并图度数代理：edges 按双端点 file_path（source ∪ target）一次 GROUP BY。
 
-    codegraph edges 表无 file_path 列（adapter L1 先例）——按 source 端点 join nodes
-    取 file_path；source 端点缺失的 dangling 边 file_path 为 NULL，INNER JOIN 天然剔除
-    （无 source 文件可归属，宁少标不计入任何文件）。**declared 代理**：这是连接度
-    （source 端出边数），不是圈复杂度——DB/graph.json 无文件行数属性（方案 §5-C4
-    实测条款）。DB 缺失/损坏/查询失败 -> None（调用方标注 degree_available=False）。
-    一次 GROUP BY 全量取回，无 N+1。"""
+    codegraph edges 表无 file_path 列（adapter L1 先例）——source 端与 target 端各按
+    端点 join nodes 取 file_path 分组计数后相加（I1，owner SQL）：**fan-in 纳入**
+    （"常改 × 波及大"的波及 = 别人依赖你——interfaces/models 类高 fan-in 低 fan-out
+    文件 source-only 下永远成不了热区，方向反了）；方向语义与 god_nodes/B1 合并图
+    度数（in+out）对齐（跨工具数字一致性）。**单位注释（L1）**：此处是 DB raw 边计数
+    ——同 (source,target) pair 的多条 raw 边（如 calls+imports 并存）各计一次，未做
+    合并图折叠；与 god_nodes/B1 的折叠度数存在单位差异（方向对齐、单位 raw）。
+    自环边两端同文件计 2（与合并图 nx 自环度数惯例一致）。端点缺失按可 join 端归组
+    （两端都缺则两段 INNER JOIN 都剔除，宁少标）。**declared 代理**：这是连接度，
+    不是圈复杂度——DB/graph.json 无文件行数属性（方案 §5-C4 实测条款）。DB 缺失/
+    损坏/查询失败 -> None（调用方标注 degree_available=False）。一次查询全量取回，
+    无 N+1。"""
     db = root / ".codegraph" / "codegraph.db"
     if not db.exists():
         return None
@@ -157,18 +163,24 @@ def _degree(root: Path) -> dict[str, int] | None:
         conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
         try:
             rows = conn.execute(
-                "SELECT n.file_path, COUNT(*) FROM edges e JOIN nodes n ON e.source = n.id "
-                "GROUP BY n.file_path").fetchall()
+                "SELECT f, SUM(c) FROM ("
+                "SELECT n.file_path f, COUNT(*) c FROM edges e "
+                "JOIN nodes n ON e.source = n.id GROUP BY n.file_path "
+                "UNION ALL "
+                "SELECT n.file_path f, COUNT(*) c FROM edges e "
+                "JOIN nodes n ON e.target = n.id GROUP BY n.file_path"
+                ") GROUP BY f").fetchall()
         finally:
             conn.close()
     except (sqlite3.Error, OSError):
         return None
-    return {fp: c for fp, c in rows if fp}
+    return {fp: int(c) for fp, c in rows if fp}
 
 
 def hotspots(project_root, top_n=10) -> dict:
-    """热区 top-N：score = churn（git log 文件 commit 频次）× 度数（DB edges source 端
-    file_path GROUP BY）。返回 {"hotspots": [...], "git_available", "scanned",
+    """热区 top-N：score = churn（git log 文件 commit 频次）× 度数（DB edges 双端点
+    file_path GROUP BY——I1：fan-in 纳入，与 god_nodes/B1 合并图度数 in+out 方向对齐，
+    单位为 raw 边计数未折叠）。返回 {"hotspots": [...], "git_available", "scanned",
     "degree_available"}。
 
     每个条目 {"file", "churn", "degree", "score"}。**declared 代理纪律**：churn 与度数
