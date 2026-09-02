@@ -18,8 +18,10 @@
 同一份人工标注服务两处：金标测试的期望符号集 + 本基准的检索任务）。
 
 用法：
-    python benchmarks/efficiency_benchmark.py [--root D:/code/graphify_fork]
+    python benchmarks/efficiency_benchmark.py [--root <path>]
         [--budget 2000] [--tasks 12] [--skip-rebuild] [--out benchmarks/results-<date>.json]
+    root 解析优先级（L1）：--root 显式 > GRAPHIFY_GOLDEN_ROOT env > 本仓根（自指）。
+    跑带 recall 的基准（金标 expect id 依赖 golden 根 DB）：GRAPHIFY_GOLDEN_ROOT=D:/code/graphify_fork
 
 声明：默认 --rebuild 会对 --root 跑 scripts/rebuild_entry.py 全量重建（写 root 的
 .codegraph/ + graphify-out/，是 fork 的既定重建入口；id 是内容 hash 幂等收敛，
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -47,8 +50,25 @@ from ranked import ranked_context, format_ranked, _count_tokens  # noqa: E402
 from graphify import serve as _serve                            # noqa: E402
 
 _READ_HEAD_LINES = 200      # read/grep 模拟：每命中文件读头部行数
-_DEFAULT_TASKS = 12         # 固定任务数（金标集前 N 条，确定性切片）
-_DEFAULT_ROOT = r"D:/code/graphify_fork"  # 与金标测试 GRAPHIFY_GOLDEN_ROOT 同源
+_DEFAULT_TASKS = 12         # 固定任务数缺省（金标集前 N 条；--tasks 显式覆盖，不再封顶）
+
+
+def _select_tasks(golden: list, n: int) -> list:
+    """任务集切片：golden[:n]——--tasks 显式即生效（用户 M1 + SDD Minor-4：原写法在
+    n >= 缺省 12 时把上限锁死为 12，--tasks 15 形同虚设）。"""
+    return golden[:n]
+
+
+def _resolve_root(args_root: str | None) -> tuple[Path, str]:
+    """root 解析（用户 L1 + SDD Imp-1）：--root 显式 > GRAPHIFY_GOLDEN_ROOT env >
+    脚本所在仓根（benchmarks/ 的父目录——自指可复现，替代硬编码 D:/code/graphify_fork）。
+    金标 expect id 依赖特定 DB（golden 根），跑带 recall 的基准请设 GRAPHIFY_GOLDEN_ROOT。"""
+    if args_root:
+        return Path(args_root).resolve(), "explicit --root"
+    env = os.environ.get("GRAPHIFY_GOLDEN_ROOT", "").strip()
+    if env:
+        return Path(env).resolve(), "env GRAPHIFY_GOLDEN_ROOT"
+    return _BENCH_ROOT, "benchmark repo root (self-referential)"
 
 
 def _pinned_commit() -> str:
@@ -110,7 +130,9 @@ def _merged_stack(root: Path, conn: sqlite3.Connection | None, G, query: str, bu
                     "FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
         if row is not None and row[0]:
             d = G.nodes[nid] if (G is not None and nid in G) else {}
-            short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
+            # 用户 L3：合并图无 name 属性（R3-2 三次裁决事实），删死代码分支——
+            # 只从 label 取末段（与 serve._symbol_short_name 同源口径）。
+            short = str(d.get("label") or nid).rsplit(".", 1)[-1]
             card = [_serve._format_node_card(G, nid, d)] if (G is not None and nid in G) else [
                 f"Node: {nid}"]
             sig = (row[3] or "").strip()
@@ -219,9 +241,10 @@ def _grep_read_sim(root: Path, conn: sqlite3.Connection | None, expect: list[str
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="§8 效率基准：合并栈 vs read/grep（token/命中@5）")
-    ap.add_argument("--root", default=_DEFAULT_ROOT, help="代码根（默认与金标 GRAPHIFY_GOLDEN_ROOT 同源）")
+    ap.add_argument("--root", default=None,
+                    help="代码根（显式最高优先；缺省 GRAPHIFY_GOLDEN_ROOT env，再缺省本仓根）")
     ap.add_argument("--budget", type=int, default=2000, help="ranked_context token_budget")
-    ap.add_argument("--tasks", type=int, default=_DEFAULT_TASKS, help="金标集固定任务数（默认前 12）")
+    ap.add_argument("--tasks", type=int, default=_DEFAULT_TASKS, help="金标集任务数（默认前 12，显式全量生效）")
     ap.add_argument("--rebuild", dest="rebuild", action="store_true", default=True,
                     help="基准前对 --root 跑 rebuild_entry 全量重建（默认开，保证同一起跑线）")
     ap.add_argument("--skip-rebuild", dest="rebuild", action="store_false",
@@ -229,9 +252,9 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="结果 JSON 路径（默认 benchmarks/results-<date>.json）")
     args = ap.parse_args()
 
-    root = Path(args.root).resolve()
+    root, root_source = _resolve_root(args.root)
     golden = json.loads(_GOLDEN_FILE.read_text(encoding="utf-8"))
-    tasks = golden[:_DEFAULT_TASKS] if args.tasks >= _DEFAULT_TASKS else golden[:args.tasks]
+    tasks = _select_tasks(golden, args.tasks)
 
     rebuild_info = _run_rebuild(root) if args.rebuild else {
         "ran": False, "ok": None, "exit": "skipped",
@@ -270,6 +293,10 @@ def main() -> None:
         "merged_mean_hit5": round(m_hit5, 3),
         "grep_read_mean_hit5": round(g_hit5, 3),
         "merged_pct_of_grep_read": round(100.0 * m_total / g_total, 1) if g_total else None,
+        # SDD Minor-2：两臂命中@5 口径不同，不可直接比——merged=expect 集上 recall
+        # 分数均值（0..1 连续值）；grep_read=前 5 次读取内命中首期望文件的二值均值。
+        "hit5_note": ("merged=expect 集上 recall 分数均值（连续）；grep_read=前 5 次读取内"
+                      "命中首期望文件的二值均值——两臂口径不同，不可直接比较"),
     }
 
     _date = date.today().isoformat()
@@ -280,6 +307,7 @@ def main() -> None:
         "date": _date,
         "pinned_commit": _pinned_commit(),
         "root": str(root),
+        "root_source": root_source,
         "token_count": _count_tokens("")[1],   # tiktoken | estimate（declared）
         "rebuild": rebuild_info,
         "task_set": {"source": "tests/fixtures/ranked_golden.json",
