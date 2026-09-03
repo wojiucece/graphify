@@ -1,9 +1,15 @@
-"""A1b 信封：verdict 三分 / freshness 推导 / 时效逃生 / 尾部行格式 / isError 边界."""
+"""A1b 信封：verdict 三分 / freshness 推导 / 时效逃生 / 尾部行格式 / isError 边界.
+
+06 票换源：freshness complete 态从"WAL mtime vs graph.json"平移到"FTS 缓存指纹 vs
+graph.json"——缓存落后于事实层（缺失/指纹失配）判 stale_index 诚实标注。
+"""
 import json, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import networkx as nx
 import pytest
+import fts_cache as fc
 from graphify.serve import _envelope, _derive_verdict, _derive_freshness
 
 def test_envelope_appends_single_meta_line():
@@ -63,6 +69,45 @@ def test_freshness_missing_graph_json_is_stale(tmp_path):
     state.write_text(json.dumps({"schema": 1, "phase": "complete", "last_duration": 5.0}),
                      encoding="utf-8")
     assert _derive_freshness(state) == "stale_index"   # 无 graph.json 文件
+
+
+def test_freshness_cache_missing_is_stale(tmp_path):
+    """06 换源：complete 态 + 无 FTS 缓存 -> stale_index（缓存落后于事实层的最极端形态）."""
+    out = tmp_path / "graphify-out"; out.mkdir()
+    (out / "graph.json").write_text(
+        json.dumps({"directed": False, "nodes": [], "links": []}), encoding="utf-8")
+    state = out / ".rebuild-state.json"
+    state.write_text(json.dumps({"schema": 1, "phase": "complete"}), encoding="utf-8")
+    assert _derive_freshness(state) == "stale_index"
+
+
+def test_freshness_cache_fresh_when_fingerprint_matches(tmp_path):
+    """06 换源：complete 态 + 缓存指纹 == graph.json -> fresh."""
+    out = tmp_path / "graphify-out"; out.mkdir()
+    gp = out / "graph.json"
+    gp.write_text(json.dumps({"directed": False, "nodes": [{"id": "a", "label": "A"}],
+                              "links": []}), encoding="utf-8")
+    fc.rebuild_fts(gp, out / ".fts-index.db")
+    state = out / ".rebuild-state.json"
+    state.write_text(json.dumps({"schema": 1, "phase": "complete"}), encoding="utf-8")
+    assert _derive_freshness(state) == "fresh"
+
+
+def test_freshness_cache_stale_after_graph_update(tmp_path):
+    """06 换源：complete 态 + graph.json 更新于缓存（指纹失配）-> stale_index 诚实标注——
+    缓存落后于事实层。"""
+    out = tmp_path / "graphify-out"; out.mkdir()
+    gp = out / "graph.json"
+    gp.write_text(json.dumps({"directed": False, "nodes": [{"id": "a", "label": "A"}],
+                              "links": []}), encoding="utf-8")
+    fc.rebuild_fts(gp, out / ".fts-index.db")
+    # 事实层更新（内容/尺寸变化）→ 缓存指纹失配
+    gp.write_text(json.dumps({"directed": False,
+                              "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+                              "links": []}), encoding="utf-8")
+    state = out / ".rebuild-state.json"
+    state.write_text(json.dumps({"schema": 1, "phase": "complete"}), encoding="utf-8")
+    assert _derive_freshness(state) == "stale_index"
 
 def test_verdict_degraded_overrides_found():
     """rebuilding 窗口压倒一切（G1 调用链：出口负责传 degraded=True）."""

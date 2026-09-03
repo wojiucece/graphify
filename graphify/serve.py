@@ -1606,22 +1606,21 @@ def _derive_freshness(state_path):
             print(f"[serve] 状态文件超时效（{limit:.0f}s），判 stale_index", file=sys.stderr)
             return "stale_index"
         return "rebuilding"
-    # complete 态：E1 不变量保证 run() 先落 graph.json 再进 finally 写状态文件 ->
-    # graph.json mtime 恒 >= complete.finished。WAL mtime 更新 = rebuild 完成后 DB
-    # 又有新数据且无 rebuild 在处理（走到本分支即排除了 rebuilding 态）——这正是
-    # stale_index 语义，非竞态误报。graph.json 与状态文件同目录（自动兼容
-    # GRAPHIFY_OUT 重定向），不硬编码 'graphify-out'。
-    root = state_path.parent.parent
-    wal = root / ".codegraph" / "codegraph.db-wal"
-    db = root / ".codegraph" / "codegraph.db"
-    ref = wal if wal.exists() else db
+    # complete 态：FTS 缓存 vs 事实层（06 票换源——旧链路 WAL mtime 对比退役）。
+    # 缓存落后于事实层（缓存缺失 / 指纹失配 = graph.json 更新于缓存）→ stale_index
+    # 诚实标注；一致 → fresh。is_fresh 即指纹对比（meta 表记录构建时 graph.json 的
+    # (mtime_ns, size)；05 票二轮评审 TOCTOU 修正后 stat 先于 read，接线不依赖旧时序）。
+    # graph.json 与状态文件同目录（自动兼容 GRAPHIFY_OUT 重定向），不硬编码 'graphify-out'。
+    fts = _fts_cache()
+    cache = state_path.parent / ".fts-index.db"
+    graph = state_path.parent / "graph.json"
     try:
-        graph_m = (state_path.parent / "graph.json").stat().st_mtime_ns
-        return "stale_index" if ref.exists() and ref.stat().st_mtime_ns > graph_m else "fresh"
+        if not graph.exists():
+            return "stale_index"   # R5-3：事实层缺失即最陈旧形态，不崩出口
+        return "fresh" if fts.is_fresh(cache, graph) else "stale_index"
     except OSError:
-        # R5-3：graph.json 缺失（产物被删/多项目路径联动出错）——freshness 是附加
-        # 诚实层，无权让 call_tool 出口崩溃杀死全部响应；产物缺失即最陈旧形态，
-        # 判 stale_index 诚实且安全。
+        # freshness 是附加诚实层，无权让 call_tool 出口崩溃杀死全部响应；
+        # 读失败即最保守形态，判 stale_index 诚实且安全。
         return "stale_index"
 
 
@@ -1674,53 +1673,135 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
     return _envelope(text, verdict=v, freshness=freshness, **meta)
 
 
+# === CUSTOM: 06 票 FTS 缓存消费侧（点查类工具换源）============================
+
+
+def _fts_cache():
+    """lazy fts_cache（scripts/ 无包结构——graphify 包不反向依赖 scripts/，rebuild_entry
+    先例：消费侧调用时才挂 sys.path）。模块缓存于 sys.modules，后续调用近零开销。"""
+    import sys as _sys
+    _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    import fts_cache
+    return fts_cache
+
+
+def _ensure_fts_retry(graph_path, fts_path, attempts=5, base_delay=0.1):
+    """ensure_fts + os.replace 锁重试退避（Task 05 ⚠️③ checklist 接线决策）。
+
+    连接纪律：serve 侧一律短连接（查询完即关，Windows 只读句柄窗口最小）；残余碰撞
+    （并发查询线程持句柄时 os.replace WinError 5）用指数退避重试兜底（5 次，0.1→0.8s）。
+    指纹命中/重建成功返回；重试耗尽向上抛（缓存构建失败是事实层派生失败，诚实暴露给
+    get_node 的 except 降级路径）。"""
+    fts = _fts_cache()
+    delay = base_delay
+    for attempt in range(attempts):
+        try:
+            return fts.ensure_fts(graph_path, fts_path)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    return False
+
+
 # === CUSTOM: B2 get_node include_source 符号切片（Phase 4）====================
+# 06 票换源：切片原语升级 end_byte 字节切（Task 01 原语）——source_location
+# `L<line>:C<col>`（C = 1-based 字节列，与 end_byte 同字节坐标系）定位起点，end_byte
+# （exclusive）定终点，raw 字节切后 decode——行尾/同行尾随代码不再误收。end_byte 缺失
+# （legacy 图/文件节点）→ 行级切片回退（旧链路语义）。校验失败仍走行级 fuzzy 重定位。
+
+_SOURCE_LOC_RE = re.compile(r"^L(\d+)(?::C(\d+))?$")
 
 
-def _slice_source(project_root, file_path, start_line, end_line, name, signature=None, pad=0):
-    """B2 符号切片：读 <project_root>/<file_path> 行区间 [start_line, end_line]（1-based 含）。
+def _line_byte_starts(raw: bytes) -> list[int]:
+    """1-based 每行起始字节偏移（按 \\n 切——与 tree-sitter end_byte 字节坐标系一致）。
+    尾随空行剔除（splitlines 同语义：'a\\n' 只有 1 行）。"""
+    starts = [0]
+    for i, b in enumerate(raw):
+        if b == 0x0A:
+            starts.append(i + 1)
+    if raw.endswith(b"\n") and len(starts) > 1:
+        starts.pop()
+    return starts
 
+
+def _slice_raw_lines(raw: bytes, starts: list[int], lo: int, hi: int, n: int) -> str:
+    """行区间 [lo, hi]（1-based 含）的字节切——行尾换行剔除（splitlines 展示无差异）。"""
+    exp_start = starts[lo - 1]
+    if hi < n:
+        exp_end = starts[hi] - 1              # 排除行 hi 的 \n（starts[hi] = 行 hi+1 起点）
+    else:
+        exp_end = len(raw)
+        if exp_end and raw[exp_end - 1] == 0x0A:
+            exp_end -= 1                       # 尾行无换行/尾随换行统一剔除
+    return raw[exp_start:exp_end].decode("utf-8", errors="replace")
+
+
+def _slice_source(project_root, file_path, source_location, end_line, end_byte,
+                  name, signature=None, pad=0):
+    """B2 符号切片：字节精确——source_location `L<line>:C<col>` 起点 + end_byte 终点
+    （exclusive）。end_byte 缺失（legacy 图/文件节点）→ 行级切片回退（旧链路语义）。
     校验（name 或 signature 出现于切片头部 3 行内）失败 → 全文逐行 fuzzy 定位
-    `def/class <name>` 行并重定区间 ±40 行；仍失败 → 返回 (原区间切片, False, 0, 0)。
+    `def/class <name>` 行并重定区间 ±40 行；仍失败 → (原切片, False, 0, 0)。
     pad>0：最终区间前后各扩 pad 行——body+context 的 ±3 上下文窗内聚于此（单次读文件
-    完成切片+扩窗，消除原 _last_slice_meta 模块级全局（FastMCP sync handler 线程池并发
-    get_node 交错互覆）+ TOCTOU 双读）。重定位窗尾非文件尾（±40 硬窗可能截断长函数）→
-    附 `(relocated window, may be truncated)` 提示行。
+    完成切片+扩窗，消除原 _last_slice_meta 模块级全局 + TOCTOU 双读）。重定位窗尾非
+    文件尾（±40 硬窗可能截断长函数）→ 附 `(relocated window, may be truncated)` 提示行。
     返回 (切片文本, slice_verified, slice_start, slice_end)。
     """
     src = Path(project_root) / file_path
     try:
-        lines = src.read_text(encoding="utf-8").splitlines()
+        raw = src.read_bytes()
     except OSError:
         return "", False, 0, 0
-    n = len(lines)
-
-    def _slice(lo: int, hi: int) -> list[str]:
-        lo, hi = max(1, lo), min(n, hi)
-        return lines[lo - 1:hi] if lo <= hi else []
+    m = _SOURCE_LOC_RE.match(source_location or "")
+    if not m:
+        return "", False, 0, 0
+    start_line, start_col = int(m.group(1)), (int(m.group(2)) if m.group(2) else None)
+    starts = _line_byte_starts(raw)
+    n = len(starts)
+    if n == 0 or start_line > n:
+        return "", False, 0, 0
 
     def _expand(lo: int, hi: int) -> tuple[int, int]:
         return max(1, lo - pad), min(n, hi + pad)
 
-    body = _slice(start_line, end_line)
-    if not body:
-        return "", False, 0, 0
-    head = "\n".join(body[:3])
-    if (name and name in head) or (signature and signature in head):
-        lo, hi = _expand(start_line, end_line)
-        return "\n".join(_slice(lo, hi)), True, lo, hi
-    # 行漂移：DB 行区间失效 → fuzzy 逐行定位 def/class + name
+    body_text = ""
+    # ── 字节精确主路径（新链路 end_byte 原语）──
+    if end_byte is not None:
+        start_byte = starts[start_line - 1] + (start_col - 1 if start_col else 0)
+        if 0 <= start_byte < end_byte <= len(raw):
+            body_text = raw[start_byte:end_byte].decode("utf-8", errors="replace")
+            head = "\n".join(body_text.splitlines()[:3])
+            if (name and name in head) or (signature and signature in head):
+                lo, hi = _expand(start_line, end_line or start_line)
+                text = _slice_raw_lines(raw, starts, lo, hi, n) if pad else body_text
+                return text, True, lo, hi
+    # ── 行级回退（legacy 无 end_byte / 字节切校验失败但有行区间）──
+    if end_byte is None and end_line is not None:
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        nl = len(lines)
+        body_text = "\n".join(lines[start_line - 1:min(end_line, nl)])
+        head = "\n".join(lines[start_line - 1:min(start_line + 2, nl)])
+        if body_text and ((name and name in head) or (signature and signature in head)):
+            lo, hi = _expand(start_line, end_line)
+            return "\n".join(lines[lo - 1:hi]), True, lo, hi
+    # 行漂移 / 无区间：fuzzy 逐行定位 def/class + name（±40 硬窗）
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    nl = len(lines)
     for i, ln in enumerate(lines, 1):
         stripped = ln.lstrip()
         if name and name in ln and (stripped.startswith("def ") or stripped.startswith("class ")):
             lo, hi = _expand(i - 40, i + 40)
-            relocated = _slice(lo, hi)
+            relocated = "\n".join(lines[lo - 1:hi])
             if relocated:
                 # L1：±40 硬窗对长函数（>80 行）可能静默截断——窗尾非文件尾时附提示
-                if hi < n:
-                    relocated.append("(relocated window, may be truncated)")
-                return "\n".join(relocated), True, lo, hi
-    return "\n".join(body), False, 0, 0
+                if hi < nl:
+                    relocated += "\n(relocated window, may be truncated)"
+                return relocated, True, lo, hi
+    return body_text, False, 0, 0
 
 
 def _verdict_for_source_request(has_source: bool, explicit_body: bool):
@@ -1732,11 +1813,20 @@ def _verdict_for_source_request(has_source: bool, explicit_body: bool):
     return None
 
 
+def _card_short_name(d: dict, nid: str) -> str:
+    """B2 名片短名（函数/方法/类名）：qualified_name 优先（原生形态 `Class::method`/裸名，
+    无括号）；回退 label 末段并剥 `()` 调用后缀——原生函数/方法 label 带 `()`/`.method()`
+    形态（旧链路 label 是 dotted qualified_name 无括号），`def <short>` 重构与切片校验
+    都需要裸名。"""
+    raw = str(d.get("qualified_name") or d.get("name") or d.get("label") or nid)
+    return raw.rsplit(".", 1)[-1].rsplit("::", 1)[-1].removesuffix("()")
+
+
 def _signature_line(sig: str, short: str) -> str:
     """B2 fix：真实 DB signature 列无 def/class/async 前缀（fork 实测 7378/7378 函数/方法
-    签名均无前缀，`__init__` → `(self)`）——缺前缀且为括号形态（Python 函数签名）时前置
-    `def <short_name>` 重构出 def 行；已有前缀原样（不重复拼接）；非括号形态（非 Python
-    语言签名，如 `void (String item)`）不套 Python def。"""
+    签名均无前缀，`__init__` → `(self)`；新链路契约同名，名字不进签名）——缺前缀且为
+    括号形态（Python 函数签名）时前置 `def <short_name>` 重构出 def 行；已有前缀原样
+    （不重复拼接）；非括号形态（非 Python 语言签名，如 `void (String item)`）不套 Python def。"""
     sig = sig.strip()
     if not sig:
         return ""
@@ -1759,32 +1849,21 @@ def _top_neighbor_ids(G, nid, top=10):
     return ranked[:top], len(nbs)
 
 
-def _neighbor_signatures(db_path, ids):
-    """B2 M1: 直查 nodes 表 signature 列（只读，复用 get_node DB 连接形态）——
-    body+context 邻接段签名摘要用。__cg 碰撞消歧后缀回退基 id（adapter A4）。
-    返回 {id: signature}。DB 缺失/损坏 → {}（诚实降级，不崩出口）。"""
+def _neighbor_signatures(fts_path, ids):
+    """B2 M1: FTS 缓存 nodes 表 signature 列（只读短连接）——body+context 邻接段签名
+    摘要用。id 是图节点原生形态，直接命中（__cg 消歧后缀回退已删，wayfinder E）。
+    返回 {id: signature}。缓存缺失/损坏 → {}（诚实降级，不崩出口）。"""
     if not ids:
         return {}
     import sqlite3 as _sqlite3
     sigs = {}
     try:
-        conn = _sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        conn = _sqlite3.connect(f"file:{fts_path.as_posix()}?mode=ro", uri=True)
         try:
             ph = ",".join("?" * len(ids))
             for nid, sig in conn.execute(
                     f"SELECT id, signature FROM nodes WHERE id IN ({ph})", tuple(ids)):
                 sigs[nid] = sig or ""
-            # 碰撞罕见路径，逐条查询量级无害（top-10 最多 10 次往返），不批量优化
-            for nid in ids:
-                if nid in sigs:
-                    continue
-                m = re.match(r"^(.*)__cg\d+$", nid)
-                if not m:
-                    continue
-                row = conn.execute(
-                    "SELECT signature FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
-                if row:
-                    sigs[nid] = row[0] or ""
         finally:
             conn.close()
     except _sqlite3.Error:
@@ -1792,19 +1871,19 @@ def _neighbor_signatures(db_path, ids):
     return sigs
 
 
-def _neighbor_summary_lines(G, nid, db_path, top=10):
-    """B2 M1: 1-hop 邻接签名摘要——每邻居 label + Signature:（直查 nodes 表 signature 列），
-    度数排序取 top-k，超限标 (+N more)。替代 _tool_get_neighbors 全量邻接文本（god node
-    时是 token 放大器）。label 过 sanitize_label（图 label 可为 LLM 字段，F-010）；
-    Signature 是代码文本非 LLM 字段（L2 语义锁定：不做 F-010 sanitize）。"""
+def _neighbor_summary_lines(G, nid, fts_path, top=10):
+    """B2 M1: 1-hop 邻接签名摘要——每邻居 label + Signature:（FTS 缓存 nodes 表 signature
+    列），度数排序取 top-k，超限标 (+N more)。替代 _tool_get_neighbors 全量邻接文本
+    （god node 时是 token 放大器）。label 过 sanitize_label（图 label 可为 LLM 字段，
+    F-010）；Signature 是代码文本非 LLM 字段（L2 语义锁定：不做 F-010 sanitize）。"""
     lines = []
     top_ids, total = _top_neighbor_ids(G, nid, top=top)
-    sigs = _neighbor_signatures(db_path, top_ids)
+    sigs = _neighbor_signatures(fts_path, top_ids)
     for nb in top_ids:
         label = str(G.nodes[nb].get("label", nb))
         sig = sigs.get(nb)
         if sig:
-            nb_short = label.rsplit(".", 1)[-1]
+            nb_short = _card_short_name(G.nodes[nb], nb)
             lines.append(f"  {sanitize_label(label)}  Signature: {_signature_line(sig, nb_short).replace('\n', '\n  ')}")
         else:
             lines.append(f"  {sanitize_label(label)}")
@@ -1812,6 +1891,91 @@ def _neighbor_summary_lines(G, nid, db_path, top=10):
     if extra > 0:
         lines.append(f"  (+{extra} more)")
     return lines
+
+
+def _get_node_tool(G, active_graph_path, arguments: dict) -> tuple[str, bool, int, str | None]:
+    """B2 get_node 正文装配（模块级——test 不经 mcp 可直接调用，_shortest_path_text 先例；
+    serve 闭包 _tool_get_node 只做薄转发）。06 票换源：元数据点查走 .fts-index.db nodes
+    表（05 票三表之一）——id 是图节点原生 kind+hash 形态，直接命中（__cg 消歧后缀与回退
+    点查已删，wayfinder E）；源码切片升级 end_byte 字节切（Task 01 原语）。连接纪律：
+    短连接 + ensure_fts os.replace 锁重试退避（Task 05 ⚠️③ checklist 接线决策）。
+    返回 (text, found, scanned, verdict_override)（B2 四元组，末元工具侧诚实自评 R3-3）。"""
+    import sqlite3 as _sqlite3
+    label = arguments["label"].lower()
+    include_source = arguments.get("include_source", "signature")
+    nid, err = _resolve_single_node(G, label)
+    if err:
+        # CUSTOM: N1 found=err is None（机械约定，Ambiguous 亦计 absent 文本保留）；
+        # scanned=1（扫描语义表：get_node 只针对单节点解析）。
+        return err, False, 1, None
+    d = G.nodes[nid]
+    card = [_format_node_card(G, nid, d)]  # none 档锚点：与扩展前逐字节一致
+    # 路径联动总条款：root/缓存路径从当前 active graph（graphify-out/graph.json）推导
+    # （与 _derive_freshness / _tool_get_ranked_context 同构）。FTS 缓存由同一
+    # graph.json 投影（05 _build），节点 id 逐字同源——WHERE id=? 直接命中，无需
+    # __cg 基 id 回退。缓存缺失/指纹失配先 ensure_fts 惰性重建（锁重试退避）。
+    row = None
+    fts_path = Path(active_graph_path).parent / ".fts-index.db"
+    try:
+        fts = _fts_cache()
+        _ensure_fts_retry(active_graph_path, fts_path)
+        conn = fts.open_readonly(fts_path)
+        try:
+            row = conn.execute(
+                "SELECT source_file, source_location, end_line, end_byte, "
+                "signature, docstring FROM nodes WHERE id = ?", (nid,)).fetchone()
+        finally:
+            conn.close()
+    except (_sqlite3.Error, OSError):
+        row = None  # 缓存缺失/损坏/锁重试耗尽：语义节点等价（has_source=False，诚实降级）
+    # 可切片判定：source_file + 可解析起点（L<line>）——概念/语义节点 source_location
+    # 为 null，无切片面（旧链路 DB 无概念节点 → has_source=False → body 档 absent 等价）。
+    has_source = (row is not None and bool(row[0])
+                  and bool(_SOURCE_LOC_RE.match(row[1] or "")))
+    explicit_body = include_source in ("body", "body+context")
+    override = _verdict_for_source_request(has_source=has_source, explicit_body=explicit_body)
+    if include_source == "none":
+        # none 档回归锚点：名片无 Signature:/Doc:/Code: 行，与扩展前逐字节一致
+        return "\n".join(card), True, 1, override
+    # 名片增强：Signature:/Doc: 行（FTS 缓存一次查询带出）。short = 函数/方法/类名
+    # （_card_short_name 剥原生 label 的 `()` 后缀），body 与 signature 两档共用。
+    short = _card_short_name(d, nid)
+    if row is not None:
+        sig = (row[4] or "").strip()
+        doc = (row[5] or "").strip()
+        if sig:
+            # 新链路 signature 列无 def 前缀（提取契约：名字不进签名）——重构出 def 行。
+            # B2 L2：Signature 是代码文本非 LLM 字段——不做 F-010 sanitize
+            # （sanitize_label 剥 \n/\t 等控制空白，变形多行签名；新链路亦存在多行
+            # 签名形态，见 test_sanitize_label_strips_*）。
+            card.append(f"  Signature: {_signature_line(sig, short)}")
+        if doc:
+            # Doc: 头行：docstring 预览行（splitlines 已剥换行），保留 sanitize 防御
+            card.append(f"  Doc: {sanitize_label(doc.splitlines()[0])}")
+    if explicit_body and has_source:
+        project_root = Path(active_graph_path).parent.parent
+        # B2 M2：pad=3（body+context ±3 上下文窗）内聚于 _slice_source——单次读文件
+        # 完成字节切片+扩窗，返回 (text, ok, slice_start, slice_end)；删 _last_slice_meta
+        # 全局（FastMCP sync handler 线程池并发 get_node 交错互覆）+ 消 TOCTOU 双读。
+        text, slice_ok, _s, _e = _slice_source(
+            project_root, row[0], row[1], row[2], row[3], short,
+            signature=_signature_line((row[4] or "").strip(), short) or None,
+            pad=3 if include_source == "body+context" else 0)
+        if slice_ok:
+            card.append("Code:")
+            card.extend(f"  {ln}" for ln in text.splitlines())
+            if include_source == "body+context":
+                # B2 M1：1-hop 邻接签名摘要（label + Signature: 双列，度数 top-10 +
+                # (+N more) 截断标注）——god node（度数 100+）不拼全量邻接文本
+                # （原 _tool_get_neighbors 全量输出是 token 放大器）。
+                card.append("Context (1-hop neighbors):")
+                card.extend(_neighbor_summary_lines(G, nid, fts_path))
+        else:
+            # 切片不可得（字节区间失效/legacy 无 end_byte）：名片仍返回，Code: 段省略
+            # + 标注 + low_confidence
+            card.append("Code: (slice unavailable — source body could not be located precisely)")
+            override = override or "low_confidence"
+    return "\n".join(card), True, 1, override  # N1 found=节点已解析, scanned=1（扫描语义表）
 
 
 # === CUSTOM: B3 get_neighbors direction/depth/fanout/blast-radius（Phase 4 Task 9）===
@@ -2228,9 +2392,10 @@ def _format_changed_symbols(r: dict, from_head: str | None = None) -> str:
 def _format_hotspots(r: dict) -> str:
     """C4 正文装配：top-N 热区（file + churn/degree/score 三轴）。**declared 纪律**：
     头行声明 score = churn × 度数是代理值、明示非圈复杂度（graph 无每文件复杂度属性，
-    方案 §5-C4 实测条款）。空结果按缺失轴分支说真话（C3 Imp-1 同款纪律）：
-    非 git（churn 轴缺）/ 无提交史（churn 空）/ DB 缺失（度数轴缺）/ churn 文件无图边
-    （交叉积为 0）。"""
+    方案 §5-C4 实测条款）；degree 单位 = graph.json 合并图边计数（与 god_nodes/B1 同
+    单位，06 票换源后诚实标注）。空结果按缺失轴分支说真话（C3 Imp-1 同款纪律）：
+    非 git（churn 轴缺）/ 无提交史（churn 空）/ graph.json 缺失（度数轴缺）/ churn
+    文件无图边（交叉积为 0）。"""
     items = r.get("hotspots", [])
     git_avail = r.get("git_available", False)
     deg_avail = r.get("degree_available", False)
@@ -2242,12 +2407,13 @@ def _format_hotspots(r: dict) -> str:
             return ("Code hotspots: no commit history (empty repo, or git log failed) "
                     "— no churn signal.")
         if not deg_avail:
-            return ("Code hotspots: codegraph DB unavailable — degree axis empty, "
+            return ("Code hotspots: graph.json unavailable — degree axis empty, "
                     "churn alone cannot rank hotspots.")
         return ("Code hotspots: no hotspots — churn files carry no graph edges "
                 "(score = churn × degree = 0).")
     lines = ["Code hotspots (declared proxies: score = churn × degree, not cyclomatic "
-             "complexity — the graph carries no per-file complexity attribute):"]
+             "complexity; degree = merged-graph edge count per file from graph.json, "
+             "same unit as god_nodes — the graph carries no per-file complexity attribute):"]
     for i, h in enumerate(items, 1):
         lines.append(f"  {i}. {sanitize_label(h['file'])}  churn={h['churn']}  "
                      f"degree={h['degree']}  score={h['score']}")
@@ -2766,84 +2932,10 @@ def _build_server(graph_path: str):
 
     def _tool_get_node(arguments: dict) -> tuple[str, bool, int, str | None]:  # CUSTOM: B2 四元组
         # B2 include_source 四档：none/signature(缺省)/body/body+context。返回
-        # (text, found, scanned, verdict_override)——末元是工具侧诚实自评（R3-3），
-        # 切片校验失败→low_confidence、语义节点显式请求 body→absent（扫描语义 scanned=1）。
-        import sqlite3 as _sqlite3
-        label = arguments["label"].lower()
-        include_source = arguments.get("include_source", "signature")
-        nid, err = _resolve_single_node(G, label)
-        if err:
-            # CUSTOM: N1 found=err is None（机械约定，Ambiguous 亦计 absent 文本保留）；
-            # scanned=1（扫描语义表：get_node 只针对单节点解析）。
-            return err, False, 1, None
-        d = G.nodes[nid]
-        card = [_format_node_card(G, nid, d)]  # none 档锚点：与扩展前逐字节一致
-        # 路径联动总条款：root 从当前 active graph（graphify-out/graph.json）推导
-        # （与 _derive_freshness / _tool_get_ranked_context 同构）。DB 只读 join 带出
-        # signature/docstring/行区间——codegraph nodes 表 id 与图节点 id 同源
-        # （adapter._map_nodes 直通）；__cg 碰撞消歧后缀回退基 id（adapter A4）。
-        row = None
-        db_path = Path(active_graph_path).parent.parent / ".codegraph" / "codegraph.db"
-        try:
-            conn = _sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
-            try:
-                row = conn.execute(
-                    "SELECT file_path, start_line, end_line, signature, docstring "
-                    "FROM nodes WHERE id = ?", (nid,)).fetchone()
-                if row is None:
-                    m = re.match(r"^(.*)__cg\d+$", nid)
-                    if m:
-                        row = conn.execute(
-                            "SELECT file_path, start_line, end_line, signature, docstring "
-                            "FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
-            finally:
-                conn.close()
-        except _sqlite3.Error:
-            row = None  # DB 缺失/损坏：语义节点等价（has_source=False，诚实降级）
-        has_source = row is not None and bool(row[0])
-        explicit_body = include_source in ("body", "body+context")
-        override = _verdict_for_source_request(has_source=has_source, explicit_body=explicit_body)
-        if include_source == "none":
-            # none 档回归锚点：名片无 Signature:/Doc:/Code: 行，与扩展前逐字节一致
-            return "\n".join(card), True, 1, override
-        # 名片增强：Signature:/Doc: 行（DB 一次 join 带出）。short = 图 label 末段
-        # （函数名/类名），body 与 signature 两档共用（review 交接：复用）。
-        short = str(d.get("name") or str(d.get("label", nid))).rsplit(".", 1)[-1]
-        if row is not None:
-            sig = (row[3] or "").strip()
-            doc = (row[4] or "").strip()
-            if sig:
-                # 真实 DB signature 列无 def 前缀（fork 实测 7378/7378）——重构出 def 行。
-                # B2 L2：Signature 是代码文本非 LLM 字段——不做 F-010 sanitize
-                # （sanitize_label 剥 \n/\t 等控制空白，变形多行签名；fork 真实 DB
-                # 存在 `(\r\n self,\r\n ...)` 多行形态，见 test_sanitize_label_strips_*）。
-                card.append(f"  Signature: {_signature_line(sig, short)}")
-            if doc:
-                # Doc: 头行：docstring 预览行（splitlines 已剥换行），保留 sanitize 防御
-                card.append(f"  Doc: {sanitize_label(doc.splitlines()[0])}")
-        if explicit_body and has_source:
-            project_root = Path(active_graph_path).parent.parent
-            # B2 M2：pad=3（body+context ±3 上下文窗）内聚于 _slice_source——单次读文件
-            # 完成切片+扩窗，返回 (text, ok, slice_start, slice_end)；删 _last_slice_meta
-            # 全局（FastMCP sync handler 线程池并发 get_node 交错互覆）+ 消 TOCTOU 双读。
-            text, slice_ok, _s, _e = _slice_source(
-                project_root, row[0], row[1], row[2], short,
-                signature=_signature_line((row[3] or "").strip(), short) or None,
-                pad=3 if include_source == "body+context" else 0)
-            if slice_ok:
-                card.append("Code:")
-                card.extend(f"  {ln}" for ln in text.splitlines())
-                if include_source == "body+context":
-                    # B2 M1：1-hop 邻接签名摘要（label + Signature: 双列，度数 top-10 +
-                    # (+N more) 截断标注）——god node（度数 100+）不拼全量邻接文本
-                    # （原 _tool_get_neighbors 全量输出是 token 放大器）。
-                    card.append("Context (1-hop neighbors):")
-                    card.extend(_neighbor_summary_lines(G, nid, db_path))
-            else:
-                # 切片校验失败：名片仍返回，Code: 段省略 + 标注 + low_confidence
-                card.append("Code: (slice unavailable — line drift detected; source body omitted)")
-                override = override or "low_confidence"
-        return "\n".join(card), True, 1, override  # N1 found=节点已解析, scanned=1（扫描语义表）
+        # (text, found, scanned, verdict_override)——末元是工具侧诚实自评（R3-3）。
+        # 06 票换源实现在模块级 _get_node_tool（元数据点查走 FTS 缓存、字节精确切片、
+        # __cg 回退删除）——此处只做闭包状态转发（_shortest_path_text 先例）。
+        return _get_node_tool(G, active_graph_path, arguments)
 
     def _tool_get_neighbors(arguments: dict) -> tuple:  # CUSTOM: N1 三元组
         label = arguments["label"].lower()

@@ -1,9 +1,13 @@
-"""C4：hotspots = churn（git log 文件 commit 频次）× 度数代理（DB edges source 端 GROUP BY）top-N.
+"""C4：hotspots = churn（git log 文件 commit 频次）× 度数代理（graph.json 合并图边
+双端点 source_file 计数）top-N.
 
+06 票换源：codegraph DB 退役，度数轴取 graph.json 唯一事实层（合并图边计数，与
+god_nodes/B1 同单位——旧链路 raw 边计数单位差异按决议诚实标注，见 _format_hotspots
+头行断言）。
 覆盖：churn 计数（含中文文件名 quotepath）、churn×degree 交叉积排序（非 churn 单轴）、
-零分剔除与 scanned 口径、top_n 钳制、非 git no-op、DB 缺失度数轴缺失、dangling 边剔除、
-serve 注册（_SEARCH_TOOLS + N1 信封，C 信封纪律不走 override）、正文 declared 代理声明、
-空结果四分支诚实文案。
+零分剔除与 scanned 口径、top_n 钳制、非 git no-op、graph.json 缺失度数轴缺失、dangling
+边剔除、serve 注册（_SEARCH_TOOLS + N1 信封，C 信封纪律不走 override）、正文 declared
+代理声明、空结果四分支诚实文案。
 """
 import json, subprocess, sys
 from pathlib import Path
@@ -21,14 +25,15 @@ def _mk_git_repo(tmp_path):
     """tmp git 仓库（生产形态：真实 git 历史）：a.py 2 次、b.py 1 次、c.py 2 次 commit.
 
     churn: a.py=2, b.py=1, c.py=2——a 与 c churn 相同，由度数轴区分排序（交叉积语义）。
-    .git/info/exclude 加 .codegraph/（生产仓 .gitignore:17 效果同源——否则 _mk_db 的
-    DB 文件会被 git add . 提交进历史污染 churn；exclude 不进 git 历史，不产生额外
-    churn 文件）。"""
+    .git/info/exclude 加 graphify-out/ + .codegraph/（生产仓 .gitignore 效果同源——
+    否则 _mk_graph 的 graph.json 会被 git add . 提交进历史污染 churn；exclude 不进 git
+    历史，不产生额外 churn 文件）。"""
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     _git_run(tmp_path, "init"); _git_run(tmp_path, "config", "user.email", "t@t")
     _git_run(tmp_path, "config", "user.name", "t")
     (tmp_path / ".git" / "info").mkdir(exist_ok=True)   # git init 已建 info/（含样例）
-    (tmp_path / ".git" / "info" / "exclude").write_text(".codegraph/\n", encoding="utf-8")
+    (tmp_path / ".git" / "info" / "exclude").write_text("graphify-out/\n.codegraph/\n",
+                                                        encoding="utf-8")
     _git_run(tmp_path, "add", "."); _git_run(tmp_path, "commit", "-m", "c1")   # a.py
     (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")
     _git_run(tmp_path, "add", "."); _git_run(tmp_path, "commit", "-m", "c2")   # b.py
@@ -41,48 +46,43 @@ def _mk_git_repo(tmp_path):
     return tmp_path
 
 
-def _mk_db(root, degrees, dangling=0, fan_in=None):
-    """最小 codegraph DB：nodes/edges 引用列与生产 schema 同形（test_git_symbols 同口径）.
+def _mk_graph(root, degrees, dangling=0, fan_in=None):
+    """最小 graph.json（新链路唯一事实层）：nodes + links 与生产形态同形（test_git_symbols
+    同口径）.
 
-    hotspots 的度数查询引用 nodes(id,file_path) + edges(source,target)——fixture 按
-    引用列同形创建（禁手写理想化：列名与真实 DB 对齐）。
+    _degree 引用 nodes(id, source_file) + links(source, target)——fixture 按引用字段
+    同形创建（禁手写理想化）。
     degrees={file: 出边数}（source 端，target 用虚构 t{n}——不在 nodes，仅 source 端计入）；
     fan_in={file: 入边数}（I1 双端语义：target 端，source 用真实插入的 xsrc 虚节点
-    ——INNER JOIN 要求端点存在，xsrc 节点自身无边不进度数表）；
-    dangling=两端点都缺失的边数（source/target 两段 JOIN 都剔除）。"""
-    import sqlite3
-    db = root / ".codegraph" / "codegraph.db"
-    db.parent.mkdir(exist_ok=True)
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, "
-              "qualified_name TEXT, file_path TEXT)")
-    c.execute("CREATE TABLE edges(id TEXT PRIMARY KEY, source TEXT, target TEXT, "
-              "kind TEXT, provenance TEXT)")
+    ——端点须在 nodes 才有归属，xsrc 节点自身无边不进度数表）；
+    dangling=两端点都不在 nodes 的边数（两端都不计入）。"""
+    out = root / "graphify-out"; out.mkdir(exist_ok=True)
+    nodes, links = [], []
     n = 0
     for file, deg in degrees.items():
         nid = f"id:{file}"
-        c.execute("INSERT INTO nodes VALUES(?,?,?,?,?)",
-                  (nid, "function", "f", f"f.{file}", file))
+        nodes.append({"id": nid, "label": f"f.{file}", "qualified_name": f"f.{file}",
+                      "source_file": file})
         for _ in range(deg):
             n += 1
-            c.execute("INSERT INTO edges VALUES(?,?,?,?,?)",
-                      (f"e{n}", nid, f"t{n}", "calls", "raw"))
+            links.append({"source": nid, "target": f"t{n}", "relation": "calls"})
     for i in range(dangling):
         n += 1
-        c.execute("INSERT INTO edges VALUES(?,?,?,?,?)",
-                  (f"e{n}", f"ghost{i}", f"t{n}", "calls", "raw"))
+        links.append({"source": f"ghost{i}", "target": f"t{n}", "relation": "calls"})
     for file, cnt in (fan_in or {}).items():
         tid = f"id:{file}"
-        c.execute("INSERT OR IGNORE INTO nodes VALUES(?,?,?,?,?)",
-                  (tid, "function", "f", f"f.{file}", file))   # target 节点须存在（JOIN 端点）
+        if not any(x["id"] == tid for x in nodes):
+            nodes.append({"id": tid, "label": f"f.{file}", "qualified_name": f"f.{file}",
+                          "source_file": file})
         for j in range(cnt):
             n += 1
             src = f"id:xsrc{j}_{file}"
-            c.execute("INSERT INTO nodes VALUES(?,?,?,?,?)",
-                      (src, "function", "x", f"x.x{j}", f"xsrc{j}_{file}.py"))
-            c.execute("INSERT INTO edges VALUES(?,?,?,?,?)",
-                      (f"e{n}", src, tid, "imports", "raw"))
-    c.commit(); c.close()
+            nodes.append({"id": src, "label": f"x.{file}", "qualified_name": f"x.x{j}",
+                          "source_file": f"xsrc{j}_{file}.py"})
+            links.append({"source": src, "target": tid, "relation": "imports"})
+    g = {"directed": False, "multigraph": False, "graph": {},
+         "nodes": nodes, "links": links}
+    (out / "graph.json").write_text(json.dumps(g), encoding="utf-8")
 
 
 # --- churn 轴 ---
@@ -116,7 +116,7 @@ def test_hotspots_rank_by_churn_times_degree(tmp_path):
     a.py churn 同为 2、度数=1 出边+4 入边=5（I1 双端计数）score=10 居次；b.py score=2
     靠 churn 平局裁决垫底."""
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"a.py": 4})
+    _mk_graph(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"a.py": 4})
     r = hotspots(proj, top_n=10)
     assert [h["file"] for h in r["hotspots"]] == ["c.py", "a.py", "b.py"]
     by_file = {h["file"]: h for h in r["hotspots"]}
@@ -132,7 +132,7 @@ def test_hotspots_rank_by_churn_times_degree(tmp_path):
 def test_hotspots_excludes_zero_score_and_counts_scanned(tmp_path):
     """零分剔除：d.py 有 churn 无图边 score=0 不入结果，但计入 scanned（参与排序）."""
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
+    _mk_graph(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
     (proj / "d.py").write_text("w = 1\n", encoding="utf-8")
     _git_run(proj, "add", "."); _git_run(proj, "commit", "-m", "c6")
     r = hotspots(proj, top_n=10)
@@ -142,7 +142,7 @@ def test_hotspots_excludes_zero_score_and_counts_scanned(tmp_path):
 
 def test_hotspots_top_n_truncates(tmp_path):
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
+    _mk_graph(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
     r = hotspots(proj, top_n=2)
     assert len(r["hotspots"]) == 2 and r["hotspots"][0]["file"] == "c.py"
 
@@ -150,7 +150,7 @@ def test_hotspots_top_n_truncates(tmp_path):
 def test_hotspots_negative_top_n_clamped(tmp_path):
     """top_n 负值 -> max(0,·) 钳制（防 [:负数] 切片反转语义截错尾）-> 空结果不炸."""
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
+    _mk_graph(proj, {"a.py": 1, "b.py": 2, "c.py": 10})
     r = hotspots(proj, top_n=-1)
     assert r["hotspots"] == []
 
@@ -161,8 +161,8 @@ def test_non_git_repo_noop(tmp_path):
     assert r["git_available"] is False and r["hotspots"] == [] and r["scanned"] == 0
 
 
-def test_db_missing_degree_unavailable(tmp_path):
-    """git 仓但 codegraph DB 缺失 -> 度数轴缺失 -> 空结果 + degree_available=False
+def test_graph_missing_degree_unavailable(tmp_path):
+    """git 仓但 graph.json 缺失 -> 度数轴缺失 -> 空结果 + degree_available=False
     （churn 单轴无法交叉积，"没有热区信息"≠ok——与 C3 graph_diff 回退同向）."""
     proj = _mk_git_repo(tmp_path)
     r = hotspots(proj)
@@ -175,7 +175,7 @@ def test_degree_dangling_edge_excluded(tmp_path):
     无真实端点文件的边无处归属）。I1 后按双端语义：source/target 两段各自 INNER JOIN，
     两端都不存在 -> 两段都不产生该边计数."""
     proj = _mk_git_repo(tmp_path)
-    _mk_db(proj, {"a.py": 1}, dangling=2)
+    _mk_graph(proj, {"a.py": 1}, dangling=2)
     assert _degree(proj) == {"a.py": 1}
 
 
@@ -186,7 +186,7 @@ def test_hotspots_high_fan_in_low_fan_out_is_hotspot(tmp_path):
     proj = _mk_git_repo(tmp_path)
     (proj / "models.py").write_text("K = 1\n", encoding="utf-8")
     _git_run(proj, "add", "."); _git_run(proj, "commit", "-m", "c6")   # models.py churn=1
-    _mk_db(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"models.py": 3})
+    _mk_graph(proj, {"a.py": 1, "b.py": 2, "c.py": 10}, fan_in={"models.py": 3})
     r = hotspots(proj, top_n=10)
     by_file = {h["file"]: h for h in r["hotspots"]}
     assert "models.py" in by_file          # source-only 下不在结果（degree=0 score=0）
@@ -222,7 +222,9 @@ def test_parse_top_n_defensive():
 
 
 def test_format_hotspots_declares_proxies():
-    """正文声明 declared 代理（score = churn × 度数，明示非圈复杂度）+ 每行三轴数值."""
+    """正文声明 declared 代理（score = churn × 度数，明示非圈复杂度）+ 每行三轴数值.
+    06 票：degree 单位 = graph.json 合并图边计数（与 god_nodes/B1 同单位）——诚实标注
+    旧链路 raw 边计数单位差异。"""
     from graphify.serve import _format_hotspots
     r = {"hotspots": [{"file": "graphify/serve.py", "churn": 42, "degree": 310,
                        "score": 13020}],
@@ -230,6 +232,7 @@ def test_format_hotspots_declares_proxies():
     out = _format_hotspots(r)
     assert "declared" in out and "churn × degree" in out
     assert "cyclomatic" in out              # 明示"不是圈复杂度"（declared 纪律）
+    assert "merged-graph" in out and "god_nodes" in out   # 度数单位诚实标注（06 决议）
     assert "churn=42" in out and "degree=310" in out and "score=13020" in out
     assert "graphify/serve.py" in out
 
@@ -247,6 +250,6 @@ def test_format_hotspots_empty_branches():
                                  "scanned": 3, "degree_available": True})
     assert "git unavailable" in non_git
     assert "no commit history" in no_hist
-    assert "codegraph DB unavailable" in no_db
+    assert "graph.json unavailable" in no_db
     assert "no graph edges" in no_edges
     assert non_git != no_hist != no_db != no_edges   # 四分支互不混淆

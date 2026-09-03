@@ -59,24 +59,39 @@ def test_worktree_dirty_diff_included(git_proj):
     r = changed_symbols(proj, from_head=head)
     assert "a.py" in r["files"] and r["basis"] == "git_head"
 
-def test_git_head_path_queries_db_symbols(git_proj):
-    """文件集 -> DB 直查 nodes.file_path IN 文件集 -> 命中变更文件内节点（不含未变文件）."""
-    import sqlite3
+def test_git_head_path_queries_graph_symbols(git_proj):
+    """文件集 -> graph.json 内存索引（source_file 建索引）-> 命中变更文件内节点（不含未变文件）."""
+    import json
     proj, head = git_proj
-    db = proj / ".codegraph" / "codegraph.db"; db.parent.mkdir()
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, "
-              "qualified_name TEXT, file_path TEXT)")
-    c.execute("INSERT INTO nodes VALUES('id:b', 'function', 'added', 'b.added', 'b.py')")
-    c.execute("INSERT INTO nodes VALUES('id:a', 'function', 'kept', 'a.kept', 'a.py')")
-    c.commit(); c.close()
+    out = proj / "graphify-out"; out.mkdir()
+    g = {"directed": False, "multigraph": False, "graph": {},
+         "nodes": [
+             {"id": "id:b", "label": "added", "qualified_name": "b.added", "source_file": "b.py"},
+             {"id": "id:a", "label": "kept", "qualified_name": "a.kept", "source_file": "a.py"},
+         ], "links": []}
+    (out / "graph.json").write_text(json.dumps(g), encoding="utf-8")
     r = changed_symbols(proj, from_head=head)
     assert "b.py" in r["files"]
     assert "id:b" in r["symbol_ids"] and "id:a" not in r["symbol_ids"]
     assert any(s["id"] == "id:b" and s["file"] == "b.py" for s in r["symbols"])
 
-def test_db_missing_returns_empty_symbols(git_proj):
-    """DB 缺失（无 .codegraph/codegraph.db）-> 诚实空符号集，不崩出口."""
+def test_query_symbols_excludes_file_nodes(git_proj):
+    """符号集语义：file 节点（label == source_file basename）不属变更符号，剔除."""
+    import json
+    from git_symbols import _query_symbols
+    proj, _head = git_proj
+    out = proj / "graphify-out"; out.mkdir()
+    g = {"directed": False, "multigraph": False, "graph": {},
+         "nodes": [
+             {"id": "file_b", "label": "b.py", "source_file": "b.py"},
+             {"id": "id:b", "label": "added", "qualified_name": "b.added", "source_file": "b.py"},
+         ], "links": []}
+    (out / "graph.json").write_text(json.dumps(g), encoding="utf-8")
+    syms = _query_symbols(proj, ["b.py"])
+    assert [s["id"] for s in syms] == ["id:b"]
+
+def test_graph_missing_returns_empty_symbols(git_proj):
+    """graph.json 缺失（无 graphify-out/graph.json）-> 诚实空符号集，不崩出口."""
     proj, head = git_proj
     r = changed_symbols(proj, from_head=head)
     assert r["basis"] == "git_head" and r["symbol_ids"] == []
@@ -112,26 +127,21 @@ def test_clean_repo_headers_equal_baseline(git_proj):
     out2 = _format_changed_symbols(r2, None)
     assert "unavailable" in out2
 
-def test_query_symbols_batches_large_file_set(git_proj, capsys):
-    """Minor-2：501 个文件 -> 2 批 IN 查询全部命中（防 SQLite 变量上限临界静默部分失败）
-    + 超过一批时 stderr 告警（防静默）."""
-    import sqlite3
+def test_query_symbols_large_file_set(git_proj):
+    """大文件集（501 个）：graph.json 内存索引 O(n) 一次命中全部——无 SQL 变量上限问题
+    （旧链路 IN 分批防静默部分失败，06 换源后无此约束）。"""
+    import json
     from git_symbols import _query_symbols
     proj, _head = git_proj
-    db = proj / ".codegraph" / "codegraph.db"; db.parent.mkdir()
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT, name TEXT, "
-              "qualified_name TEXT, file_path TEXT)")
-    for i in range(501):
-        c.execute("INSERT INTO nodes VALUES(?, 'function', ?, ?, ?)",
-                  (f"id:{i}", f"f{i}", f"f{i}.f{i}", f"f{i:03d}.py"))
-    c.commit(); c.close()
+    out = proj / "graphify-out"; out.mkdir()
+    nodes = [{"id": f"id:{i}", "label": f"f{i}", "qualified_name": f"f{i}.f{i}",
+              "source_file": f"f{i:03d}.py"} for i in range(501)]
+    g = {"directed": False, "multigraph": False, "graph": {}, "nodes": nodes, "links": []}
+    (out / "graph.json").write_text(json.dumps(g), encoding="utf-8")
     files = [f"f{i:03d}.py" for i in range(501)]
     syms = _query_symbols(proj, files)
     assert len(syms) == 501
     assert {s["id"] for s in syms} == {f"id:{i}" for i in range(501)}
-    err = capsys.readouterr().err
-    assert "批 IN 查询" in err and "2 批" in err   # 超过一批时 stderr 告警（防静默）
 
 def test_read_prev_git_head_non_dict(tmp_path):
     """Minor-3：状态文件合法 JSON 但非 dict（如 []）-> 返回 None 不抛——AttributeError
