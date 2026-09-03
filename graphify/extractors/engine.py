@@ -32,13 +32,6 @@ def _qualified_name(scope_chain: tuple, name: str) -> str:
         return "::".join((*scope_chain, name))
     return name
 
-
-def _qname_segment(class_name: str) -> str:
-    """The name a class contributes to the qualified-name chain. Ruby class
-    names carry their full ``ruby_namespace`` prefix (``Foo::Bar``), so only the
-    last segment is appended; every other grammar's class name is already bare."""
-    return class_name.rsplit("::", 1)[-1]
-
 def _semantic_reference_edge(
     source: str,
     target: str,
@@ -1266,7 +1259,13 @@ def _c_like_function_signature(node, source: bytes, *, drop_self: bool = False) 
 def _kotlin_function_signature(node, source: bytes, *, drop_self: bool = False) -> str:
     """Kotlin function signature: params live in the `function_value_parameters`
     direct child (not a field) and the return type is the type after the
-    post-params `:` (reuses ``_kotlin_function_return_type_node``)."""
+    post-params `:` (reuses ``_kotlin_function_return_type_node``).
+
+    Only real `parameter` children are collected — the grammar emits default
+    values as SIBLING nodes of the parameter (`path: String = "/"` parses as
+    `parameter` + `"/"`), so a bare `is_named` filter would misread each default
+    literal as its own parameter.
+    """
     parts: list[str] = []
     params_node = None
     for child in node.children:
@@ -1275,7 +1274,7 @@ def _kotlin_function_signature(node, source: bytes, *, drop_self: bool = False) 
             break
     if params_node is not None:
         for child in params_node.children:
-            if child.is_named:
+            if child.type == "parameter":
                 parts.append(_flatten_text(_read_text(child, source)))
     sig = f"({', '.join(parts)})"
     ret = _kotlin_function_return_type_node(node)
@@ -2984,12 +2983,17 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
                      nodes: list, edges: list, seen_ids: set, function_bodies: list,
                      parent_class_nid: str | None, add_node, add_edge, walk,
                      callable_def_nids: set, callable_class_nids: set,
-                     ruby_namespace: list) -> bool:
+                     ruby_namespace: list, qname_chain: tuple = ()) -> bool:
     """Ruby: a constant assignment whose RHS is ``Struct.new(...)``,
     ``Class.new(Super)`` or ``Data.define(...)`` defines a class named after the
     constant (#1640). Synthesize the class node, attach block-defined methods via
     ``method`` (by recursing the block with the new node as parent), and emit an
     ``inherits`` edge for ``Class.new(Super)``. Returns True if handled.
+
+    The synthesized class carries the same depth fields as the generic class
+    branch (qualified_name = the already ruby-qualified const name; no
+    `signature` per the contract), and the block walk threads the enclosing
+    ``qname_chain`` so block methods get ``Invoice::fetch``-style names.
     """
     if node.type != "assignment":
         return False
@@ -3014,7 +3018,13 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
     const_name = "::".join(ruby_namespace + const_segments)
     line = node.start_point[0] + 1
     class_nid = _make_id(stem, const_name)
-    add_node(class_nid, const_name, line)
+    add_node(
+        class_nid, const_name, line,
+        col=node.start_point[1] + 1,
+        end_line=node.end_point[0] + 1,
+        end_byte=node.end_byte,
+        qualified_name=const_name,
+    )
     callable_def_nids.add(class_nid)  # a class is callable (its constructor)
     callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)
     # Mirror the generic class branch: containment always hangs off the file node.
@@ -3058,7 +3068,8 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
         ruby_namespace.extend(const_segments)
         try:
             for child in body.children:
-                walk(child, parent_class_nid=class_nid)
+                walk(child, parent_class_nid=class_nid,
+                     qname_chain=qname_chain + tuple(const_segments))
         finally:
             del ruby_namespace[-len(const_segments):]
     return True
@@ -3975,11 +3986,20 @@ def _extract_generic(
             if body:
                 ruby_namespace.extend(ruby_segments)
                 try:
+                    # Ruby appends ALL of the class's own name segments so a
+                    # compact `class Foo::Bar` contributes ("Foo", "Bar") to the
+                    # qualified-name chain — cutting to the last segment alone
+                    # would drop `Foo` (the class node label keeps the full
+                    # name, so the two declaration styles must agree).
+                    child_qname_chain = qname_chain + (
+                        tuple(ruby_segments) if config.ts_module == "tree_sitter_ruby"
+                        else (class_name,)
+                    )
                     for child in body.children:
                         walk(
                             child,
                             parent_class_nid=class_nid,
-                            qname_chain=qname_chain + (_qname_segment(class_name),),
+                            qname_chain=child_qname_chain,
                         )
                 finally:
                     if ruby_segments:
@@ -5039,7 +5059,7 @@ def _extract_generic(
                                 nodes, edges, seen_ids, function_bodies,
                                 parent_class_nid, add_node, add_edge, walk,
                                 callable_def_nids, callable_class_nids,
-                                ruby_namespace):
+                                ruby_namespace, qname_chain):
                 return
 
         # Python's `@property` / `@staticmethod` / `@classmethod` wrap the

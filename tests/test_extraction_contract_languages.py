@@ -231,6 +231,55 @@ def test_csharp_property_rhs_head_and_type_only(tmp_path):
     assert "signature" not in _node_by_label(result, "Name")
 
 
+# ── Reviewer fixes (second pass): Kotlin defaults + Ruby qualified names ─────
+
+
+def test_kotlin_default_parameters_do_not_leak_into_signature(tmp_path):
+    """tree-sitter-kotlin emits default values as SIBLINGS of the parameter
+    node; the builder must collect `parameter` children only, or the defaults
+    `"/"` / `false` would appear as phantom parameters."""
+    p = _write(tmp_path, "defaults.kt",
+               'fun get(path: String = "/", cache: Boolean = false): String = path\n')
+    n = _node_by_label(extract_kotlin(p), "get()")
+    assert n["signature"] == "(path: String, cache: Boolean) -> String"
+
+
+def test_ruby_compact_module_qualified_name_keeps_outer_segments(tmp_path):
+    """Compact `module Outer::Inner` must contribute BOTH segments to the
+    qualified-name chain, matching the expanded `module Outer; module Inner`
+    form (`Outer::Inner::Foo::bar`, not the outer-dropping `Inner::Foo::bar`)."""
+    p = _write(tmp_path, "compact.rb",
+               "module Outer::Inner\n"
+               "  class Foo\n"
+               "    def bar\n"
+               "    end\n"
+               "  end\n"
+               "end\n")
+    result = extract_ruby(p)
+    assert _node_by_label(result, ".bar()")["qualified_name"] == "Outer::Inner::Foo::bar"
+    assert _node_by_label(result, "Outer::Inner::Foo")["qualified_name"] == "Outer::Inner::Foo"
+
+
+def test_ruby_struct_new_class_carries_depth_fields_and_qualified_block_methods(tmp_path):
+    """A `Invoice = Struct.new(...) do ... end` synthesized class carries the
+    contract depth fields (minus signature), and its block methods get
+    `Invoice::fetch`-style qualified names (not bare `fetch`)."""
+    p = _write(tmp_path, "struct.rb",
+               "Invoice = Struct.new(:id, :total) do\n"
+               "  def fetch\n"
+               "    id\n"
+               "  end\n"
+               "end\n")
+    result = extract_ruby(p)
+    cls = _node_by_label(result, "Invoice")
+    assert cls["qualified_name"] == "Invoice"
+    assert cls["source_location"] == "L1:C1"
+    assert cls["end_line"] == 5
+    assert isinstance(cls["end_byte"], int)
+    assert "signature" not in cls  # classes get no signature per the contract
+    assert _node_by_label(result, ".fetch()")["qualified_name"] == "Invoice::fetch"
+
+
 def test_extraction_is_repeatable_all_languages():
     """Same input -> identical extraction dict for every language config."""
     for lang in _LANGS:
