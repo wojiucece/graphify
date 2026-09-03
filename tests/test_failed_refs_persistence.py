@@ -109,3 +109,145 @@ def test_build_merge_carries_existing_failed_refs(tmp_path):
                     graph_path=out, dedup=False)
     names = {fr["callee_name"] for fr in G.graph.get("failed_refs", [])}
     assert names == {"old0", "new0"}
+
+
+# ── 07 票评审 I1/I3：三引擎共享逐出语义（删除/重提源 failed_refs 不永生）────────
+# 与 watch._reconcile_existing_graph 同源：file_path 命中重提源（new_sources）或
+# 剪除源（prune/deleted）→ 逐出；unchanged 源 → 保留。
+
+def test_build_merge_evicts_failed_refs_for_rebuilt_and_deleted(tmp_path):
+    out = tmp_path / "graph.json"
+    out.write_text(json.dumps(
+        {"nodes": [
+            {"id": "n_u", "label": "u()", "source_file": "pkg/unchanged.py",
+             "source_location": "L1:C1"},
+            {"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+             "source_location": "L1:C1"},
+            {"id": "n_d", "label": "d()", "source_file": "pkg/deleted.py",
+             "source_location": "L1:C1"},
+        ], "edges": [], "hyperedges": [],
+         "failed_refs": [
+             {"from_node": "n_u", "callee_name": "u_missing", "line": 1,
+              "file_path": "pkg/unchanged.py"},
+             {"from_node": "n_r", "callee_name": "stale_callee", "line": 1,
+              "file_path": "pkg/re_extracted.py"},
+             {"from_node": "n_d", "callee_name": "deleted_callee", "line": 1,
+              "file_path": "pkg/deleted.py"},
+         ]}), encoding="utf-8")
+    G = build_merge(
+        [{"nodes": [{"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+                     "source_location": "L1:C1"}],
+          "edges": [], "hyperedges": [],
+          "failed_refs": [
+              {"from_node": "n_r", "callee_name": "fresh_callee", "line": 2,
+               "file_path": "pkg/re_extracted.py"},
+          ]}],
+        graph_path=out, prune_sources=["pkg/deleted.py"], dedup=False)
+    names = {fr["callee_name"] for fr in G.graph.get("failed_refs", [])}
+    assert names == {"u_missing", "fresh_callee"}  # stale 重提源逐出 + deleted 逐出
+
+
+def test_merge_raw_extraction_evicts_failed_refs_for_rebuilt_and_deleted(tmp_path):
+    out = tmp_path / "graph.json"
+    out.write_text(json.dumps(
+        {"nodes": [
+            {"id": "n_u", "label": "u()", "source_file": "pkg/unchanged.py",
+             "source_location": "L1:C1"},
+            {"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+             "source_location": "L1:C1"},
+            {"id": "n_d", "label": "d()", "source_file": "pkg/deleted.py",
+             "source_location": "L1:C1"},
+        ], "edges": [], "hyperedges": [],
+         "failed_refs": [
+             {"from_node": "n_u", "callee_name": "u_missing", "line": 1,
+              "file_path": "pkg/unchanged.py"},
+             {"from_node": "n_r", "callee_name": "stale_callee", "line": 1,
+              "file_path": "pkg/re_extracted.py"},
+             {"from_node": "n_d", "callee_name": "deleted_callee", "line": 1,
+              "file_path": "pkg/deleted.py"},
+         ]}), encoding="utf-8")
+    new = {"nodes": [{"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+                      "source_location": "L1:C1"}],
+           "edges": [], "hyperedges": [],
+           "failed_refs": [
+               {"from_node": "n_r", "callee_name": "fresh_callee", "line": 2,
+                "file_path": "pkg/re_extracted.py"},
+           ]}
+    merged = merge_raw_extraction(new, out, prune_sources=["pkg/deleted.py"])
+    names = {fr["callee_name"] for fr in merged.get("failed_refs", [])}
+    assert names == {"u_missing", "fresh_callee"}
+
+
+def test_prune_graph_json_sources_evicts_failed_refs(tmp_path):
+    """07 票评审 I1：_prune_graph_json_sources（--no-cluster 增量早退剪源路径）同步
+    逐出被剪源（删除/排除）的 failed_refs——与节点/边同一逐出语义。"""
+    from graphify.cli import _prune_graph_json_sources
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(
+        {"nodes": [
+            {"id": "n1", "label": "a()", "source_file": "pkg/keep.py",
+             "source_location": "L1:C1"},
+            {"id": "n2", "label": "b()", "source_file": "pkg/gone.py",
+             "source_location": "L1:C1"},
+        ], "edges": [], "hyperedges": [],
+         "failed_refs": [
+             {"from_node": "n1", "callee_name": "keep_missing", "line": 1,
+              "file_path": "pkg/keep.py"},
+             {"from_node": "n2", "callee_name": "gone_missing", "line": 1,
+              "file_path": "pkg/gone.py"},
+         ]}), encoding="utf-8")
+    n_removed = _prune_graph_json_sources(graph_path, ["pkg/gone.py"])
+    assert n_removed == 1
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    names = {fr["callee_name"] for fr in data.get("failed_refs", [])}
+    assert names == {"keep_missing"}  # gone.py 的失败引用被逐出
+
+
+def test_watch_reconcile_evicts_failed_refs_for_rebuilt_and_deleted(tmp_path):
+    """07 票评审 I3：watch._reconcile_existing_graph 的 failed_refs 逐出（file_path
+    identity 命中删除/重提源 → 逐出；unchanged 源 → 保留）。"""
+    from graphify.watch import _reconcile_existing_graph
+    root = tmp_path
+    (root / "pkg").mkdir()
+    for name in ("unchanged.py", "re_extracted.py"):
+        (root / "pkg" / name).write_text("x = 1\n", encoding="utf-8")
+    out_dir = root / "graphify-out"
+    out_dir.mkdir()
+    existing_path = out_dir / "graph.json"
+    existing_path.write_text(json.dumps(
+        {"nodes": [
+            {"id": "n_u", "label": "u()", "source_file": "pkg/unchanged.py",
+             "source_location": "L1:C1"},
+            {"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+             "source_location": "L1:C1"},
+            {"id": "n_d", "label": "d()", "source_file": "pkg/deleted.py",
+             "source_location": "L1:C1"},
+        ], "links": [], "hyperedges": [],
+         "failed_refs": [
+             {"from_node": "n_u", "callee_name": "u_missing", "line": 1,
+              "file_path": "pkg/unchanged.py"},
+             {"from_node": "n_r", "callee_name": "stale_callee", "line": 1,
+              "file_path": "pkg/re_extracted.py"},
+             {"from_node": "n_d", "callee_name": "deleted_callee", "line": 1,
+              "file_path": "pkg/deleted.py"},
+         ]}), encoding="utf-8")
+    result = {
+        "nodes": [{"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+                   "source_location": "L1:C1"}],
+        "edges": [], "hyperedges": [],
+        "failed_refs": [
+            {"from_node": "n_r", "callee_name": "fresh_callee", "line": 2,
+             "file_path": "pkg/re_extracted.py"},
+        ],
+    }
+    deleted_identity = (root / "pkg" / "deleted.py").resolve().as_posix()
+    merged, _ = _reconcile_existing_graph(
+        existing_path, result,
+        out=out_dir, project_root=root, watch_root=root,
+        code_files=[root / "pkg" / "unchanged.py", root / "pkg" / "re_extracted.py"],
+        extract_targets=[root / "pkg" / "re_extracted.py"],
+        full_rebuild=False, deleted_paths=set(),
+        deleted_source_identities={deleted_identity},
+    )
+    names = {fr["callee_name"] for fr in merged.get("failed_refs", [])}
+    assert names == {"u_missing", "fresh_callee"}

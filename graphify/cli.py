@@ -616,14 +616,25 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
         h for h in data.get("hyperedges", [])
         if isinstance(h, dict) and h.get("source_file") not in stale
     ]
+    # 07 票（评审 I1）：被剪源（删除/排除）的 failed_refs 同步逐出——与节点/边同一
+    # 逐出语义，防幻影 file:line 缺口。stale_sources 是图自身 source_file 拼写，
+    # failed_refs.file_path 同源（相对 posix），精确串匹配即可。
+    _had_failed_refs = "failed_refs" in data
+    kept_failed = [
+        fr for fr in data.get("failed_refs", [])
+        if isinstance(fr, dict) and fr.get("file_path") not in stale
+    ]
+    _failed_pruned = len(data.get("failed_refs", [])) - len(kept_failed)
     if n_removed == 0 and len(kept_edges) == len(data.get(links_key, [])) and (
         len(kept_hyper) == len(data.get("hyperedges", []))
-    ):
+    ) and _failed_pruned == 0:
         return 0
     data["nodes"] = kept_nodes
     data[links_key] = kept_edges
     if "hyperedges" in data:
         data["hyperedges"] = kept_hyper
+    if _had_failed_refs:
+        data["failed_refs"] = kept_failed
     from graphify.export import backup_if_protected as _backup
     _backup(graph_path.parent)
     from graphify.paths import write_json_atomic

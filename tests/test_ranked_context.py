@@ -15,11 +15,13 @@ def mini_db(tmp_path):
     graph = {
         "directed": False, "multigraph": False, "graph": {},
         "nodes": [
-            {"id": "a1", "kind": "function", "label": "debounce_grace",
+            # 07 票评审 I2：函数标签用生产形态（带 `()`，graphify label 原生形态）——
+            # 让 pinning/检索测试练到真实场景（裸名精确匹配永不命中函数标签）。
+            {"id": "a1", "kind": "function", "label": "debounce_grace()",
              "qualified_name": "watch.debounce_grace", "source_file": "watch.py",
              "source_location": "L10:C1", "docstring": "grace window for rebuild",
              "signature": "def debounce_grace(s):"},
-            {"id": "a2", "kind": "function", "label": "watch_flush",
+            {"id": "a2", "kind": "function", "label": "watch_flush()",
              "qualified_name": "watch.watch_flush", "source_file": "watch.py",
              "source_location": "L30:C1", "docstring": None,
              "signature": "def watch_flush():"},
@@ -72,6 +74,14 @@ def test_pinning_exact_name_ranks_top(mini_db):
     assert r["query_shape"]["pinned"] == ["FanoutBase"]
     assert r["results"][0]["stage"] == "pinned"
     assert any(x["label"] == "pkg.FanoutBase" for x in r["results"])
+
+def test_pinning_function_label_with_parens(mini_db):
+    """07 票评审 I2：函数标签是 `name()` 生产形态（带括号），裸名查询必须仍命中 pinning
+    ——predicate 剥括号匹配（lower(name) ∈ {裸名, 裸名+()} 或 qualified_name=裸名）。"""
+    r = ranked_context(mini_db, "debounce_grace", token_budget=2000)
+    assert r["query_shape"]["pinned"] == ["debounce_grace"]
+    assert r["results"][0]["stage"] == "pinned"
+    assert any(x["id"] == "a1" for x in r["results"])
 
 def test_gap_hit_linked_to_failed_ref(mini_db):
     """07 票换源：identifier token 与 failed_ref.callee_name 精确匹配（大小写不敏感）
@@ -131,7 +141,7 @@ def test_collision_suffix_nodes_get_real_degree(mini_db):
     度数如实取（join 其自身度数；collision_bases 记录基底供 L1 诊断，不误当真实度 0）。"""
     graph = mini_db / "graphify-out" / "graph.json"
     data = json.loads(graph.read_text(encoding="utf-8"))
-    data["nodes"] = [{"id": "a1__cg0", "kind": "function", "label": "debounce_grace",
+    data["nodes"] = [{"id": "a1__cg0", "kind": "function", "label": "debounce_grace()",
                       "qualified_name": "watch.debounce_grace", "source_file": "watch.py",
                       "source_location": "L10:C1", "docstring": None, "signature": ""}]
     data["links"] = []

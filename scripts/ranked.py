@@ -150,13 +150,19 @@ def _fts_search(conn, identifiers: list[str]):
 
 def _pinning_search(conn, source_shaped: list[str]):
     """精确名 pinning 通道（R3-5：schema 无 lower_name 列，用 lower(name) 表达式全扫，
-    LIMIT 5 上限）。返回 (rows, pinned_terms)，rows = (id, qualified_name, name)。"""
+    LIMIT 5 上限）。返回 (rows, pinned_terms)，rows = (id, qualified_name, name)。
+    07 票评审 I2：原生函数标签是 `name()` 形态（graphify label 带括号），裸名精确匹配
+    永不命中（实测 sanitize_label 排在五个测试函数之后）——predicate 同时匹配剥括号后
+    的 name 与 qualified_name：lower(name) ∈ {裸名, 裸名+()} 或 lower(qualified_name)=裸名
+    （类/变量标签无括号照常命中）。"""
     rows, pinned_terms = [], []
     for tok in source_shaped:
+        low = tok.lower()
         try:
             found = conn.execute(
-                "SELECT id, qualified_name, name FROM nodes WHERE lower(name) = ? LIMIT ?",
-                (tok.lower(), _PIN_LIMIT)).fetchall()
+                "SELECT id, qualified_name, name FROM nodes "
+                "WHERE lower(name) IN (?, ?) OR lower(qualified_name) = ? LIMIT ?",
+                (low, low + "()", low, _PIN_LIMIT)).fetchall()
         except sqlite3.OperationalError:
             found = []
         if found:

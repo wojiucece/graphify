@@ -1672,16 +1672,27 @@ def merge_raw_extraction(
     if carried_hyper or new.get("hyperedges"):
         new["hyperedges"] = carried_hyper + list(new.get("hyperedges", []))
     # 07 票：failed_refs 跨增量构建边界存活 —— 既有失败引用 + 本 run 新提取的失败引用
-    # 并集（按四元组去重；新提取在前，同键时既有旧引用被去重丢弃 = 新的赢）。旧图无
-    # failed_refs 时为空集，幂等。
+    # 并集（按四元组去重；新提取在前，同键时既有旧引用被去重丢弃 = 新的赢）。逐出语义
+    # 镜像 watch（评审 I1 修复）：file_path 命中本 run 重提源（new_sources）或剪除源
+    # （_prune_hit——删除/排除）→ 不携带；无 file_path 的失败引用不逐出（与 watch 一致）。
+    # 旧图无 failed_refs 时为空集，幂等。
     _new_failed = [fr for fr in new.get("failed_refs", []) if isinstance(fr, dict)]
     _new_failed_keys = {
         (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
         for fr in _new_failed
     }
+
+    def _failed_evicted(fp: str | None) -> bool:
+        if not fp:
+            return False
+        if fp in new_sources or _norm_source_file(fp, _eff_root) in new_sources:
+            return True  # 本 run 重提源 —— 新鲜的赢
+        return _prune_hit(fp)  # 删除/排除源 —— 逐出
+
     new["failed_refs"] = _new_failed + [
         fr for fr in _graph_failed_refs(graph_path)
-        if (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+        if not _failed_evicted(fr.get("file_path"))
+        and (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
         not in _new_failed_keys
     ]
     if unverified_semantic_shrink:
@@ -1929,9 +1940,12 @@ def build_merge(
                 continue  # the new chunks re-emitted it — theirs wins
             carried.append(he)
 
-    # 07 票：failed_refs 跨增量构建边界存活（与 hyperedge carry 同构）。既有失败引用
-    # （未被本 run 重提的）随 base chunk 进 build()，与新 chunk 的失败引用并集（build
-    # 内按序合并，重提的以新的为准）。基线上没有 failed_refs（旧图）时为空集——幂等。
+    # 07 票：failed_refs 跨增量构建边界存活（与 hyperedge carry 同构，逐出语义镜像
+    # watch._reconcile_existing_graph——评审 I1 修复：删除/修复过的源引用不得永生）。
+    # 既有失败引用逐出条件（与节点/边 replace + prune 同源）：file_path 命中本 run 重提
+    # 源（new_sources——重提即被新鲜提取取代）或命中剪除源（_prune_match——删除/排除）
+    # → 不携带；否则保留 + 新 chunk 的失败引用并集（四元组去重，重提的以新的为准）。
+    # 无 file_path 的失败引用不逐出（与 watch 的 identity(None) not in evicted 一致）。
     carried_failed_refs: list[dict] = []
     if had_graph:
         _new_failed_keys = {
@@ -1940,7 +1954,17 @@ def build_merge(
             for fr in (chunk.get("failed_refs") or [])
             if isinstance(fr, dict)
         }
+
+        def _failed_evicted(fp: str | None) -> bool:
+            if not fp:
+                return False
+            if fp in new_sources or _norm_source_file(fp, _replace_root) in new_sources:
+                return True  # 本 run 重提源 —— 新鲜的赢
+            return _prune_match(fp)  # 删除/排除源 —— 逐出
+
         for fr in _graph_failed_refs(graph_path):
+            if _failed_evicted(fr.get("file_path")):
+                continue
             key = (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
             if key in _new_failed_keys:
                 continue  # 本 run 重提 —— 新的赢
