@@ -77,6 +77,12 @@ def _extract_ts(tmp_path):
     return extract(files, cache_root=tmp_path / "graphify-out", parallel=False)
 
 
+def _extract_pascal(tmp_path):
+    fixture = FIXTURES.parent / "pascal_cross_file"
+    files = [p.resolve() for p in sorted(fixture.iterdir())]
+    return extract(files, cache_root=tmp_path / "graphify-out", parallel=False)
+
+
 def _calls(result):
     """All call edges as (source_label, target_label, edge) tuples."""
     label = {n["id"]: n["label"] for n in result["nodes"]}
@@ -158,6 +164,18 @@ def test_failed_ref_is_structured_and_retrievable(tmp_path):
 def test_failed_refs_empty_for_fully_resolved_corpus(tmp_path):
     # The TS corpus resolves both calls (instance + static) — nothing fails.
     assert _extract_ts(tmp_path).get("failed_refs") == []
+
+
+def test_tail_resolver_rescued_call_not_reported_as_gap(tmp_path):
+    # The pascal_inherited_calls tail resolver rescues `Prepare` inside
+    # TDerivedGadget.Run via the inherits chain — a call the shared pass
+    # records as a failed_ref because no top-level `prepare` symbol exists.
+    # A call that ends up resolved must not ALSO be reported as a gap: the
+    # end-of-extract reconciliation drops it (review fix, false positive).
+    result = _extract_pascal(tmp_path)
+    calls = _calls(result)
+    assert any("Run" in s and "Prepare" in t for s, t, _ in calls)
+    assert result.get("failed_refs") == []
 
 
 def test_failed_refs_is_always_a_list_key(tmp_path):

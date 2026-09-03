@@ -7389,6 +7389,40 @@ def extract(
         if _sf and "\\" in str(_sf):
             _item["source_file"] = PurePath(_sf).as_posix()
 
+    # Task 04 review fix: reconcile failure references against the FINAL edge
+    # set. The shared cross-file call pass records a failed_ref whenever it
+    # cannot bind a raw call by name, but a TAIL resolver running later (e.g.
+    # pascal_inherited_calls, csharp_qualified_calls) may still rescue that
+    # same call into a calls/indirect_call edge. A call that ended up resolved
+    # must not ALSO be reported as a knowledge gap: drop any failed_ref whose
+    # from_node is the source of a final call edge AND whose callee_name
+    # matches that edge's target label — the same normalization the call pass's
+    # label index uses (strip "()" and a leading "."), folded for the semantic
+    # match (Pascal resolves Prepare/prepare case-insensitively). Additive:
+    # only removes failed_ref entries, never touches nodes or edges.
+    if failed_refs:
+        _label_of: dict[str, str] = {
+            n["id"]: n.get("label", "") for n in all_nodes if n.get("id")
+        }
+        _resolved_targets: dict[str, set[str]] = {}
+        for _e in all_edges:
+            if _e.get("relation") not in ("calls", "indirect_call"):
+                continue
+            _lbl = _label_of.get(_e.get("target"))
+            if not _e.get("source") or not _lbl:
+                continue
+            _resolved_targets.setdefault(_e["source"], set()).add(
+                str(_lbl).strip("()").lstrip(".").lower())
+
+        def _key(name: object) -> str:
+            return str(name).strip("()").lstrip(".").lower()
+
+        failed_refs = [
+            f for f in failed_refs
+            if _key(f.get("callee_name"))
+            not in _resolved_targets.get(f.get("from_node"), set())
+        ]
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
