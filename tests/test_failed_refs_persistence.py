@@ -251,3 +251,48 @@ def test_watch_reconcile_evicts_failed_refs_for_rebuilt_and_deleted(tmp_path):
     )
     names = {fr["callee_name"] for fr in merged.get("failed_refs", [])}
     assert names == {"u_missing", "fresh_callee"}
+
+
+def test_watch_reconcile_full_rebuild_uses_only_fresh(tmp_path):
+    """07 票评审尾巴 1：watch._reconcile_existing_graph 的 full_rebuild=True 分支——
+    failed_refs 全量替换（_fresh_failed），既有引用全部丢弃（即使 file_path 未删除/
+    未重建——全量重建覆盖整个语料，旧的天然被替换）。"""
+    from graphify.watch import _reconcile_existing_graph
+    root = tmp_path
+    (root / "pkg").mkdir()
+    for name in ("unchanged.py", "re_extracted.py"):
+        (root / "pkg" / name).write_text("x = 1\n", encoding="utf-8")
+    out_dir = root / "graphify-out"
+    out_dir.mkdir()
+    existing_path = out_dir / "graph.json"
+    existing_path.write_text(json.dumps(
+        {"nodes": [
+            {"id": "n_u", "label": "u()", "source_file": "pkg/unchanged.py",
+             "source_location": "L1:C1"},
+            {"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+             "source_location": "L1:C1"},
+        ], "links": [], "hyperedges": [],
+         "failed_refs": [
+             {"from_node": "n_u", "callee_name": "u_missing", "line": 1,
+              "file_path": "pkg/unchanged.py"},
+             {"from_node": "n_r", "callee_name": "stale_callee", "line": 1,
+              "file_path": "pkg/re_extracted.py"},
+         ]}), encoding="utf-8")
+    result = {
+        "nodes": [{"id": "n_r", "label": "r()", "source_file": "pkg/re_extracted.py",
+                   "source_location": "L1:C1"}],
+        "edges": [], "hyperedges": [],
+        "failed_refs": [
+            {"from_node": "n_r", "callee_name": "fresh_callee", "line": 2,
+             "file_path": "pkg/re_extracted.py"},
+        ],
+    }
+    merged, _ = _reconcile_existing_graph(
+        existing_path, result,
+        out=out_dir, project_root=root, watch_root=root,
+        code_files=[root / "pkg" / "unchanged.py", root / "pkg" / "re_extracted.py"],
+        extract_targets=[],
+        full_rebuild=True, deleted_paths=set(), deleted_source_identities=set(),
+    )
+    names = {fr["callee_name"] for fr in merged.get("failed_refs", [])}
+    assert names == {"fresh_callee"}  # 全量重建：u_missing / stale_callee 均被替换
