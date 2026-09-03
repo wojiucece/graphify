@@ -1256,13 +1256,17 @@ _DOCSTRING_TRUNCATED_MARKER = " …[+{n} chars truncated]"
 def _truncate_docstring(text: str) -> str:
     """Contract B2: truncate ``text`` over 1500 chars at a semantic boundary.
 
-    Scans the [1350, 1500) window backward from the cap and cuts at the latest
-    paragraph (``\\n\\n`` / CRLF ``\\r\\n\\r\\n``), line (``\\n``), then sentence
-    (``。.!?`` + whitespace) boundary; with no boundary in the window it
-    hard-cuts at 1500. The retained text is followed by a quantized
-    `` …[+N chars truncated]`` marker so consumers know both that it is
-    incomplete and how much is gone. Python string slicing is Unicode-safe, so
-    this never splits a UTF-8 char in the middle.
+    Scans the [1350, 1500) window backward from the cap and cuts at the first
+    boundary it meets — i.e. the LATEST (highest-index) boundary wins, because
+    scanning from the cap means the first hit retains the most content. At a
+    given position paragraph (``\\n\\n`` / CRLF ``\\r\\n\\r\\n``) is preferred over
+    line (``\\n``), which is preferred over sentence (``。.!?`` + whitespace), so
+    a paragraph break that sits further back in the window still beats a
+    sentence break nearer the cap. With no boundary in the window it hard-cuts
+    at 1500. The retained text is followed by a quantized `` …[+N chars
+    truncated]`` marker so consumers know both that it is incomplete and how
+    much is gone. Python string slicing is Unicode-safe, so this never splits a
+    UTF-8 char in the middle.
     """
     if len(text) <= _DOCSTRING_LIMIT:
         return text
@@ -1295,8 +1299,18 @@ def _python_first_statement_docstring(body_node, source: bytes) -> str | None:
     (contract B3 noise filter)."""
     if not body_node or not body_node.children:
         return None
-    first = body_node.children[0]
-    if first.type != "expression_statement":
+    # Skip leading comment nodes: at module level a shebang / `# -*- coding`
+    # header sits before the docstring, and comments are not statements (PEP
+    # 257 — the docstring is the first *statement*). tree-sitter never puts
+    # comments inside block bodies, so this is a no-op for class/function
+    # bodies and only the module site is affected.
+    first = None
+    for child in body_node.children:
+        if child.type == "comment":
+            continue
+        first = child
+        break
+    if first is None or first.type != "expression_statement":
         return None
     named = first.named_children
     if len(named) != 1 or named[0].type != "string":
@@ -1750,22 +1764,97 @@ _JS_DOCSTRING_EXPORT_TYPES = frozenset({
 })
 
 
+def _js_decl_nid(node, source: bytes, stem: str) -> str | None:
+    """Node id the generic extractor emits for a function/method declaration.
+
+    Mirrors the engine's id construction exactly: module-level function
+    ``stem_name``; class/interface-body methods ``<class_nid>_name``; nested
+    ``function`` declarations are parent-scoped under the nearest enclosing
+    named scope (engine ``_scan_js_nested_function_declarations`` #2653), so
+    a function inside ``outer`` is ``<outer_nid>_name`` and deeper nesting
+    chains the same way."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        return None
+    name = _read_text(name_node, source)
+    parent = node.parent
+    if parent is not None and parent.type in ("class_body", "interface_body"):
+        class_node = parent.parent
+        class_name_node = class_node.child_by_field_name("name") if class_node else None
+        if class_name_node is None:
+            return None
+        return _make_id(_make_id(stem, _read_text(class_name_node, source)), name)
+    if parent is not None and parent.type in ("program", "export_statement"):
+        return _make_id(stem, name)
+    outer = _js_enclosing_scope_nid(node, source, stem)
+    if outer is None:
+        return None
+    return _make_id(outer, name)
+
+
+def _js_arrow_owner_nid(arrow_node, source: bytes, stem: str) -> str | None:
+    """Node id that owns an arrow function, when it has one: the named const
+    binding (``const f = () => {}`` -> ``stem_f``), or the enclosing named
+    function/method when the arrow is just a callback in its body. Anonymous
+    callbacks with no owning binding contribute no id."""
+    cur = arrow_node.parent
+    while cur is not None:
+        t = cur.type
+        if t == "variable_declarator":
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None:
+                return _make_id(stem, _read_text(name_node, source))
+            return None
+        if t in ("function_declaration", "generator_function_declaration",
+                 "method_definition", "method_signature"):
+            return _js_decl_nid(cur, source, stem)
+        if t == "arrow_function":
+            owner = _js_arrow_owner_nid(cur, source, stem)
+            if owner is not None:
+                return owner
+        cur = cur.parent
+    return None
+
+
+def _js_enclosing_scope_nid(node, source: bytes, stem: str) -> str | None:
+    """Node id of the nearest enclosing named scope (function/method/arrow-const)
+    that the engine would use as ``parent_nid`` for a nested declaration. Walks
+    up the ancestor chain; anonymous arrows in between contribute no id and are
+    skipped."""
+    cur = node.parent
+    while cur is not None:
+        t = cur.type
+        if t in ("function_declaration", "generator_function_declaration",
+                 "method_definition", "method_signature"):
+            return _js_decl_nid(cur, source, stem)
+        if t == "arrow_function":
+            owner = _js_arrow_owner_nid(cur, source, stem)
+            if owner is not None:
+                return owner
+        cur = cur.parent
+    return None
+
+
 def _js_docstring_target_nid(node, source: bytes, stem: str) -> str | None:
     """Resolve a JSDoc comment's following declaration to the node id the
     generic extractor emits for it, or None when it is not a docstring-bearing
-    symbol. Mirrors the engine's id construction: module-level function/class/
-    arrow-const ``stem_name``; class-body methods ``<class_nid>_name``;
-    ``export``/decorator wrappers are unwrapped first. Scope is validated the
-    way the engine emits nodes (module level, or class/interface body) so a
-    body-level ``const x = () => {}`` never shadows a same-named module symbol's
-    docstring."""
+    symbol. ``export``/decorator wrappers are unwrapped first, then the engine's
+    id construction is mirrored per declaration kind:
+
+    - function/method (any scope the engine emits a node for — module level,
+      class/interface body, or nested ``function`` under an enclosing named
+      scope): ``_js_decl_nid``
+    - module-level class-like declarations: ``stem_name``
+    - ``const a = 1, b = () => 2``: the FIRST function-valued declarator wins
+      (scalar declarators are skipped, not fatal)
+    - body-level ``const x = () => {}`` yields nothing (the engine does not emit
+      a node for it), so a same-named module arrow can't be shadowed
+    """
     n = node
-    exported = False
     if n.type == "export_statement":
         for child in n.named_children:
             if child.type in _JS_DOCSTRING_EXPORT_TYPES:
                 n = child
-                exported = True
                 break
         else:
             return None
@@ -1774,7 +1863,14 @@ def _js_docstring_target_nid(node, source: bytes, stem: str) -> str | None:
         if n is None:
             return None
     parent = n.parent
-    is_module_level = exported or (parent is not None and parent.type == "program")
+    is_module_level = parent is not None and (
+        parent.type == "program"
+        or (parent.type == "export_statement" and parent.parent is not None
+            and parent.parent.type == "program")
+    )
+    if n.type in ("function_declaration", "generator_function_declaration",
+                  "method_definition", "method_signature"):
+        return _js_decl_nid(n, source, stem)
     if n.type in ("lexical_declaration", "variable_declaration"):
         if not is_module_level:
             return None
@@ -1784,25 +1880,9 @@ def _js_docstring_target_nid(node, source: bytes, stem: str) -> str | None:
             name_node = child.child_by_field_name("name")
             value = child.child_by_field_name("value")
             if name_node is None or value is None or value.type not in _JS_FUNCTION_VALUE_TYPES:
-                return None
+                continue  # scalar/object declarator: not a function, keep scanning
             return _make_id(stem, _read_text(name_node, source))
         return None
-    if n.type in ("function_declaration", "generator_function_declaration",
-                  "method_definition", "method_signature"):
-        name_node = n.child_by_field_name("name")
-        if name_node is None:
-            return None
-        name = _read_text(name_node, source)
-        if parent is not None and parent.type in ("class_body", "interface_body"):
-            class_node = parent.parent
-            class_name_node = class_node.child_by_field_name("name") if class_node else None
-            if class_name_node is None:
-                return None
-            class_nid = _make_id(stem, _read_text(class_name_node, source))
-            return _make_id(class_nid, name)
-        if not is_module_level:
-            return None
-        return _make_id(stem, name)
     if n.type in ("class_declaration", "abstract_class_declaration",
                   "interface_declaration", "enum_declaration", "type_alias_declaration"):
         if not is_module_level:

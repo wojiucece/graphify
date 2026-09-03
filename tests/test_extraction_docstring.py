@@ -10,9 +10,12 @@ field contract (ticket 03-field-contract, sections B1-B3):
 - <5 chars (after strip) stores null
 - precise first-statement rule (Python): only the body's first child statement,
   an ``expression_statement`` containing exactly one plain ``string`` node — no
-  concatenation, no f/b/r prefix, no assignment
+  concatenation, no f/b/r prefix, no assignment; leading module comments
+  (shebang / coding header) are skipped as non-statements
 - JS/TS: a JSDoc ``/** … */`` block associates with the function/method/class
-  declaration it immediately precedes (export / const-arrow wrappers unwrapped)
+  declaration it immediately precedes — export / const-arrow wrappers unwrapped,
+  nested ``function`` declarations scoped under their enclosing named scope, and
+  ``const a = 1, b = () => 2`` landing on the function-valued declarator
 - the existing rationale node/edge behavior is untouched
 
 The build layer has no field whitelist, so the field must land in graph.json
@@ -47,11 +50,30 @@ def _docstrings(result):
 
 
 def test_python_module_docstring_on_file_node():
+    # The fixture opens with a shebang + `# -*- coding` header; the module
+    # docstring is still the first *statement* and must be captured (comments
+    # are not statements, PEP 257).
     result = extract_python(PY_FIXTURE)
     file_node = _by_label(result["nodes"], PY_FIXTURE.name)[0]
     assert file_node["docstring"] == (
         "Module docstring: coordinates the nightly settlement reconciliation pipeline."
     )
+
+
+def test_python_module_docstring_survives_leading_comments(tmp_path):
+    """A shebang / coding / plain comment before the module docstring must not
+    disqualify it (module-level comments are real children of the module node,
+    unlike block bodies)."""
+    for head in ("#!/usr/bin/env python3\n",
+                 "# -*- coding: utf-8 -*-\n",
+                 "# some plain comment\n",
+                 "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n",
+                 ""):
+        path = tmp_path / "sample.py"
+        path.write_text(head + '"""Module docstring here."""\n\ndef f():\n    pass\n',
+                        encoding="utf-8", newline="\n")
+        docs = _docstrings(extract_python(path))
+        assert docs[path.name] == "Module docstring here.", head
 
 
 def test_python_class_and_function_docstrings_verbatim():
@@ -164,6 +186,65 @@ def test_ts_jsdoc_before_decorated_export_class_attaches(tmp_path):
     ''')
     docs = _docstrings(extract_js(path))
     assert docs["Service"] == "A decorated service class."
+
+
+def test_ts_jsdoc_on_nested_function_in_body_attaches(tmp_path):
+    """JSDoc before a ``function`` nested inside another function's body attaches
+    to the nested node the engine emits under the enclosing scope (#2653)."""
+    path = _write_ts(tmp_path, '''
+        export function outer(): void {
+          /** Inner helper doc. */
+          function helper(): number {
+            /** Deepest doc. */
+            function deep(): number { return 1; }
+            return deep();
+          }
+          return helper();
+        }
+    ''')
+    docs = _docstrings(extract_js(path))
+    assert docs["helper()"] == "Inner helper doc."
+    assert docs["deep()"] == "Deepest doc."
+
+
+def test_ts_jsdoc_on_function_inside_arrow_const_body_attaches(tmp_path):
+    """`const Panel = () => { function handleClick(){} }`: the arrow const owns
+    the nested function's scope (engine scans the arrow body under the const's
+    nid)."""
+    path = _write_ts(tmp_path, '''
+        const Panel = () => {
+          /** Click handler doc. */
+          function handleClick(): void {}
+        };
+    ''')
+    docs = _docstrings(extract_js(path))
+    assert docs["handleClick()"] == "Click handler doc."
+
+
+def test_ts_jsdoc_on_function_inside_method_body_attaches(tmp_path):
+    path = _write_ts(tmp_path, '''
+        class Foo {
+          method(): void {
+            /** Method-local helper doc. */
+            function insideMethod(): void {}
+          }
+        }
+    ''')
+    docs = _docstrings(extract_js(path))
+    assert docs["insideMethod()"] == "Method-local helper doc."
+
+
+def test_ts_jsdoc_on_multi_declarator_const_lands_on_function_value(tmp_path):
+    """`const a = 1, b = () => 2`: a JSDoc before the declaration lands on the
+    function-valued declarator (b), not a dead end on the scalar `a`."""
+    path = _write_ts(tmp_path, '''
+        /** Combiner doc. */
+        const a = 1, b = () => 2;
+    ''')
+    docs = _docstrings(extract_js(path))
+    assert docs["b()"] == "Combiner doc."
+    # No `a` node exists (scalar consts are not function nodes).
+    assert "a" not in docs or docs["a"] is None
 
 
 def test_ts_jsdoc_on_body_level_arrow_does_not_shadow_module_symbol(tmp_path):
