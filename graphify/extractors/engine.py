@@ -32,6 +32,13 @@ def _qualified_name(scope_chain: tuple, name: str) -> str:
         return "::".join((*scope_chain, name))
     return name
 
+
+def _qname_segment(class_name: str) -> str:
+    """The name a class contributes to the qualified-name chain. Ruby class
+    names carry their full ``ruby_namespace`` prefix (``Foo::Bar``), so only the
+    last segment is appended; every other grammar's class name is already bare."""
+    return class_name.rsplit("::", 1)[-1]
+
 def _semantic_reference_edge(
     source: str,
     target: str,
@@ -1143,6 +1150,153 @@ def _python_function_signature(node, source: bytes, *, drop_self: bool) -> str:
     return_type = node.child_by_field_name("return_type")
     if return_type is not None:
         sig += " -> " + _read_text(return_type, source)
+    return sig
+
+
+# ── Extraction-depth signature builders (native-indexing Task 02) ────────────
+# Each language's tree-sitter grammar declares its own parameter-list /
+# return-type field names (see LanguageConfig.params_field / return_field /
+# signature_fn). The generic builder below covers the majority; grammars whose
+# parameter list / return type are not direct node fields get a small custom
+# builder (C/C++ declarator unwrap, Kotlin function_value_parameters, Swift
+# direct parameter children).
+
+_SIGNATURE_MAX_CHARS = 100
+
+
+def _flatten_text(text: str) -> str:
+    """Collapse all runs of whitespace to a single space (multi-line C/C++/etc.
+    declarations become one-line signatures)."""
+    return " ".join(text.split())
+
+
+def _signature_head(text: str) -> str | None:
+    """Flatten and head-truncate a variable/constant RHS for the `signature`
+    field (contract rules 1 & 3): at most ``_SIGNATURE_MAX_CHARS`` chars cut on
+    a token boundary, with an explicit `` …`` marker when truncated (never a
+    silent mid-string cut). Sub-5-char noise (e.g. ``= 5``) returns None so the
+    field is omitted.
+    """
+    flat = _flatten_text(text)
+    if len(flat) < 5:
+        return None
+    if len(flat) <= _SIGNATURE_MAX_CHARS:
+        return flat
+    cut = flat.rfind(" ", 0, _SIGNATURE_MAX_CHARS)
+    if cut < 1:
+        cut = _SIGNATURE_MAX_CHARS  # one unbroken token: hard cut, still marked
+    return flat[:cut] + " …"
+
+
+def _variable_signature(node, source: bytes, *, value_field: str = "value") -> str | None:
+    """Variable/constant/field signature per the three contract rules:
+
+    1. has `=` RHS      -> flattened, token-boundary-truncated RHS head
+    2. type-only / bare -> None (the type info lives in the type refs; and
+    3. no RHS           -> None)  a too-short head is filtered as noise
+    """
+    value = node.child_by_field_name(value_field)
+    if value is None:
+        return None
+    return _signature_head(_read_text(value, source))
+
+
+def _generic_field_signature(node, source: bytes, *, params_field: str = "parameters",
+                             return_field: str = "return_type",
+                             drop_self: bool = False) -> str:
+    """Function signature ``(params) -> return`` from the config-declared
+    parameter-list / return-type field names. Param texts are the grammar's own
+    spelling (``const char *input``, ``path: String``), name excluded; each is
+    whitespace-flattened so multi-line declarations stay one line.
+    """
+    parts: list[str] = []
+    params_node = node.child_by_field_name(params_field)
+    if params_node is not None:
+        for child in params_node.children:
+            if child.is_named:
+                parts.append(_flatten_text(_read_text(child, source)))
+    if drop_self and parts and parts[0] in ("self", "cls"):
+        parts.pop(0)
+    sig = f"({', '.join(parts)})"
+    if return_field:
+        ret = node.child_by_field_name(return_field)
+        if ret is not None:
+            # TS/TSX grammar puts the return type in a `type_annotation` node
+            # whose text includes the leading `: `; unwrap to the real type.
+            if ret.type == "type_annotation":
+                ret = next((c for c in ret.children if c.is_named), None)
+            if ret is not None:
+                sig += " -> " + _flatten_text(_read_text(ret, source))
+    return sig
+
+
+def _c_like_function_signature(node, source: bytes, *, drop_self: bool = False) -> str:
+    """C/C++ function signature: unwrap pointer/reference declarators to reach
+    the function declarator's parameter list; the return type is the `type`
+    field plus any `*`/`&` operators in the wrapping declarator chain
+    (``char *process`` -> ``char *``)."""
+    parts: list[str] = []
+    ret_parts: list[str] = []
+    type_node = node.child_by_field_name("type")
+    if type_node is not None:
+        ret_parts.append(_flatten_text(_read_text(type_node, source)))
+    decl = node.child_by_field_name("declarator")
+    while decl is not None:
+        if decl.type == "function_declarator":
+            params_node = decl.child_by_field_name("parameters")
+            if params_node is not None:
+                for child in params_node.children:
+                    if child.is_named:
+                        parts.append(_flatten_text(_read_text(child, source)))
+            break
+        if decl.type in ("pointer_declarator", "reference_declarator"):
+            for child in decl.children:
+                if not child.is_named and child.type in ("*", "&"):
+                    ret_parts.append(_read_text(child, source))
+        nxt = decl.child_by_field_name("declarator")
+        if nxt is None or nxt.id == decl.id:
+            break
+        decl = nxt
+    sig = f"({', '.join(parts)})"
+    if ret_parts:
+        sig += " -> " + " ".join(ret_parts)
+    return sig
+
+
+def _kotlin_function_signature(node, source: bytes, *, drop_self: bool = False) -> str:
+    """Kotlin function signature: params live in the `function_value_parameters`
+    direct child (not a field) and the return type is the type after the
+    post-params `:` (reuses ``_kotlin_function_return_type_node``)."""
+    parts: list[str] = []
+    params_node = None
+    for child in node.children:
+        if child.type == "function_value_parameters":
+            params_node = child
+            break
+    if params_node is not None:
+        for child in params_node.children:
+            if child.is_named:
+                parts.append(_flatten_text(_read_text(child, source)))
+    sig = f"({', '.join(parts)})"
+    ret = _kotlin_function_return_type_node(node)
+    if ret is not None:
+        sig += " -> " + _flatten_text(_read_text(ret, source))
+    return sig
+
+
+def _swift_function_signature(node, source: bytes, *, drop_self: bool = False) -> str:
+    """Swift function/init/subscript signature: parameters are direct `parameter`
+    children; the result type is the `return_type` field (for a subscript, the
+    result type is its `name` field)."""
+    parts: list[str] = []
+    for child in node.children:
+        if child.type == "parameter":
+            parts.append(_flatten_text(_read_text(child, source)))
+    sig = f"({', '.join(parts)})"
+    ret = (node.child_by_field_name("name") if node.type == "subscript_declaration"
+           else node.child_by_field_name("return_type"))
+    if ret is not None:
+        sig += " -> " + _flatten_text(_read_text(ret, source))
     return sig
 
 
@@ -2345,7 +2499,12 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                             const_name = _read_text(name_node, source)
                             line = child.start_point[0] + 1
                             const_nid = _make_id(stem, const_name)
-                            add_node_fn(const_nid, const_name, line)
+                            # Constant signature: the `=` RHS head (three rules),
+                            # e.g. `const HEADERS = {...}` -> `{ ... }`.
+                            add_node_fn(
+                                const_nid, const_name, line,
+                                signature=_variable_signature(child, source),
+                            )
                             add_edge_fn(file_nid, const_nid, "contains", line)
                             const_found = True
                             # #2552: `const handler = wrapper(async (req) => …)`
@@ -3202,13 +3361,21 @@ def _extract_generic(
                 ):
                     metadata = dict(metadata or {})
                     metadata["is_partial"] = True
-            if config.ts_module == "tree_sitter_python":
+            if config.signature_enabled:
+                # Class nodes carry the depth fields minus `signature` (import
+                # and class get no signature per the contract). Ruby's
+                # class_name is already fully qualified via ruby_namespace, so
+                # it is used directly; every other grammar's name is bare.
+                if config.ts_module == "tree_sitter_ruby":
+                    class_qname = class_name
+                else:
+                    class_qname = _qualified_name(qname_chain, class_name)
                 add_node(
                     class_nid, class_name, line, metadata=metadata,
                     col=node.start_point[1] + 1,
                     end_line=node.end_point[0] + 1,
                     end_byte=node.end_byte,
-                    qualified_name=_qualified_name(qname_chain, class_name),
+                    qualified_name=class_qname,
                 )
             else:
                 add_node(class_nid, class_name, line, metadata=metadata)
@@ -3812,7 +3979,7 @@ def _extract_generic(
                         walk(
                             child,
                             parent_class_nid=class_nid,
-                            qname_chain=qname_chain + (class_name,),
+                            qname_chain=qname_chain + (_qname_segment(class_name),),
                         )
                 finally:
                     if ruby_segments:
@@ -3959,7 +4126,13 @@ def _extract_generic(
                     property_line = node.start_point[0] + 1
                     property_nid = _make_id(parent_class_nid, property_name)
                     if property_nid not in seen_ids:
-                        add_node(property_nid, property_name, property_line)
+                        # Property signature: the `= RHS` initializer head
+                        # (`public int X { get; set; } = 42` -> `42`).
+                        add_node(
+                            property_nid, property_name, property_line,
+                            signature=_variable_signature(node, source,
+                                                          value_field="value"),
+                        )
                         add_edge(parent_class_nid, property_nid, "defines",
                                  property_line, context="field")
             type_node = node.child_by_field_name("type")
@@ -4253,7 +4426,12 @@ def _extract_generic(
                 if name:
                     line = decl.start_point[0] + 1
                     field_nid = _make_id(parent_class_nid, name)
-                    add_node(field_nid, name, line)
+                    # Field signature: the `default_value` (`= RHS`) head.
+                    add_node(
+                        field_nid, name, line,
+                        signature=_variable_signature(node, source,
+                                                      value_field="default_value"),
+                    )
                     add_edge(parent_class_nid, field_nid, "defines", line, context="field")
             return
 
@@ -4293,27 +4471,33 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
-            if config.ts_module == "tree_sitter_python":
-                # Methods (parent_class_nid set) drop the implicit self/cls
-                # binding param so the signature describes the CALL shape.
-                py_extra = dict(
-                    col=node.start_point[1] + 1,
-                    end_line=node.end_point[0] + 1,
-                    end_byte=node.end_byte,
-                    signature=_python_function_signature(
+            extra = {}
+            if config.signature_enabled:
+                # Six-piece depth set on every function/method: exact start col,
+                # end_line / end_byte, readable scope-chain qualified_name, and
+                # the call-shape signature. Python methods drop the implicit
+                # self/cls binding param (its signature_fn does that itself).
+                extra["col"] = node.start_point[1] + 1
+                extra["end_line"] = node.end_point[0] + 1
+                extra["end_byte"] = node.end_byte
+                extra["qualified_name"] = _qualified_name(qname_chain, func_name)
+                if config.signature_fn is not None:
+                    extra["signature"] = config.signature_fn(
                         node, source, drop_self=bool(parent_class_nid)
-                    ),
-                    qualified_name=_qualified_name(qname_chain, func_name),
-                )
-            else:
-                py_extra = {}
+                    )
+                else:
+                    extra["signature"] = _generic_field_signature(
+                        node, source,
+                        params_field=config.params_field,
+                        return_field=config.return_field,
+                    )
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, sanitized_name)
-                add_node(func_nid, f".{func_name}()", line, **py_extra)
+                add_node(func_nid, f".{func_name}()", line, **extra)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, sanitized_name)
-                add_node(func_nid, f"{func_name}()", line, **py_extra)
+                add_node(func_nid, f"{func_name}()", line, **extra)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":

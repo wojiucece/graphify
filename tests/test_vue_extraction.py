@@ -106,7 +106,8 @@ function onClick(): void {
     assert "onClick()" in by_label
     # count is declared on line 8, onClick on line 10 of the SFC.
     assert by_label["count"]["source_location"] == "L8"
-    assert by_label["onClick()"]["source_location"] == "L10"
+    # Extraction-depth contract: function symbols carry `L<line>:C<col>`.
+    assert by_label["onClick()"]["source_location"] == "L10:C1"
 
 
 def test_typed_props_reference_imported_type(tmp_path):

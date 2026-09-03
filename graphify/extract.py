@@ -146,7 +146,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
 
 from graphify.symbol_resolution import resolve_bash_source_edges  # noqa: E402
 
-from graphify.extractors.engine import REFERENCE_CONTEXTS, _CSHARP_TYPE_PARAMETER_SCOPE_DECLARATIONS, _C_PRIMITIVE_TYPE_NODES, _JAVA_BUILTIN_TYPES, _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS, _JS_FUNCTION_VALUE_TYPES, _JS_SCOPE_BOUNDARY, _PYTHON_ANNOTATION_NOISE, _PYTHON_TYPE_CONTAINERS, _RUBY_CLASS_FACTORIES, _c_collect_type_refs, _cpp_collect_type_refs, _cpp_declarator_name, _cpp_local_var_types, _csharp_attribute_names, _csharp_classify_base, _csharp_collect_type_refs, _csharp_extra_walk, _csharp_namespace_id, _csharp_namespace_name, _csharp_pre_scan_interfaces, _csharp_type_parameters_in_scope, _dynamic_import_js, _extract_generic, _find_body, _find_require_call, _get_cpp_func_name, _java_annotation_names, _java_collect_type_refs, _java_extra_walk, _java_type_parameters_in_scope, _js_collect_pattern_idents, _js_dispatch_value_idents, _js_extra_walk, _js_local_bound_names, _js_member_assignment_target, _js_module_bound_names, _kotlin_collect_type_refs, _kotlin_function_return_type_node, _kotlin_property_type_node, _kotlin_user_type_name, _php_collect_type_refs, _php_method_return_type_node, _php_name_text, _python_collect_assignment_targets, _python_collect_param_refs, _python_collect_type_refs, _python_local_bound_names, _python_module_bound_names, _python_param_names, _read_csharp_type_name, _require_imports_js, _ruby_const_last_name, _ruby_extra_walk, _ruby_local_class_bindings, _ruby_new_class_name, _scala_collect_type_refs, _semantic_reference_edge, _source_location, _swift_classify_base, _swift_collect_type_refs, _swift_constructor_type, _swift_declaration_keyword, _swift_extra_walk, _swift_local_var_types, _swift_pre_scan, _swift_property_name, _swift_property_type_node, _swift_receiver_name, _swift_user_type_name, _ts_decorator_name, _ts_descendant_decorators, _ts_emit_decorator_edges, _ts_extra_walk, _ts_method_name, _ts_receiver_type_table  # noqa: E402,F401
+from graphify.extractors.engine import REFERENCE_CONTEXTS, _CSHARP_TYPE_PARAMETER_SCOPE_DECLARATIONS, _C_PRIMITIVE_TYPE_NODES, _JAVA_BUILTIN_TYPES, _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS, _JS_FUNCTION_VALUE_TYPES, _JS_SCOPE_BOUNDARY, _PYTHON_ANNOTATION_NOISE, _PYTHON_TYPE_CONTAINERS, _RUBY_CLASS_FACTORIES, _c_collect_type_refs, _cpp_collect_type_refs, _cpp_declarator_name, _cpp_local_var_types, _csharp_attribute_names, _csharp_classify_base, _csharp_collect_type_refs, _csharp_extra_walk, _csharp_namespace_id, _csharp_namespace_name, _csharp_pre_scan_interfaces, _csharp_type_parameters_in_scope, _dynamic_import_js, _extract_generic, _find_body, _find_require_call, _get_cpp_func_name, _java_annotation_names, _java_collect_type_refs, _java_extra_walk, _java_type_parameters_in_scope, _js_collect_pattern_idents, _js_dispatch_value_idents, _js_extra_walk, _js_local_bound_names, _js_member_assignment_target, _js_module_bound_names, _kotlin_collect_type_refs, _kotlin_function_return_type_node, _kotlin_property_type_node, _kotlin_user_type_name, _kotlin_function_signature, _c_like_function_signature, _swift_function_signature, _php_collect_type_refs, _php_method_return_type_node, _php_name_text, _python_collect_assignment_targets, _python_collect_param_refs, _python_collect_type_refs, _python_function_signature, _python_local_bound_names, _python_module_bound_names, _python_param_names, _read_csharp_type_name, _require_imports_js, _ruby_const_last_name, _ruby_extra_walk, _ruby_local_class_bindings, _ruby_new_class_name, _scala_collect_type_refs, _semantic_reference_edge, _source_location, _swift_classify_base, _swift_collect_type_refs, _swift_constructor_type, _swift_declaration_keyword, _swift_extra_walk, _swift_local_var_types, _swift_pre_scan, _swift_property_name, _swift_property_type_node, _swift_receiver_name, _swift_user_type_name, _ts_decorator_name, _ts_descendant_decorators, _ts_emit_decorator_edges, _ts_extra_walk, _ts_method_name, _ts_receiver_type_table  # noqa: E402,F401
 
 from graphify.extractors.pascal import _PAS_BEGIN_END_TOKEN_RE, _PAS_CALL_RE, _PAS_END_SEMI_RE, _PAS_IMPL_HEADER_RE, _PAS_KEYWORDS, _PAS_METHOD_DECL_RE, _PAS_MODULE_RE, _PAS_TOKEN_RE, _PAS_TYPE_HEADER_RE, _PAS_USES_RE, _extract_pascal_regex, _pascal_find_body, _pascal_split_bases, _pascal_split_sections, _pascal_split_uses, _pascal_strip_comments, extract_pascal  # noqa: E402,F401
 
@@ -808,6 +808,10 @@ _PYTHON_CONFIG = LanguageConfig(
     call_accessor_object_field="object",
     function_boundary_types=frozenset({"function_definition"}),
     import_handler=_import_python,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="return_type",
+    signature_fn=_python_function_signature,
 )
 
 _JS_CONFIG = LanguageConfig(
@@ -829,6 +833,9 @@ _JS_CONFIG = LanguageConfig(
     # fine; the inline/nested forms are what this covers.
     function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="return_type",
 )
 
 _TS_CONFIG = LanguageConfig(
@@ -851,6 +858,9 @@ _TS_CONFIG = LanguageConfig(
     # `function_expression`: see the note on the JS config above.
     function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="return_type",
 )
 
 # .tsx files must use the TSX grammar (JSX-aware), not the plain TypeScript grammar.
@@ -870,6 +880,9 @@ _TSX_CONFIG = LanguageConfig(
     call_accessor_object_field=_TS_CONFIG.call_accessor_object_field,
     function_boundary_types=_TS_CONFIG.function_boundary_types,
     import_handler=_TS_CONFIG.import_handler,
+    signature_enabled=True,
+    params_field=_TS_CONFIG.params_field,
+    return_field=_TS_CONFIG.return_field,
 )
 
 _JAVA_CONFIG = LanguageConfig(
@@ -890,6 +903,9 @@ _JAVA_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset(),
     function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_handler=_import_java,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="type",
 )
 
 _GROOVY_CONFIG = LanguageConfig(
@@ -902,6 +918,9 @@ _GROOVY_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset(),
     function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_handler=_import_java,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="type",
 )
 
 _C_CONFIG = LanguageConfig(
@@ -916,6 +935,8 @@ _C_CONFIG = LanguageConfig(
     function_boundary_types=frozenset({"function_definition"}),
     import_handler=_import_c,
     resolve_function_name_fn=_get_c_func_name,
+    signature_enabled=True,
+    signature_fn=_c_like_function_signature,
 )
 
 _CPP_CONFIG = LanguageConfig(
@@ -930,6 +951,8 @@ _CPP_CONFIG = LanguageConfig(
     function_boundary_types=frozenset({"function_definition"}),
     import_handler=_import_c,
     resolve_function_name_fn=_get_cpp_func_name,
+    signature_enabled=True,
+    signature_fn=_c_like_function_signature,
 )
 
 def _ruby_sanitize_method_name(name: str) -> str:
@@ -962,6 +985,9 @@ _RUBY_CONFIG = LanguageConfig(
     body_fallback_child_types=("body_statement",),
     function_boundary_types=frozenset({"method", "singleton_method"}),
     sanitize_symbol_name_fn=_ruby_sanitize_method_name,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="",  # Ruby has no return-type annotation in the grammar
 )
 
 _CSHARP_CONFIG = LanguageConfig(
@@ -984,6 +1010,9 @@ _CSHARP_CONFIG = LanguageConfig(
     body_fallback_child_types=("declaration_list",),
     function_boundary_types=frozenset({"method_declaration"}),
     import_handler=_import_csharp,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="returns",
 )
 
 _KOTLIN_CONFIG = LanguageConfig(
@@ -1005,6 +1034,8 @@ _KOTLIN_CONFIG = LanguageConfig(
     body_fallback_child_types=("function_body", "class_body", "enum_class_body"),
     function_boundary_types=frozenset({"function_declaration"}),
     import_handler=_import_kotlin,
+    signature_enabled=True,
+    signature_fn=_kotlin_function_signature,
 )
 
 _SCALA_CONFIG = LanguageConfig(
@@ -1022,6 +1053,9 @@ _SCALA_CONFIG = LanguageConfig(
     body_fallback_child_types=("template_body",),
     function_boundary_types=frozenset({"function_definition"}),
     import_handler=_import_scala,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="return_type",
 )
 
 _PHP_CONFIG = LanguageConfig(
@@ -1055,6 +1089,9 @@ _PHP_CONFIG = LanguageConfig(
     body_fallback_child_types=("declaration_list", "compound_statement", "enum_declaration_list"),
     function_boundary_types=frozenset({"function_definition", "method_declaration"}),
     import_handler=_import_php,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="return_type",
 )
 
 
@@ -1095,6 +1132,9 @@ _LUA_CONFIG = LanguageConfig(
     body_fallback_child_types=("block",),
     function_boundary_types=frozenset({"function_declaration"}),
     import_handler=_import_lua,
+    signature_enabled=True,
+    params_field="parameters",
+    return_field="",  # Lua has no return-type annotation in the grammar
 )
 
 
@@ -1140,6 +1180,8 @@ _SWIFT_CONFIG = LanguageConfig(
     body_fallback_child_types=("class_body", "protocol_body", "function_body", "enum_class_body"),
     function_boundary_types=frozenset({"function_declaration", "init_declaration", "deinit_declaration", "subscript_declaration"}),
     import_handler=_import_swift,
+    signature_enabled=True,
+    signature_fn=_swift_function_signature,
 )
 
 # ── Ruby local type inference (for member-call resolution) ─────────────────────

@@ -133,8 +133,10 @@ def test_multiline_cli_attribute_keeps_line_numbers(tmp_path):
         "}\n"
     )
     nodes = {n["label"]: n["source_location"] for n in extract_cpp(p)["nodes"]}
-    assert nodes["Wrapper"] == "L5"
-    assert nodes[".Init()"] == "L8"
+    # Extraction-depth contract: symbol nodes carry `L<line>:C<col>` (byte col),
+    # on the CLI-normalized source (`ref ` tokens blanked out).
+    assert nodes["Wrapper"] == "L5:C16"
+    assert nodes[".Init()"] == "L8:C9"
 
 
 def test_cli_normalization_preserves_line_breaks(tmp_path):

@@ -120,8 +120,9 @@ def test_ts_call_import_types_source_locations_are_exact(tmp_path: Path):
     })
     after_node = next(n for n in r["nodes"] if n["label"] == "after()")
     target_class_node = next(n for n in r["nodes"] if n["label"] == "TargetClass")
-    assert after_node["source_location"] == "L5"
-    assert target_class_node["source_location"] == "L6"
+    # Extraction-depth contract: symbol nodes carry `L<line>:C<col>`.
+    assert after_node["source_location"] == "L5:C1"
+    assert target_class_node["source_location"] == "L6:C1"
 
 
 def test_ts_multiline_import_type_arguments(tmp_path: Path, capsys):

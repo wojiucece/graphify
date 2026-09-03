@@ -56,6 +56,21 @@ class LanguageConfig:
     # Extra walk hook called after generic dispatch (for JS arrow functions, C# namespaces, etc.)
     extra_walk_fn: Callable | None = None
 
+    # ── Extraction-depth fields (native-indexing Task 02: six-piece contract) ──
+    # Per-language tree-sitter grammar field names; never assumed cross-language.
+    # ``signature_enabled`` gates the whole six-piece depth set for this config:
+    # signature / qualified_name / ``L<line>:C<col>`` location / end_line /
+    # end_byte on function/method/class symbol nodes. ``params_field`` /
+    # ``return_field`` name the parameter-list and return-type fields on the
+    # language's function node for the generic ``(params) -> return`` builder;
+    # ``signature_fn`` overrides it entirely for grammars whose parameter list
+    # or return type are not direct fields (C/C++ declarator unwrap, Kotlin
+    # ``function_value_parameters``, Swift direct ``parameter`` children).
+    signature_enabled: bool = False
+    params_field: str = "parameters"
+    return_field: str = "return_type"
+    signature_fn: Callable | None = None
+
 @dataclass(frozen=True)
 class _SymbolDeclarationFact:
     file_path: Path
