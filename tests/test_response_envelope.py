@@ -93,6 +93,19 @@ def test_freshness_cache_fresh_when_fingerprint_matches(tmp_path):
     assert _derive_freshness(state) == "fresh"
 
 
+def test_freshness_fts_cache_unavailable_is_stale(monkeypatch, tmp_path):
+    """B3（06 二轮评审）：fts_cache 不可用（非 editable 安装缺 scripts/）→ freshness 诚实
+    判 stale_index 不崩——_derive_freshness 每次工具调用执行，裸 import 会让所有工具
+    Error executing（ModuleNotFoundError 逃逸）。"""
+    out = tmp_path / "graphify-out"; out.mkdir()
+    (out / "graph.json").write_text(
+        json.dumps({"directed": False, "nodes": [], "links": []}), encoding="utf-8")
+    state = out / ".rebuild-state.json"
+    state.write_text(json.dumps({"schema": 1, "phase": "complete"}), encoding="utf-8")
+    monkeypatch.setattr("graphify.serve._fts_cache", lambda: None)
+    assert _derive_freshness(state) == "stale_index"
+
+
 def test_freshness_cache_stale_after_graph_update(tmp_path):
     """06 换源：complete 态 + graph.json 更新于缓存（指纹失配）-> stale_index 诚实标注——
     缓存落后于事实层。"""

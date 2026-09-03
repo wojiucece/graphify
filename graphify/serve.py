@@ -1609,7 +1609,7 @@ def _derive_freshness(state_path):
     # complete 态：FTS 缓存 vs 事实层（06 票换源——旧链路 WAL mtime 对比退役）。
     # 缓存落后于事实层（缓存缺失 / 指纹失配 = graph.json 更新于缓存）→ stale_index
     # 诚实标注；一致 → fresh。is_fresh 即指纹对比（meta 表记录构建时 graph.json 的
-    # (mtime_ns, size)；05 票二轮评审 TOCTOU 修正后 stat 先于 read，接线不依赖旧时序）。
+    # (mtime_ns, size)；A1 已落地 stat 先于 read，接线不依赖旧时序）。
     # graph.json 与状态文件同目录（自动兼容 GRAPHIFY_OUT 重定向），不硬编码 'graphify-out'。
     fts = _fts_cache()
     cache = state_path.parent / ".fts-index.db"
@@ -1617,6 +1617,8 @@ def _derive_freshness(state_path):
     try:
         if not graph.exists():
             return "stale_index"   # R5-3：事实层缺失即最陈旧形态，不崩出口
+        if fts is None:
+            return "stale_index"   # B3：fts_cache 不可用（非 editable 安装）——缓存状态不可知，最诚实 = 陈旧
         return "fresh" if fts.is_fresh(cache, graph) else "stale_index"
     except OSError:
         # freshness 是附加诚实层，无权让 call_tool 出口崩溃杀死全部响应；
@@ -1678,13 +1680,19 @@ def _apply_envelope(name: str, result, freshness: str, verdict_override: str | N
 
 def _fts_cache():
     """lazy fts_cache（scripts/ 无包结构——graphify 包不反向依赖 scripts/，rebuild_entry
-    先例：消费侧调用时才挂 sys.path）。模块缓存于 sys.modules，后续调用近零开销。"""
+    先例：消费侧调用时才挂 sys.path）。模块缓存于 sys.modules，后续调用近零开销。
+    B3（06 二轮评审）：import 失败（非 editable 安装缺 scripts/）→ 返回 None——调用方
+    诚实降级（freshness 判 stale_index、get_node 走无缓存路径），不逃逸 ModuleNotFoundError
+    （_derive_freshness 每次工具调用执行，裸 import 会让所有工具变 Error executing）。"""
     import sys as _sys
     _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
     if _scripts_dir not in _sys.path:
         _sys.path.insert(0, _scripts_dir)
-    import fts_cache
-    return fts_cache
+    try:
+        import fts_cache
+        return fts_cache
+    except ImportError:
+        return None
 
 
 def _ensure_fts_retry(graph_path, fts_path, attempts=5, base_delay=0.1):
@@ -1693,8 +1701,11 @@ def _ensure_fts_retry(graph_path, fts_path, attempts=5, base_delay=0.1):
     连接纪律：serve 侧一律短连接（查询完即关，Windows 只读句柄窗口最小）；残余碰撞
     （并发查询线程持句柄时 os.replace WinError 5）用指数退避重试兜底（5 次，0.1→0.8s）。
     指纹命中/重建成功返回；重试耗尽向上抛（缓存构建失败是事实层派生失败，诚实暴露给
-    get_node 的 except 降级路径）。"""
+    get_node 的 except 降级路径）。fts_cache 不可用（B3，_fts_cache 返回 None）→ 直接
+    False 不重建——调用方按无缓存降级。"""
     fts = _fts_cache()
+    if fts is None:
+        return False
     delay = base_delay
     for attempt in range(attempts):
         try:
@@ -1916,18 +1927,21 @@ def _get_node_tool(G, active_graph_path, arguments: dict) -> tuple[str, bool, in
     # __cg 基 id 回退。缓存缺失/指纹失配先 ensure_fts 惰性重建（锁重试退避）。
     row = None
     fts_path = Path(active_graph_path).parent / ".fts-index.db"
-    try:
-        fts = _fts_cache()
-        _ensure_fts_retry(active_graph_path, fts_path)
-        conn = fts.open_readonly(fts_path)
+    fts = _fts_cache()
+    if fts is not None:
+        # B3（06 二轮评审）：fts_cache 不可用（非 editable 安装缺 scripts/）→ 无缓存降级
+        # （row=None → has_source=False → body 档 absent）——不逃逸 AttributeError。
         try:
-            row = conn.execute(
-                "SELECT source_file, source_location, end_line, end_byte, "
-                "signature, docstring FROM nodes WHERE id = ?", (nid,)).fetchone()
-        finally:
-            conn.close()
-    except (_sqlite3.Error, OSError):
-        row = None  # 缓存缺失/损坏/锁重试耗尽：语义节点等价（has_source=False，诚实降级）
+            _ensure_fts_retry(active_graph_path, fts_path)
+            conn = fts.open_readonly(fts_path)
+            try:
+                row = conn.execute(
+                    "SELECT source_file, source_location, end_line, end_byte, "
+                    "signature, docstring FROM nodes WHERE id = ?", (nid,)).fetchone()
+            finally:
+                conn.close()
+        except (_sqlite3.Error, OSError):
+            row = None  # 缓存缺失/损坏/锁重试耗尽：语义节点等价（has_source=False，诚实降级）
     # 可切片判定：source_file + 可解析起点（L<line>）——概念/语义节点 source_location
     # 为 null，无切片面（旧链路 DB 无概念节点 → has_source=False → body 档 absent 等价）。
     has_source = (row is not None and bool(row[0])

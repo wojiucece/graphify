@@ -143,6 +143,28 @@ def test_meta_fingerprint_matches_graph(graph, db_path):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == fc._SCHEMA_VERSION
 
 
+def test_build_stats_before_read(graph, db_path):
+    """A1（Task 05 二轮评审）：stat 先于 read_text——构建期间 graph.json 被原子替换时，
+    指纹记旧值、内容读新值 → 指纹失配自愈（防 is_fresh 永真、陈旧内容不自愈）。
+    db_path 父目录须先存在（_build 不 mkdir，rebuild_fts 才 mkdir）。"""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    order = []
+
+    class RecordingPath:
+        """Duck-typed graph 路径：委托真实 Path 并记录 stat/read 顺序（_build 只吃
+        .stat() 与 .read_text(encoding=...)）。"""
+        def stat(self):
+            order.append("stat")
+            return graph.stat()
+
+        def read_text(self, **kw):
+            order.append("read")
+            return graph.read_text(**kw)
+
+    fc._build(RecordingPath(), db_path)
+    assert order == ["stat", "read"]
+
+
 # ── 构建正确性：nodes 全量 + FTS 排除 file ───────────────────────────────────
 
 def test_nodes_table_holds_all_nodes(conn, graph):

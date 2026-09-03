@@ -167,6 +167,25 @@ def test_get_node_first_call_builds_cache_and_reports_fresh(tmp_path):
     assert "Signature: def target_fn(x)" in out
 
 
+def test_fts_cache_unavailable_get_node_degrades(monkeypatch, tmp_path):
+    """B3（06 二轮评审）：fts_cache 不可用（非 editable 安装缺 scripts/）→ get_node 不
+    逃逸 AttributeError——名片仍返回、签名行省略、body 档 has_source=False → absent。"""
+    proj, gp = _mk_proj(tmp_path)
+    fc.rebuild_fts(gp, proj / "graphify-out" / ".fts-index.db")
+    G = _load(gp)
+    monkeypatch.setattr(serve_mod, "_fts_cache", lambda: None)
+    # 缺省 signature 档：名片正常（无 Signature 行——缓存不可用即无契约字段）
+    text, found, scanned, override = serve_mod._get_node_tool(G, str(gp), {"label": "target_fn"})
+    assert found and override is None
+    assert "Node: target_fn()" in text
+    assert "Signature:" not in text
+    # 显式 body：has_source=False → absent，不崩
+    text2, found2, scanned2, override2 = serve_mod._get_node_tool(
+        G, str(gp), {"label": "target_fn", "include_source": "body"})
+    assert found2 and override2 == "absent"
+    assert "Code:" not in text2
+
+
 def test_ensure_fts_retry_backoff_on_lock(monkeypatch):
     """连接纪律决策（Task 05 ⚠️③ checklist）：serve 侧短连接 + os.replace 锁
     （PermissionError/WinError 5）指数退避重试兜底——首次失败后重试成功。"""

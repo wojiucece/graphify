@@ -101,7 +101,7 @@ heuristic       → "fuzzy"
 
 ### FTS 缓存（票 05）
 
-- `graphify-out/.fts-index.db`：三表——nodes 元数据表（全量节点，服务点查类工具）、nodes\_fts FTS5 外部内容表（content='nodes'，5 列 id/name/qualified\_name/docstring/signature）、graph.json (mtime\_ns, size) 指纹表。
+- `graphify-out/.fts-index.db`：三表——nodes 元数据表（全量节点，服务点查类工具）、nodes\_fts FTS5 独立表（非外部内容表——camel 预拆与 content='nodes' 外部内容表不兼容，见 scripts/fts\_cache.py 模块 docstring 偏离论证；5 列 id/name/qualified\_name/docstring/signature）、graph.json (mtime\_ns, size) 指纹表。
 
 - bm25 权重 `(0, 3, 2, 0.2, 1)` 与 tokenizer（默认 unicode61）逐字对齐旧链路，保证排序等价迁移。
 
@@ -111,7 +111,7 @@ heuristic       → "fuzzy"
 
 - 过滤路径照搬旧链路：元数据表 WHERE 先收窄（kind/source\_file）再 JOIN FTS。
 
-- 构建原子替换（tmp + rename）；外部内容表的手动同步命令留接口（首期全量 rebuild，未来局部更新的口子）。
+- 构建原子替换（tmp + rename）；nodes\_fts 的手动同步命令留接口（'rebuild' 命令对常规 FTS5 表有效，首期全量 rebuild，未来局部更新的口子）。
 
 - 失效两级：watcher 进程内直通；serve 重启指纹对比惰性重建。
 

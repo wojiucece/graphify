@@ -179,7 +179,12 @@ def _build(graph_path: Path, db_path: Path) -> None:
     identifier token 上应用同构。nodes（原始）与 nodes_fts（拆段）按 rowid 对齐
     （先插 nodes 取 last_insert_rowid，再插 nodes_fts 同 rowid）——过滤路径 JOIN 与
     结果原始名回填都依赖此不变量。
+
+    A1（Task 05 二轮评审）：stat 先于 read_text——构建期间 graph.json 被原子替换时，
+    指纹记旧值、内容读新值 → 指纹失配自愈（原实现 read 先 stat：记新指纹配旧内容，
+    is_fresh 永真、陈旧内容不自愈）。
     """
+    st = graph_path.stat()
     g = json.loads(graph_path.read_text(encoding="utf-8"))
     conn = sqlite3.connect(str(db_path))
     try:
@@ -202,7 +207,6 @@ def _build(graph_path: Path, db_path: Path) -> None:
                 "INSERT INTO nodes_fts(rowid, id, name, qualified_name, "
                 "docstring, signature) VALUES (?,?,?,?,?,?)",
                 (rowid, fts[0], name, qn, fts[3], fts[4]))
-        st = graph_path.stat()
         conn.execute("INSERT INTO meta VALUES (?,?,?)",
                      (st.st_mtime_ns, st.st_size, int(time.time())))
         conn.commit()
