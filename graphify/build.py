@@ -1334,6 +1334,13 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # directory-qualified display label so lookup/discovery can disambiguate
     # them (#2032). Labels only — ids and edges are untouched.
     _disambiguate_file_node_labels(G)
+    # 07 票：failed_refs（Task 04 extract 失败收集器）随图构建挂到 G.graph —— to_json
+    # 提升到 graph.json 顶层（spec 定位的知识缺口查询源，ranked gap 通道消费）。仅非空
+    # 时挂载：空集不写键（无缺口则图不带该键）；增量合并（build_merge / watch reconcile）
+    # 的并集已在 base chunk/result 完成，本函数只接收单份 extraction。
+    _failed_refs = extraction.get("failed_refs")
+    if _failed_refs:
+        G.graph["failed_refs"] = list(_failed_refs)
     return G
 
 
@@ -1368,6 +1375,13 @@ def build(
         combined["hyperedges"].extend(ext.get("hyperedges", []))
         combined["input_tokens"] += ext.get("input_tokens", 0)
         combined["output_tokens"] += ext.get("output_tokens", 0)
+    # 07 票：failed_refs 跨 chunk 并集（多个 extraction 的失败引用合并成一份，随
+    # combined 进 build_from_json → G.graph）。build_merge 的 base chunk 也走 build()，
+    # 故既有失败引用（carried_failed_refs）在此与新 chunk 的失败引用汇流。
+    combined["failed_refs"] = [
+        fr for ext in extractions
+        for fr in (ext.get("failed_refs") or []) if isinstance(fr, dict)
+    ]
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would
         # raise TypeError in _pick_winner's regex search (#2326). build_from_json
@@ -1500,6 +1514,19 @@ def _load_existing_graph(graph_path: Path) -> "tuple[list, list, list, bool] | N
         list(data.get("hyperedges", [])),
         bool(data.get("directed", False)),
     )
+
+
+def _graph_failed_refs(graph_path: "str | Path") -> "list[dict]":
+    """读 graph.json 顶层 failed_refs（07 票知识缺口查询源，spec 定位 rankde gap 通道
+    消费的事实层信号）。文件缺失/损坏 → []（诚实空，增量合并路径以此为基线携带既有
+    失败引用跨构建边界存活）。独立于 _load_existing_graph（其 4 元组签名不可改，消费
+    侧在 base chunk 里额外携带本键）。"""
+    try:
+        data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+        refs = data.get("failed_refs")
+        return [r for r in refs if isinstance(r, dict)] if isinstance(refs, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 def merge_raw_extraction(
@@ -1644,6 +1671,19 @@ def merge_raw_extraction(
     carried_hyper = [he for he in existing_hyperedges if not _dropped(he)]
     if carried_hyper or new.get("hyperedges"):
         new["hyperedges"] = carried_hyper + list(new.get("hyperedges", []))
+    # 07 票：failed_refs 跨增量构建边界存活 —— 既有失败引用 + 本 run 新提取的失败引用
+    # 并集（按四元组去重；新提取在前，同键时既有旧引用被去重丢弃 = 新的赢）。旧图无
+    # failed_refs 时为空集，幂等。
+    _new_failed = [fr for fr in new.get("failed_refs", []) if isinstance(fr, dict)]
+    _new_failed_keys = {
+        (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+        for fr in _new_failed
+    }
+    new["failed_refs"] = _new_failed + [
+        fr for fr in _graph_failed_refs(graph_path)
+        if (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+        not in _new_failed_keys
+    ]
     if unverified_semantic_shrink:
         new["_unverified_semantic_shrink"] = unverified_semantic_shrink
     return new
@@ -1889,8 +1929,26 @@ def build_merge(
                 continue  # the new chunks re-emitted it — theirs wins
             carried.append(he)
 
+    # 07 票：failed_refs 跨增量构建边界存活（与 hyperedge carry 同构）。既有失败引用
+    # （未被本 run 重提的）随 base chunk 进 build()，与新 chunk 的失败引用并集（build
+    # 内按序合并，重提的以新的为准）。基线上没有 failed_refs（旧图）时为空集——幂等。
+    carried_failed_refs: list[dict] = []
+    if had_graph:
+        _new_failed_keys = {
+            (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+            for chunk in new_chunks
+            for fr in (chunk.get("failed_refs") or [])
+            if isinstance(fr, dict)
+        }
+        for fr in _graph_failed_refs(graph_path):
+            key = (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+            if key in _new_failed_keys:
+                continue  # 本 run 重提 —— 新的赢
+            carried_failed_refs.append(fr)
+
     base = (
-        [{"nodes": existing_nodes, "edges": existing_edges, "hyperedges": carried_hyperedges}]
+        [{"nodes": existing_nodes, "edges": existing_edges, "hyperedges": carried_hyperedges,
+          "failed_refs": carried_failed_refs}]
         if had_graph else []
     )
 

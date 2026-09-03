@@ -4071,7 +4071,29 @@ def dispatch_command(cmd: str) -> None:
             "hyperedges": list(sem_result.get("hyperedges", [])),
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
+            # 07 票：failed_refs（extract 失败收集器）随 merged dict 持久化 —— --no-cluster
+            # 路径顶层直写 graph.json；clustered 路径经 build()/build_merge() → G.graph →
+            # to_json 提升顶层。信号跨构建边界存活，ranked gap 通道才有源可消费。
+            "failed_refs": list(ast_result.get("failed_refs") or []),
         }
+
+        # 07 票：failed_refs.file_path 相对化——extract 以 target 为根，节点 source_file
+        # 经 build_from_json(root=target) 相对化，failed_refs 是顶层键不受 build 覆盖，
+        # 手动相对化（与节点 source_file 的 posix 相对形态一致；跨根路径保持原样兜底）。
+        # 对齐 watch.py 的 _relativize_source_files（其 failed_refs bucket 同款语义）。
+        _extract_root = Path(target).resolve()
+        def _relativize_failed_ref(_fr: dict) -> dict:
+            _fp = _fr.get("file_path")
+            if not _fp or not Path(_fp).is_absolute():
+                return _fr
+            try:
+                _rel = Path(_fp).resolve().relative_to(_extract_root)
+                return dict(_fr, file_path=_rel.as_posix())
+            except (OSError, ValueError):
+                return _fr
+        merged["failed_refs"] = [
+            _relativize_failed_ref(_fr) for _fr in merged.get("failed_refs", [])
+        ]
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"

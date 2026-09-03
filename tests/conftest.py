@@ -88,33 +88,52 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 # === CUSTOM: B1 金标门（M3）====================================================
-# 金标集（tests/fixtures/ranked_golden.json）是只读质量闸门，依赖真实 codegraph DB——
-# DB 缺失时整体跳过（'skipped (golden)' 进测试摘要，不静默消失）。默认根保留本机
-# D:/code/graphify_fork 可跑；GRAPHIFY_GOLDEN_ROOT 环境变量覆盖（CI/其他环境指向
-# 已重建 DB 的 fork）。`-m 'not golden'` 可整组排除金标闸门。
+# 金标集（tests/fixtures/ranked_golden.json）是只读质量闸门，依赖真实事实层
+# graph.json（新链路，含 failed_refs 供 gap 型查询）——事实层缺失时整体跳过
+# （'skipped (golden)' 进测试摘要，不静默消失）。默认根保留本机 D:/code/graphify_fork
+# 可跑；GRAPHIFY_GOLDEN_ROOT 环境变量覆盖（CI/其他环境指向已重建事实层的 fork）。
+# `-m 'not golden'` 可整组排除金标闸门。
 _GOLDEN_DEFAULT_ROOT = r"D:/code/graphify_fork"
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "golden: B1 只读金标集质量闸门（recall/no-degrade），依赖真实 codegraph DB；"
-        "DB 缺失时以 'skipped (golden)' 跳过，`-m 'not golden'` 可整组排除"
+        "golden: B1 只读金标集质量闸门（通过率≥95%/no-degrade），依赖真实事实层 graph.json；"
+        "事实层缺失时以 'skipped (golden)' 跳过，`-m 'not golden'` 可整组排除"
         "（金标根默认 D:/code/graphify_fork，GRAPHIFY_GOLDEN_ROOT 覆盖）",
     )
 
 
 @pytest.fixture(autouse=True)
 def _golden_gate(request) -> None:
-    """金标门：带 golden marker 的测试在真实 DB 缺失时显式跳过。
+    """金标门：带 golden marker 的测试在真实新链路事实层缺失时显式跳过。
 
     原来在测试体内 `if not exists: pytest.skip` 硬编码 D:/code/graphify_fork——
     质量闸门在其他环境静默消失且无 marker 可筛选。现在：marker 注册（pytest_configure
     上面）+ env 覆盖 + 统一 gate，'skipped (golden)' 在测试摘要可见。
+    07 票：事实层还须是"新链路"形态（graph.json 顶层含 failed_refs——Task 04 失败
+    收集器持久化接线）——旧链路（codegraph 适配器产出的 function:md5 id 图）没有
+    failed_refs，gap 型查询与 path-id expect 全部失配，跳过而非失败（'skipped (golden)'
+    提示换根）。
     """
     if request.node.get_closest_marker("golden"):
         root = Path(os.environ.get("GRAPHIFY_GOLDEN_ROOT", _GOLDEN_DEFAULT_ROOT))
-        if not (root / ".codegraph" / "codegraph.db").exists():
+        graph_json = root / "graphify-out" / "graph.json"
+        if not graph_json.exists():
             pytest.skip(
-                f"skipped (golden): GRAPHIFY_GOLDEN_ROOT={root} 无 .codegraph/codegraph.db"
+                f"skipped (golden): GRAPHIFY_GOLDEN_ROOT={root} 无 graphify-out/graph.json"
+            )
+        try:
+            import json as _json
+            _data = _json.loads(graph_json.read_text(encoding="utf-8"))
+        except Exception:
+            pytest.skip(
+                f"skipped (golden): GRAPHIFY_GOLDEN_ROOT={root} 的 graph.json 不可解析"
+            )
+        if "failed_refs" not in _data:
+            pytest.skip(
+                f"skipped (golden): GRAPHIFY_GOLDEN_ROOT={root} 是旧链路数据 "
+                f"（graph.json 无 failed_refs），金标需新链路 graph.json——"
+                f"设 GRAPHIFY_GOLDEN_ROOT 指向新链路重建的项目"
             )

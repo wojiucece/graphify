@@ -371,9 +371,10 @@ def _changed_path_candidates(raw: Path, *, change_root: Path, watch_root: Path) 
 
 
 def _relativize_source_files(payload: dict, root: Path, *, scope: Path | None = None) -> None:
-    for bucket in ("nodes", "edges", "hyperedges"):
+    for bucket in ("nodes", "edges", "hyperedges", "failed_refs"):
+        _field = "file_path" if bucket == "failed_refs" else "source_file"
         for item in payload.get(bucket, []):
-            source = item.get("source_file")
+            source = item.get(_field)
             if not source:
                 continue
             source_path = Path(source)
@@ -383,7 +384,7 @@ def _relativize_source_files(payload: dict, root: Path, *, scope: Path | None = 
                 resolved = source_path.resolve()
                 if scope is not None and not _is_relative_to(resolved, scope):
                     continue
-                item["source_file"] = resolved.relative_to(root).as_posix()
+                item[_field] = resolved.relative_to(root).as_posix()
             except ValueError:
                 continue
 
@@ -392,13 +393,14 @@ def _rebase_relative_source_files(payload: dict, source_root: Path, target_root:
     """Rebase cache-root-relative source paths onto the project root."""
     if source_root == target_root:
         return
-    for bucket in ("nodes", "edges", "hyperedges"):
+    for bucket in ("nodes", "edges", "hyperedges", "failed_refs"):
+        _field = "file_path" if bucket == "failed_refs" else "source_file"
         for item in payload.get(bucket, []):
-            source = item.get("source_file")
+            source = item.get(_field)
             if not source or Path(source).is_absolute():
                 continue
             try:
-                item["source_file"] = (source_root / source).relative_to(target_root).as_posix()
+                item[_field] = (source_root / source).relative_to(target_root).as_posix()
             except ValueError:
                 continue
 
@@ -1035,12 +1037,36 @@ def _reconcile_existing_graph(
         for item in preserved_nodes + preserved_edges + preserved_hyperedges:
             source_paths.rebase_preserved(item)
 
+        # 07 票：failed_refs 跨增量重建边界存活（Task 04 extract 失败收集器持久化接线）。
+        # 全量重建（full_rebuild）：只用本 run 新提取的（覆盖整个语料，旧的天然被替换）。
+        # 增量：既有失败引用中 evict 的（删除/重提源，其 file_path 命中删除或重建身份）丢弃，
+        # 其余保留 + 本 run 新提取的并集（按四元组去重，新的赢）。identity 空间与
+        # is_evicted 同源（source_paths.identity），失败引用用 file_path 字段（非 source_file）。
+        _fresh_failed = [fr for fr in result.get("failed_refs", []) if isinstance(fr, dict)]
+        _fresh_failed_keys = {
+            (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+            for fr in _fresh_failed
+        }
+        if full_rebuild:
+            failed_refs = _fresh_failed
+        else:
+            _failed_evicted = set(deleted_source_identities) | set(rebuilt_source_identities)
+            _preserved_failed = [
+                fr for fr in (existing.get("failed_refs") or [])
+                if isinstance(fr, dict)
+                and source_paths.identity(fr.get("file_path")) not in _failed_evicted
+                and (fr.get("from_node"), fr.get("callee_name"), fr.get("line"), fr.get("file_path"))
+                not in _fresh_failed_keys
+            ]
+            failed_refs = _fresh_failed + _preserved_failed
+
         return {
             "nodes": result["nodes"] + preserved_nodes,
             "edges": result["edges"] + preserved_edges,
             "hyperedges": result.get("hyperedges", []) + preserved_hyperedges,
             "input_tokens": 0,
             "output_tokens": 0,
+            "failed_refs": failed_refs,
         }, existing_graph_data
     except Exception as exc:
         # Post-load reconciliation failure: fall back to the fresh extraction

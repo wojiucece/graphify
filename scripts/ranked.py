@@ -1,10 +1,15 @@
-"""B1 融合检索：FTS5 × 精确名 pinning × 结构 × 预算 四通道（只读直查 codegraph DB + 合并图）。
+"""B1 融合检索：FTS5 × 精确名 pinning × 结构 × 预算 四通道（只读直查自建 FTS 缓存 + 事实层 graph.json）。
 
-分层原理（docs/graphify-codegraph-phase4-plan.md §4-B1）：词法检索（FTS5 BM25 / 精确名
-pinning）直查 `.codegraph/codegraph.db`——codegraph 符号事实层；结构（度数中心性）走
-`graphify-out/graph.json` 合并图——graphify 分析层口径（合并图口径 ≠ DB GROUP BY，
-折叠/remap 后度数不同）。token 级分流（Q8）：identifier tokens 进 FTS/pinning，
-CJK tokens 进图侧子串（R18：纯中文 FTS 必零命中，显式报告 cjk_hits 杜绝"没搜到=不存在"）。
+分层原理（docs/graphify-native-indexing-spec.md §工具面迁移）：07 票换源——词法检索
+（FTS5 BM25 / 精确名 pinning）查 `graphify-out/.fts-index.db`（自建缓存，05 票 schema/
+权重/tokenizer 逐字平移 codegraph，排序等价）；结构（度数中心性）与 gap 通道走
+`graphify-out/graph.json` 事实层（graph.json 是唯一事实来源，缓存由它投影）。
+token 级分流（Q8）：identifier tokens 进 FTS/pinning，CJK tokens 进图侧子串
+（R18：纯中文 FTS 必零命中，显式报告 cjk_hits 杜绝"没搜到=不存在"）。
+
+降级（M4 诚实 absent 保留）：graph.json 缺失/损坏（事实层没了）→ absent + db_missing
+（旧链路"非 codegraph 项目"同构）；缓存不可用（scripts 缺失/构建失败）但事实层在 →
+纯图通道（structure/cjk/gap）照常，fts/pinned 诚实零命中 + cache_missing 标注。
 
 返回 dict：{"results": [{"id","label","score","stage","source_tool"}...],
            "query_shape": {...}, "gap_hit": bool}。serve 闭包用 format_ranked 序列化为
@@ -13,16 +18,18 @@ verdict/freshness。工具侧诚实自报（query_shape/count_mode/collisions/ga
 format_ranked 归入响应体 `_meta` 对象（方案 §4-B1：`_meta.query_shape` 报告）。
 """
 from __future__ import annotations
-import json, re, sqlite3, sys
+import json, re, sqlite3, sys, time
 from pathlib import Path
 
 import networkx as nx  # B3 I2：get_digraph 统一缓存的 DiGraph 视图（graphify 核心依赖）
 
 _SELF = Path(__file__).resolve().parent
-if str(_SELF) not in sys.path:        # scripts 无包结构——同目录 import adapter（rebuild_entry 先例）
+if str(_SELF) not in sys.path:        # scripts 无包结构——同目录 import（rebuild_entry 先例）
     sys.path.insert(0, str(_SELF))
 
-from adapter import _open_readonly
+# 07 票：codegraph 运行时退役——B1 不再直查 .codegraph/codegraph.db（adapter 依赖移除），
+# 改查自建 FTS 缓存（graphify-out/.fts-index.db，scripts/fts_cache.py，05 票产物）。
+# fts_cache 是 scripts 模块，lazy import（见 _fts_cache）——graphify 包不反向依赖 scripts/。
 # Q6（v1.7 裁决）：id 折叠复用同一实现，不复刻——adapter._disambiguate_ids 同款写法
 # （graphify.ids.normalize_id，NFKC+casefold 折叠；brief 所述 adapter._normalize_id 系
 # 同源别名，adapter 未导出该名，故直接从 graphify.ids 取同函数）。
@@ -96,23 +103,49 @@ def _is_source_shaped(tok: str) -> bool:
     return any(a.islower() and b.isupper() for a, b in zip(tok, tok[1:]))
 
 
-def _fts_search(conn, identifiers: list[str]):
-    """FTS5 BM25 通道（brief 全参：5 列权重 id=0/name=3/qn=2/doc=0.2/sig=1——id 列权重=0
-    是设计选择非漏参：id 是 raw hash 无语义，匹配无检索价值）。返回 (rows, hits)，
-    rows = (id, name, qualified_name, snippet, bm25)。nodes_fts 缺失/语法异常 → 诚实零命中。"""
-    if not identifiers:
-        return [], 0
+def _fts_cache():
+    """lazy fts_cache（scripts/ 无包结构——graphify 包不反向依赖 scripts/，serve 同款
+    _fts_cache 先例：消费侧调用时才挂 sys.path）。import 失败（非 editable 安装缺
+    scripts/）→ None——调用方诚实降级（fts/pinned 通道零命中 + cache_missing 标注），
+    不逃逸 ModuleNotFoundError。"""
     try:
-        match = " ".join(f'"{t}"' for t in identifiers)   # 引号防 FTS 语法注入；隐式 AND
-        rows = conn.execute(
-            "SELECT id, name, qualified_name, "
-            "COALESCE(snippet(nodes_fts, 3, '', '', '…', 8), '') AS snip, "
-            "bm25(nodes_fts, 0, 3, 2, 0.2, 1) AS score "
-            "FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY score LIMIT ?",
-            (match, _FTS_LIMIT)).fetchall()
-        return rows, len(rows)
-    except sqlite3.OperationalError:
+        import fts_cache
+        return fts_cache
+    except ImportError:
+        return None
+
+
+def _ensure_fts_retry(graph_path, fts_path, attempts=5, base_delay=0.1):
+    """ensure_fts + os.replace 锁重试退避（serve._ensure_fts_retry 同款逻辑，ranked 自持
+    一份——serve 不反向依赖 scripts，ranked 亦不 import serve，避免循环）。指纹命中/重建
+    成功返回 True；重试耗尽向上抛（缓存构建失败是事实层派生失败，ranked_context 的 except
+    捕获后走纯图通道降级）。fts_cache 不可用（_fts_cache 返回 None）→ False 不重建。"""
+    fts = _fts_cache()
+    if fts is None:
+        return False
+    delay = base_delay
+    for attempt in range(attempts):
+        try:
+            return fts.ensure_fts(graph_path, fts_path)
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    return False
+
+
+def _fts_search(conn, identifiers: list[str]):
+    """FTS5 BM25 通道（07 票换源）：查自建 FTS 缓存 nodes_fts（05 schema 逐字平移
+    codegraph——同 5 列、同列权重 id=0/name=3/qn=2/doc=0.2/sig=1、同 unicode61 tokenizer，
+    排序等价），叠加 camel 双侧预拆（split_identifier 索引与查询共用，pinningSearch ↔
+    "pinning search" 语义命中）。委托 fts_cache.fts_search（同 snippet 列 3、同 MATCH
+    隐式 AND、同 LIMIT 40）。返回 (rows, hits)，rows = (id, name, qualified_name, snippet,
+    bm25)；缓存不可用/语法异常 → 诚实零命中。"""
+    fts = _fts_cache()
+    if fts is None or not identifiers:
         return [], 0
+    return fts.fts_search(conn, identifiers)
 
 
 def _pinning_search(conn, source_shaped: list[str]):
@@ -132,23 +165,24 @@ def _pinning_search(conn, source_shaped: list[str]):
     return rows, pinned_terms
 
 
-def _gap_refs(conn):
-    """Knowledge Gaps：unresolved_refs status='failed' → {ref.lower(): {ref, files[top3]}}。
-    表缺失（旧 schema/合成 fixture）→ 诚实空（R18：没搜到 ≠ 不存在）。"""
+def _gap_refs(failed_refs):
+    """Knowledge Gaps（07 票换源）：extract 失败收集器（Task 04，{from_node, callee_name,
+    line, file_path}）→ {ref.lower(): {ref, files[top3]}}——替代 codegraph unresolved_refs
+    status='failed'。匹配语义不变（查询词与失败引用名大小写不敏感精确匹配）。缺失
+    （旧图无 failed_refs）→ 诚实空（R18：没搜到 ≠ 不存在）。"""
     out = {}
-    try:
-        rows = conn.execute(
-            "SELECT reference_name, file_path, line "
-            "FROM unresolved_refs WHERE status='failed'").fetchall()
-    except sqlite3.OperationalError:
-        return out
-    for ref, file, line in rows:
+    for fr in failed_refs or []:
+        if not isinstance(fr, dict):
+            continue
+        ref = fr.get("callee_name") or ""
         if not ref:
             continue
         key = ref.lower()
         entry = out.setdefault(key, {"ref": ref, "files": []})
-        if file and len(entry["files"]) < _GAP_FILES_TOP:
-            entry["files"].append(f"{file}:{line}" if line else file)
+        file_path = fr.get("file_path") or ""
+        line = fr.get("line") or 0
+        if file_path and len(entry["files"]) < _GAP_FILES_TOP:
+            entry["files"].append(f"{file_path}:{line}" if line else file_path)
     return out
 
 
@@ -187,12 +221,16 @@ def _cache_load(graph_path: Path) -> dict | None:
         nid = n.get("id", "")
         if nid and _CG_SUFFIX_RE.search(_normalize_id(nid)):
             collision_bases.add(nid.split("__cg")[0])
+    # 07 票：failed_refs（知识缺口查询源）随 graph.json 载荷进缓存 —— gap 通道消费。
+    # 顶层为规范落点（--no-cluster 直写与 to_json 提升路径同源）；graph 属性槽回退
+    # 兜底（第三方写入的嵌套形态，防御性读取）。空 → []（诚实空，无缺口）。
     payload = {
         "degree": degree,
         "collision_bases": collision_bases,
         "nodes": g.get("nodes", []),
         "links": g.get("links", []),
         "digraph": None,   # B3 lazy 有向视图（首次 get_digraph 时构造驻留）
+        "failed_refs": g.get("failed_refs") or (g.get("graph") or {}).get("failed_refs") or [],
     }
     # 共享可变引用：payload（nodes/links list、degree dict、digraph）与调用方共享同一
     # 对象，调用方须只读；mutate 会污染缓存（后续命中直接复用该对象）。并发 miss 重复
@@ -204,17 +242,6 @@ def _cache_load(graph_path: Path) -> dict | None:
         oldest = next(iter(_GRAPH_CACHE))   # 插入序首键 = 最旧条目（LRU 驱逐）
         del _GRAPH_CACHE[oldest]
     return payload
-
-
-def _load_graph(graph_path: Path):
-    """合并图加载 → (degree_map, collision_bases, nodes)。加载失败 → (None, None, [])。
-    degree：links 端点计数（合并图口径）。collision_bases：_normalize_id fold 含消歧
-    后缀（__cg）的图节点原始 id 基底（Q6：碰撞节点不参与 join）。
-    I2 统一缓存后本函数即 _cache_load 的 B1 视图瘦封装（签名/语义不变）。"""
-    payload = _cache_load(graph_path)
-    if payload is None:
-        return None, None, []
-    return payload["degree"], payload["collision_bases"], payload["nodes"]
 
 
 def get_digraph(graph_path: Path):
@@ -269,26 +296,18 @@ def _cjk_search(nodes, cjk_tokens: list[str]):
     return rows, hits
 
 
-def _db_degree(conn):
-    """降级路径：DB edges GROUP BY 度数（合并图不可用，SQL GROUP BY 口径）。"""
-    degree = {}
-    try:
-        for (s, t) in conn.execute("SELECT source, target FROM edges"):
-            if s:
-                degree[s] = degree.get(s, 0) + 1
-            if t:
-                degree[t] = degree.get(t, 0) + 1
-    except sqlite3.OperationalError:
-        pass
-    return degree
-
-
 def ranked_context(root, query: str, token_budget: int = 2000, channels=None) -> dict:
-    """四通道融合检索。
+    """四通道融合检索（07 票换源：codegraph DB → 自建 FTS 缓存 + 事实层 graph.json）。
 
-    root: 项目根（含 .codegraph/codegraph.db + graphify-out/graph.json）。
+    root: 项目根（含 graphify-out/graph.json 事实层 + graphify-out/.fts-index.db 缓存）。
     channels: 启用通道子集（None=四通道全开）；"BM25-only" 对照（金标集）传
     {"fts"}——通道关闭时结构信号不参与（BM25-only 口径无度数 tiebreak）。
+
+    降级（M4 诚实 absent 保留，spec 工具面迁移）：graph.json 缺失/损坏（事实层没了）
+    → absent + db_missing 标注（旧链路"非 codegraph 项目"同构，零 serve 改动——N1 信封
+    found=False + scanned=0 即 absent）；缓存不可用（scripts 缺失 / ensure 构建失败 /
+    打开失败）但事实层在 → 纯图通道（structure/cjk/gap）照常，fts/pinned 诚实零命中 +
+    cache_missing 标注（"回退纯图通道"行为不变）。
     """
     root = Path(root)
     active = _ALL_CHANNELS if channels is None else frozenset(channels)
@@ -305,51 +324,58 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
         "gap_summary": [],
     }
 
-    try:
-        conn = _open_readonly(root / ".codegraph" / "codegraph.db")
-    except (sqlite3.OperationalError, OSError):
-        # M4：非 codegraph 项目（无 .codegraph/codegraph.db，多项目热切换下 agent 会对
-        # 无 codegraph 的项目调 B1）→ 诚实 absent 而非 isError。边界（Q1）：仅 DB 打开
-        # 失败降级；DB 在但查询炸（BEGIN/查询异常）仍 propagate 走服务端 isError。
-        # 形态选择：found=False + scanned=0 → N1 信封 absent+empty_graph（零 serve 改动，
-        # 与 _derive_verdict 契约一致）；db_missing/note 在 body._meta.query_shape 显式
-        # 标注，区分"codegraph 无 DB"（db_missing）与"graphify 空图"（empty_graph）——
-        # 两者同归 absent，原因不同，agent 靠 db_missing 分支处理。
+    graph_path = root / "graphify-out" / "graph.json"
+    # 事实层（graph.json）是唯一事实来源（spec 单一事实层）：结构/度数/cjk/gap 都从它取。
+    # 缺失/损坏（_cache_load 返回 None）→ M4 诚实 absent（旧链路"无 codegraph DB"同构——
+    # 事实层没了检索无源可查）。旧链路的 raw_db 降级随之退役：graph.json 即事实层，损坏
+    # 即整条链不可用，不存在第二个 DB 可回退。
+    payload = _cache_load(graph_path)
+    if payload is None:
         shape["db_missing"] = True
         shape["centrality"] = "db_missing"
         shape["count_mode"] = _count_tokens("")[1]
-        shape["note"] = "codegraph DB 缺失（无 .codegraph/codegraph.db）——非 codegraph 项目，B1 检索不可用"
+        shape["note"] = "graphify-out/graph.json 缺失（无事实层）——非 graphify 项目，B1 检索不可用"
         return {"results": [], "query_shape": shape, "gap_hit": False}
-    try:
-        conn.execute("BEGIN")   # 单事务快照读（Task 4 模式，WAL 并发写下恒读一致快照）
-        fts_rows, fts_hits = (_fts_search(conn, identifiers) if "fts" in active else ([], 0))
-        pinned_rows, pinned_terms = (
-            _pinning_search(conn, [t for t in identifiers if _is_source_shaped(t)])
-            if "pinned" in active else ([], []))
-        shape["fts_hits"] = fts_hits
-        shape["pinned"] = pinned_terms
-        gap_refs = _gap_refs(conn)
+    degree = payload["degree"] if "structure" in active else None
+    collision_bases = payload["collision_bases"]
+    nodes = payload["nodes"]
+    gap_refs = _gap_refs(payload["failed_refs"])
 
-        degree, collision_bases, nodes = None, set(), []
-        if "structure" in active or "cjk" in active:
-            degree, collision_bases, nodes = _load_graph(root / "graphify-out" / "graph.json")
-            if degree is None:      # 图加载失败 → 结构降级 DB GROUP BY 口径
-                shape["centrality"] = "raw_db"
-                degree = _db_degree(conn)
-                collision_bases = set()
-        if "structure" not in active:
-            degree = None           # BM25-only 对照：结构信号全关（无度数 tiebreak）
-        cjk_rows, cjk_hits = (_cjk_search(nodes, cjk) if "cjk" in active else ([], 0))
-        shape["cjk_hits"] = cjk_hits
+    # FTS 缓存（自建，05 模块）：fts/pinned 通道查 .fts-index.db。缓存不可用（模块缺失/
+    # ensure 构建失败/打开失败）→ 诚实降级到纯图通道（structure/cjk/gap 已装载），
+    # fts/pinned 零命中 + cache_missing 标注——不逃逸异常。
+    fts_rows, fts_hits = [], 0
+    pinned_rows, pinned_terms = [], []
+    conn = None
+    try:
+        fts = _fts_cache()
+        if fts is None:
+            shape["cache_missing"] = True
+        else:
+            fts_path = root / "graphify-out" / ".fts-index.db"
+            _ensure_fts_retry(graph_path, fts_path)
+            conn = fts.open_readonly(fts_path)
+            if "fts" in active:
+                fts_rows, fts_hits = _fts_search(conn, identifiers)
+            if "pinned" in active:
+                pinned_rows, pinned_terms = _pinning_search(
+                    conn, [t for t in identifiers if _is_source_shaped(t)])
+    except (sqlite3.Error, OSError, ValueError, RuntimeError):
+        shape["cache_missing"] = True
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+    shape["fts_hits"] = fts_hits
+    shape["pinned"] = pinned_terms
+    cjk_rows, cjk_hits = (_cjk_search(nodes, cjk) if "cjk" in active else ([], 0))
+    shape["cjk_hits"] = cjk_hits
 
     # 融合装配：stage 优先级（pinned > fts > cjk）+ 通道内排序 + 结构度数平局打破
-    # L1 id 恒等不变量：FTS raw id 与 merged 图 id 恒等（碰撞除外）——degree join 依赖
-    # 此隐含契约。当前成立：codegraph id 为小写 hex，graph.json 直通同一 id 池（AST
-    # 批次同源），仅 __cg 消歧后缀折叠（collision_bases 排除）。上游若改 id 生成
-    # （加盐/加前缀/改折叠规则），join 会静默退化为 degree 全 0——以 degenerate_degree
-    # 显式标注供诊断，不把"0"误当真实中心度（平局打破静默失效）。
+    # L1 id 恒等不变量：FTS 缓存 id 与 graph.json 图 id 恒等（缓存由 graph.json 投影，
+    # 碰撞除外）——degree join 依赖此隐含契约。当前成立：FTS nodes 表 id 与 graph.json
+    # 节点 id 逐字同源（05 _build 直通同一 id 池），仅 __cg 消歧后缀折叠（collision_bases
+    # 排除）。上游若改 id 生成（加盐/加前缀/改折叠规则），join 会静默退化为 degree 全 0
+    # ——以 degenerate_degree 显式标注供诊断，不把"0"误当真实中心度（平局打破静默失效）。
     results, seen = [], set()
     _join_candidates = 0   # 参与 degree join 的候选数（非碰撞）
     _deg_positive = 0      # 其中 degree > 0 的个数（L1 退化判据）
@@ -386,9 +412,9 @@ def ranked_context(root, query: str, token_budget: int = 2000, channels=None) ->
         _add({"id": cid, "label": clabel, "score": _CJK_SCORE,
               "stage": "cjk", "source_tool": "substring"})
     shape["scanned"] = len(seen)        # N1 scanned = 候选池大小（去重后）
-    # L1 退化标注：仅 merged_graph 口径（id 恒等不变量相关的 join 路径）——raw_db 降级
-    # （同源 DB 无恒等问题）与 BM25-only（degree=None）不触发。有非碰撞候选但 degree 全 0
-    # 时提示 id 恒等不变量疑破；稀疏图（孤立节点）也可能触发，属诊断信号非错误。
+    # L1 退化标注：仅 merged_graph 口径（id 恒等不变量相关的 join 路径）——BM25-only
+    # （degree=None）不触发。有非碰撞候选但 degree 全 0 时提示 id 恒等不变量疑破；
+    # 稀疏图（孤立节点）也可能触发，属诊断信号非错误。
     if degree is not None and shape["centrality"] == "merged_graph" \
             and _join_candidates and _deg_positive == 0:
         shape["degenerate_degree"] = True

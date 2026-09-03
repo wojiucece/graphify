@@ -399,6 +399,12 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
         data["graph"]["hyperedges"] = hyperedges
     data["hyperedges"] = hyperedges
+    # 07 票：failed_refs 提升到顶层 —— graph.json 顶层是知识缺口查询源（spec 定位，
+    # ranked gap 通道消费）。G.graph 属性槽（node_link_data 的 data["graph"]）仅作中间
+    # 载体：build 阶段挂到 G.graph["failed_refs"]，导出时提升为顶层键，与 --no-cluster
+    # 原始路径（merged dict 顶层直写）保持同一落点。空集不写（无缺口则不带键）。
+    if isinstance(data.get("graph"), dict) and data["graph"].get("failed_refs"):
+        data["failed_refs"] = data["graph"].pop("failed_refs")
     # Fallback provenance comes from the repo the graph is being written INTO
     # (output_path lives in <target>/graphify-out/), never the shell's cwd —
     # the same cwd-anchoring mistake #2316 fixed for `update`.

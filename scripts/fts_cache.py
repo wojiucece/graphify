@@ -139,11 +139,17 @@ def _fts_row(node: dict) -> tuple | None:
       （实测语义节点无 description 字段，接口保留待未来 description 接入）
     - file 节点：不进 FTS（文件名搜索走 pinning / 元数据表 WHERE source_file
       LIKE——进 FTS 只会引入噪声）
+    - rationale 节点（07 票修正，spec 索引范围 = AST 符号 + 语义概念节点）：graphify
+      内部推理痕迹（file_type='rationale'，label 是长文本 trace，如 "L2 验证: xxx"）既
+      非 AST 符号也非语义概念——进 FTS 只会以长文本稀释符号命中的 IDF 并淹没定义/测试
+      名（实测 4k+ rationale 节点主导多查询 top 结果），与旧链路 codegraph 索引面对齐。
 
     返回 None = 不进 FTS。语义/AST 判定顺序：先 file（file 节点 source_location
-    'L1' 也过 _is_ast_tier 的 ^L\\d，必须先短路），再 _is_ast_tier。
+    'L1' 也过 _is_ast_tier 的 ^L\\d，必须先短路），再 rationale，再 _is_ast_tier。
     """
     if _is_file_node(node):
+        return None
+    if node.get("file_type") == "rationale":
         return None
     label = node.get("label") or ""
     if _is_ast_tier(node):
