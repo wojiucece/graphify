@@ -1587,8 +1587,8 @@ def _derive_freshness(state_path):
     - 无状态文件 = 未迁移项目，守卫回退 fresh（不得全标 stale）
     - rebuilding 超时效（max(2*last_duration, 1800)s）判 stale_index（Q3 时效逃生，
       kill -9 残留的自愈上限）
-    - complete 态比对 graph.json mtime vs codegraph DB mtime（主 DB mtime 仅
-      checkpoint 时更新，不可直接用；-wal 不存在时回退主 DB，取较新者）
+    - complete 态比对 FTS 缓存 vs graph.json（is_fresh 指纹对比：meta 表记录构建时
+      graph.json 的 (mtime_ns, size)；缓存落后于事实层→stale_index，一致→fresh）
     """
     try:
         d = json.loads(state_path.read_text(encoding="utf-8"))
