@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import networkx as nx
 import pytest
-from adapter import _symbol_short_name
+from symbol_utils import _symbol_short_name  # Task 09: adapter 退役，短名事实源迁至 symbol_utils
 
 
 def test_symbol_short_name_from_label():
@@ -206,10 +206,10 @@ def test_neighbors_lines_exposes_resolved_by_when_present():
     assert "  --> callee [calls] [INFERRED] [resolved_by=fuzzy] at=pkg/caller.py:L10" in body
     assert "  <-- callee [calls] [INFERRED] [resolved_by=fuzzy] at=pkg/caller.py:L10" in body
 
-def test_serve_symbol_short_name_matches_adapter():
-    """同源自包含防漂移（rebuild_entry _parse_refresh 先例，Task 08 保留）：
+def test_serve_symbol_short_name_matches_symbol_utils():
+    """同源自包含防漂移（rebuild_entry _parse_refresh 先例，Task 08/09 保留）：
     serve.py 不 import scripts 的既有约束——_symbol_short_name 在 serve 持自包含副本，
-    语义须与 adapter 本体逐样本一致（fanout 同名匹配依赖它）。"""
+    语义须与 scripts/symbol_utils.py 本体逐样本一致（fanout 同名匹配依赖它）。"""
     from graphify.serve import _symbol_short_name as s_ssn
     for d, nid in [({"label": "pkg.Base.handle"}, "function:52e9d06d"),
                    ({"label": "main (2)"}, "function:abc"),

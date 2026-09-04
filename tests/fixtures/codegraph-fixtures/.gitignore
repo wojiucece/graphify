@@ -1,3 +1,0 @@
-# SQLite WAL 模式读写 sidecar——测试打开 DB 时会再生，勿跟踪
-mini.codegraph.db-shm
-mini.codegraph.db-wal

@@ -17,15 +17,15 @@ def test_state_path_is_under_graphify_out(proj):
 def test_write_state_requires_lock_owner(proj):
     lock = _lock_path(proj); lock.mkdir()
     (lock / "pid").write_text(str(os.getpid()))
-    _write_state(proj, lock, {"schema": 1, "phase": "rebuilding", "started": time.time()})
+    _write_state(proj, lock, {"schema": 2, "phase": "rebuilding", "started": time.time()})
     data = json.loads(_state_path(proj).read_text(encoding="utf-8"))
-    assert data["phase"] == "rebuilding" and data["schema"] == 1
+    assert data["phase"] == "rebuilding" and data["schema"] == 2
 
 def test_write_state_refuses_non_owner(proj):
     lock = _lock_path(proj); lock.mkdir()
     (lock / "pid").write_text("999999999")   # 非自身 pid
     before = _state_path(proj).exists()
-    _write_state(proj, lock, {"schema": 1, "phase": "rebuilding", "started": time.time()})
+    _write_state(proj, lock, {"schema": 2, "phase": "rebuilding", "started": time.time()})
     assert _state_path(proj).exists() == before  # 拒写，文件不出现
 
 def test_rebuild_finally_updates_state_even_on_error(proj, monkeypatch):

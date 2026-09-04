@@ -15,7 +15,8 @@ unreachable 集系统性趋空、>50% 闸门永不触发、find_dead_code 静默
 (_reverse_closure/_fanout_targets) 手法。
 
 R3-2：合并图节点 id 是 hash 形态且无 name 属性——短名唯一事实源是 label，复用
-adapter._symbol_short_name（结构查询与 B3 同源，不在本文件重复定义）。
+symbol_utils._symbol_short_name（结构查询与 B3 同源，不在本文件重复定义；Task 09
+adapter 退役后短名事实源迁至 scripts/symbol_utils.py）。
 
 import 推导（按合并图实际边形态实现，见 Task 12 报告）：
 - 合并图（codegraph-merged）kind 含 'import' 节点（import 语句本身，仅经 contains 边
@@ -42,8 +43,8 @@ from pathlib import Path
 
 import networkx as nx
 
-# 本文件从 adapter import 短名事实源（R3-2 共享）——不在本文件重复定义。
-from adapter import _symbol_short_name
+# 本文件从 symbol_utils import 短名事实源（R3-2 共享，Task 09 adapter 退役后迁入）——不在本文件重复定义。
+from symbol_utils import _symbol_short_name
 
 # 代码符号 kind 白名单：进入不可达报告与分母（scanned=符号总数）的节点。
 # 排除 file（文件不是符号）、import（import 语句是使用证据）、文档/语义概念类

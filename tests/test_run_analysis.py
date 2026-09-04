@@ -1,184 +1,68 @@
-"""端到端：codegraph DB -> graphify-out（export.to_json 产物）."""
+"""analysis-only：读事实层 mini graph.json -> GRAPH_REPORT.md / knowledge-gaps.json.
+
+Task 09 换源：输入从 mini.codegraph.db（codegraph 退役）换成 mini-graph.json（事实层
+node_link 格式 + failed_refs）。seed/refresh/shrink-guard 等 build 步骤已随 rebuild_entry
+编排迁至 test_rebuild_entry.py。
+"""
 import json
 from pathlib import Path
 
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-MINI_DB = FIXTURES / "codegraph-fixtures" / "mini.codegraph.db"
+MINI_GRAPH = FIXTURES / "mini-graph.json"
 
 
-def test_run_produces_node_link_graph_and_report(tmp_path):
+def test_run_reads_graph_and_writes_report(tmp_path):
+    """读事实层 graph.json -> GRAPH_REPORT.md（graph.json 是输入，已存在）."""
     from run_analysis import run
-    out = run(MINI_DB, output_dir=tmp_path, root="fixture-src")
+    out = run(MINI_GRAPH, output_dir=tmp_path, root="fixture-src")
     out = Path(out)
-    graph = out / "graph.json"
     report = out / "GRAPH_REPORT.md"
-    assert graph.exists() and report.exists()
-    data = json.loads(graph.read_text(encoding="utf-8"))
-    # B4: node_link 格式 -> links 键（非 edges）
-    assert "links" in data, "graph.json 必须是 node_link 格式（links 键），serve.py 依赖"
-    assert "nodes" in data and len(data["nodes"]) > 0
+    assert report.exists()
     assert report.stat().st_size > 100
 
 
-def test_run_merges_seed_and_attaches_hyperedges(tmp_path):
-    from run_analysis import run
-    seed = {
-        "nodes": [{"id": "concept:auth", "label": "认证", "_origin": "semantic", "file_type": "concept"}],
-        "edges": [{"source": "concept:auth", "target": "file:fixture-src/a.py", "relation": "documents"}],
-        "hyperedges": [{"id": "auth_cluster", "label": "认证簇", "nodes": ["concept:auth"]}],
-    }
-    seed_path = tmp_path / "seed.json"
-    seed_path.write_text(__import__("json").dumps(seed), encoding="utf-8")
-    out = run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src", semantic_seed=seed_path)
-    data = __import__("json").loads((Path(out) / "graph.json").read_text(encoding="utf-8"))
-    ids = {n["id"] for n in data["nodes"]}
-    assert "concept:auth" in ids
-    # C2: hyperedges 挂回（node_link 格式 graph.hyperedges 或顶层 hyperedges）
-    hes = data.get("hyperedges") or data.get("graph", {}).get("hyperedges") or []
-    assert any(h["id"] == "auth_cluster" for h in hes), "hyperedges 未挂回"
-
-
-def test_run_warns_on_symbolic_anchor_violations(tmp_path, capfd):
-    """I1/B2 接线（最终审查）：seed 含符号级锚点（function:xxx）-> stderr 告警但不阻断.
-    validate_semantic_anchors 原仅测试调用；接线后 run() 内消费（违规只提示，不跑不炸）。"""
-    from run_analysis import run
-    seed = {
-        "nodes": [{"id": "concept:auth", "label": "认证", "_origin": "semantic", "file_type": "concept"}],
-        "edges": [{"source": "concept:auth", "target": "function:abc123", "relation": "documents"}],
-        "hyperedges": [],
-    }
-    seed_path = tmp_path / "seed.json"
-    seed_path.write_text(json.dumps(seed), encoding="utf-8")
-    out = run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src", semantic_seed=seed_path)
-    captured = capfd.readouterr()
-    assert "语义锚定违规" in captured.err, f"stderr 未含锚定违规告警: {captured.err!r}"
-    assert "function:abc123" in captured.err
-    # 不阻断：run 正常产出
-    assert (Path(out) / "graph.json").exists()
-
-
-def test_run_warns_on_missing_explicit_seed(tmp_path, capfd):
-    """用户回归报告：显式 --semantic-seed 传不存在路径 -> stderr 警告（fail-loud 保留）.
-    旧代码传错路径当场 FileNotFoundError crash（拼错能立刻发现）；静默跳过则产出
-    adapter-only 图零警告。修复后：警告含路径/关键词，且 run 不抛异常、正常产出 graph.json。"""
-    from run_analysis import run
-    missing = tmp_path / "nonexistent.json"
-    out = run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
-              semantic_seed=missing)
-    # 不抛异常、正常产出
-    assert (Path(out) / "graph.json").exists()
-    captured = capfd.readouterr()
-    assert "semantic-seed" in captured.err or str(missing) in captured.err, \
-        f"stderr 未含 seed 路径警告: {captured.err!r}"
-
-
 def test_run_writes_knowledge_gaps_sidecar(tmp_path):
-    """I1/C4 接线（最终审查）：knowledge_gaps 写 <out>/knowledge-gaps.json.
-    load_codegraph 返回的 knowledge_gaps 原零消费；fixture DB 有 1 条 failed ref
-    （from file:c.py -> 'b'），sidecar 必须可解析且含该条。"""
+    """failed_refs（Task 04 收集器，Task 07 持久化）-> knowledge-gaps.json sidecar.
+    mini-graph.json 含 1 条 failed ref（from file:c.py -> 'b'），sidecar 必须可解析
+    且含该条——{ref, node, file, line} 形态与旧 adapter unresolved_refs 输出同构."""
     from run_analysis import run
-    out = run(MINI_DB, output_dir=tmp_path, root="fixture-src")
+    out = run(MINI_GRAPH, output_dir=tmp_path, root="fixture-src")
     kg_path = Path(out) / "knowledge-gaps.json"
     assert kg_path.exists(), "knowledge-gaps.json sidecar 未写"
     gaps = json.loads(kg_path.read_text(encoding="utf-8"))
     assert isinstance(gaps, list) and len(gaps) >= 1
     assert set(gaps[0].keys()) >= {"ref", "node", "file", "line"}
     assert gaps[0]["ref"] == "b"
+    assert gaps[0]["node"] == "file:c.py" and gaps[0]["file"] == "c.py"
 
 
-def test_run_shrink_guard_blocks_silent_overwrite(tmp_path):
-    """审查 fix（Important）：to_json force=False 恢复 #479 shrink-guard。
-
-    第二次 run() 面对"现有图节点数 > 新图"（缩量场景，如 seed/refresh 丢失）
-    时必须 raise RuntimeError，且 graph.json 保持旧内容不被覆盖。
-    """
+def test_run_no_failed_refs_writes_empty_list(tmp_path):
+    """事实层无 failed_refs -> knowledge-gaps.json 空数组（诚实空，非缺失）."""
+    import copy
     from run_analysis import run
-    out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src"))
-    graph = out / "graph.json"
-    first_n = len(json.loads(graph.read_text(encoding="utf-8"))["nodes"])
-    assert first_n > 0
-    # 模拟缩量：把现有 graph.json 换成节点更多的伪造 node_link JSON，
-    # 使 existing_n > new_n，触发 to_json 的 shrink-guard（export.py:267）。
-    fake = {
-        "nodes": [{"id": f"fake:{i}", "label": f"fake{i}"} for i in range(first_n + 50)],
-        "links": [],
-    }
-    graph.write_text(__import__("json").dumps(fake), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="shrink-guard"):
-        run(MINI_DB, output_dir=out, root="fixture-src")
-    # graph.json 未被覆盖：仍是伪造内容（缩量写入被拦截）
-    assert json.loads(graph.read_text(encoding="utf-8")) == fake
+    g = json.loads(MINI_GRAPH.read_text(encoding="utf-8"))
+    g.pop("failed_refs", None)
+    path = tmp_path / "no-gaps.json"
+    path.write_text(json.dumps(g), encoding="utf-8")
+    out = run(path, output_dir=tmp_path / "out", root="fixture-src")
+    gaps = json.loads((Path(out) / "knowledge-gaps.json").read_text(encoding="utf-8"))
+    assert gaps == []
 
 
-def test_refresh_persists_seed_and_prevents_shrink_guard_brick(tmp_path, monkeypatch):
-    """砖死回归（用户实测复现，两轮沙箱模拟）：refresh 产物此前只合入内存
-    extraction，从不写回 seed 文件——.md 编辑产生 refresh 后，任何不带 refresh
-    的重建（.py 编辑 / SessionEnd hook 触发面）产出 adapter-only 图 ->
-    节点数骤减 -> shrink-guard RuntimeError -> 图永久冻结。
-
-    修复后：refresh 合入后落盘 <out>/semantic-seed.json（与 rebuild_entry C1
-    默认发现路径一致），下一轮无 refresh 的 run() 自动拾取，链路闭合不再砖死。
-    """
-    # M2（用户审查）：extract() 的 cache 锚定 CWD（extract.py:5765 cache_location
-    # = Path('.').resolve()）——chdir 进沙箱，防 AST cache 写进真实仓库 graphify-out/cache/ast/
-    monkeypatch.chdir(tmp_path)
+def test_run_missing_graph_raises(tmp_path):
+    """事实层缺失 -> FileNotFoundError（诚实暴露，不静默降级）."""
     from run_analysis import run
-    # md 放进 root（fixture-src/）内：chdir 后 root 与 tmp 同盘，root 外文件走
-    # relpath 折叠分支（updepth=1）得 '../notes.md'，_sf_match 后缀匹配失效会
-    # 破坏 upsert 断言语义；root 内文件归一为 'notes.md'，与原（跨盘裸名）形态一致。
-    md_dir = tmp_path / "fixture-src"
-    md_dir.mkdir(parents=True, exist_ok=True)
-    md = md_dir / "notes.md"
-    md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
-                  encoding="utf-8")
-    out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
-                   semantic_refresh=[md]))
-    # 第一轮：seed 已落盘且含 semantic 节点
-    seed_path = out / "semantic-seed.json"
-    assert seed_path.exists(), "refresh 产物未落盘 semantic-seed.json"
-    seed = json.loads(seed_path.read_text(encoding="utf-8"))
-    assert any(n.get("_origin") == "semantic" for n in seed.get("nodes", [])), \
-        "seed 无 _origin=semantic 节点"
-    sem_ids1 = {n["id"] for n in json.loads((out / "graph.json").read_text(encoding="utf-8"))
-                .get("nodes", []) if n.get("_origin") == "semantic"}
-    assert sem_ids1, "第一轮 graph.json 无 semantic 节点"
-    # 第二轮：无 refresh（模拟 .py 编辑 / SessionEnd hook 触发面）。
-    # 修复前此处产出 adapter-only 图 -> shrink-guard RuntimeError（砖死）。
-    out2 = Path(run(MINI_DB, output_dir=out, root="fixture-src"))
-    graph2 = json.loads((out2 / "graph.json").read_text(encoding="utf-8"))
-    sem_ids2 = {n["id"] for n in graph2.get("nodes", []) if n.get("_origin") == "semantic"}
-    assert sem_ids1.issubset(sem_ids2), \
-        f"第二轮丢失 semantic 节点: {sem_ids1 - sem_ids2}"
+    with pytest.raises(FileNotFoundError):
+        run(tmp_path / "nonexistent.json", output_dir=tmp_path / "out")
 
 
-def test_refresh_upsert_no_duplicate_growth(tmp_path, monkeypatch):
-    """upsert 语义（按 source_file 替换，防重复膨胀）：同一 .md 文件连续两次
-    refresh，seed 中该文件的节点数不翻倍（第二次 = 先删同源旧节点/边再插入）。"""
-    # M2（用户审查）：chdir 进沙箱，防 extract() 的 CWD 锚定 cache 污染真实仓库。
-    # md 同步移入 root（fixture-src/）内：chdir 后 root 外文件 source_file 归一为
-    # '../notes.md'，_sf_match 后缀匹配失效；root 内归一为 'notes.md'（原形态）。
-    monkeypatch.chdir(tmp_path)
+def test_run_wiki_generates_obsidian(tmp_path):
+    """wiki=True -> Obsidian 出口（to_obsidian 照旧）."""
     from run_analysis import run
-    md_dir = tmp_path / "fixture-src"
-    md_dir.mkdir(parents=True, exist_ok=True)
-    md = md_dir / "notes.md"
-    md.write_text("# 架构决策\n\n采用 SQLite 存储元数据。\n\n## 原因\n\n单文件部署最简单。\n",
-                  encoding="utf-8")
-    out = Path(run(MINI_DB, output_dir=tmp_path / "out", root="fixture-src",
-                   semantic_refresh=[md]))
-    seed1 = json.loads((out / "semantic-seed.json").read_text(encoding="utf-8"))
-    count1 = len([n for n in seed1.get("nodes", []) if n.get("source_file") == "notes.md"])
-    assert count1 > 0, "第一次 refresh 后 seed 无该文件节点"
-    run(MINI_DB, output_dir=out, root="fixture-src", semantic_refresh=[md])
-    seed2 = json.loads((out / "semantic-seed.json").read_text(encoding="utf-8"))
-    count2 = len([n for n in seed2.get("nodes", []) if n.get("source_file") == "notes.md"])
-    assert count2 == count1, \
-        f"第二次 refresh 后 seed 节点数膨胀: {count1} -> {count2}（upsert 未按 source_file 替换）"
-
-
-import time
+    out = Path(run(MINI_GRAPH, output_dir=tmp_path / "out", root="fixture-src", wiki=True))
+    assert (out / "wiki").exists()
 
 
 def test_surprising_connections_always_passes_communities(monkeypatch, tmp_path):
@@ -193,34 +77,22 @@ def test_surprising_connections_always_passes_communities(monkeypatch, tmp_path)
     def fake_sc(G, communities=None, top_n=10):
         captured["communities"] = communities
         return []
-    # patch run_analysis 模块持有的引用（非 graphify.analyze.surprising_connections）
     monkeypatch.setattr(run_analysis, "surprising_connections", fake_sc)
-    run(MINI_DB, output_dir=tmp_path, root="fixture-src")
+    run(MINI_GRAPH, output_dir=tmp_path, root="fixture-src")
     assert captured["communities"] is not None, "必须恒传 communities（锁死 betweenness 死路径）"
 
 
 def test_large_graph_end_to_end_not_timeout(tmp_path):
     """B3②: 大图(>1000节点)端到端不超时（surprising_connections 采样 + god_nodes 度数排序的行为证据）.
-    不直测 suggest_questions（report.py 不调用它）；改为跑全管线断言产物存在且不超时。"""
-    import os
-    db = os.environ.get("CG_SMOKE_DB",
-        "D:/code/graphify_fork/.worktrees/feat-codegraph-merge/.codegraph/codegraph.db")
-    if not Path(db).exists():
-        import pytest; pytest.skip("无大图 DB")
+    事实层 graph.json 输入（新链路形态）；无大图事实层（golden 根未重建）则跳过。"""
+    import os, time
+    root = Path(os.environ.get("GRAPHIFY_GOLDEN_ROOT", "D:/code/graphify_fork"))
+    graph = root / "graphify-out" / "graph.json"
+    if not graph.exists():
+        pytest.skip("无大图事实层 graph.json（GRAPHIFY_GOLDEN_ROOT 未重建）")
     from run_analysis import run
     t0 = time.monotonic()
-    out = run(db, output_dir=tmp_path / "out", root="graphify")
+    out = run(graph, output_dir=tmp_path / "out", root=str(root))
     elapsed = time.monotonic() - t0
     assert (Path(out) / "GRAPH_REPORT.md").exists()
-    # 行为断言：10k 节点量级应在 120s 内完成（采样生效证据，非硬超时上限）
     assert elapsed < 120, f"大图分析耗时 {elapsed:.1f}s 异常，可能采样未生效"
-
-
-def test_parse_refresh_filters_empty_segments():
-    """M1（用户审查）：CLI refresh 解析过滤空段，与 rebuild_entry._parse_refresh 同款
-    （自包含副本，两端一致）。"a.md," 此前产生 Path('') -> Path('.')，refresh 指向
-    整个 CWD。None 透传（无 refresh 语义）。"""
-    import run_analysis
-    assert run_analysis._parse_refresh("a.md,") == [Path("a.md")]
-    assert run_analysis._parse_refresh("a.md,,b.md") == [Path("a.md"), Path("b.md")]
-    assert run_analysis._parse_refresh(None) is None

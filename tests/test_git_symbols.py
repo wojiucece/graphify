@@ -203,27 +203,5 @@ def test_read_prev_git_head(tmp_path):
     rebuild_entry._state_path(tmp_path).write_text("not json", encoding="utf-8")
     assert rebuild_entry._read_prev_git_head(tmp_path) is None          # 损坏不炸
 
-def test_rebuild_logs_changed_summary(monkeypatch, tmp_path, capsys):
-    """rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD）."""
-    import sqlite3
-    import rebuild_entry
-    proj = _git_repo(tmp_path)
-    prev_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=proj, capture_output=True,
-                               text=True).stdout.strip()
-    (proj / "graphify-out").mkdir()
-    rebuild_entry._state_path(proj).write_text(
-        json.dumps({"schema": 1, "phase": "complete", "git_head": prev_head}), encoding="utf-8")
-    # 第二个 commit：新增 b.py
-    (proj / "b.py").write_text("def b():\n    pass\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=proj, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "second"], cwd=proj, check=True, capture_output=True)
-    db = proj / ".codegraph" / "codegraph.db"; db.parent.mkdir()
-    c = sqlite3.connect(db)
-    c.execute("CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,applied_at INTEGER,description TEXT)")
-    c.execute("INSERT INTO schema_versions VALUES(9,0,'x')"); c.commit(); c.close()
-    monkeypatch.setattr(rebuild_entry, "run_codegraph_sync", lambda r: 0)
-    monkeypatch.setattr(rebuild_entry, "db_fingerprint", lambda d: (1, 0))
-    monkeypatch.setattr("run_analysis.run", lambda *a, **k: Path(tmp_path))
-    rebuild_entry.rebuild(proj, db_path=db, out_dir=proj / "graphify-out")
-    err = capsys.readouterr().err
-    assert "变更摘要" in err and "b.py" in err
+# test_rebuild_logs_changed_summary 已迁至 test_rebuild_entry.py（Task 09 新链路编排，
+# 无 codegraph DB / db_fingerprint mock）——本文件聚焦 git_symbols 自身。

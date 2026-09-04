@@ -1,0 +1,29 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {"id": "file:a.py", "label": "a.py", "source_file": "a.py", "source_location": "L1", "kind": "file", "file_type": "code"},
+    {"id": "file:b.py", "label": "b.py", "source_file": "b.py", "source_location": "L1", "kind": "file", "file_type": "code"},
+    {"id": "file:c.py", "label": "c.py", "source_file": "c.py", "source_location": "L1", "kind": "file", "file_type": "code"},
+    {"id": "class:cli", "label": "a.Cli", "source_file": "a.py", "source_location": "L2", "kind": "class", "file_type": "code"},
+    {"id": "function:afoo", "label": "a.foo", "source_file": "a.py", "source_location": "L5", "kind": "function", "file_type": "code"},
+    {"id": "function:bbar", "label": "b.bar", "source_file": "b.py", "source_location": "L2", "kind": "function", "file_type": "code"},
+    {"id": "function:cbaz", "label": "c.baz", "source_file": "c.py", "source_location": "L2", "kind": "function", "file_type": "code"},
+    {"id": "method:main", "label": "a.Cli.main", "source_file": "a.py", "source_location": "L3", "kind": "method", "file_type": "code"}
+  ],
+  "links": [
+    {"source": "file:a.py", "target": "class:cli", "relation": "contains", "source_file": "a.py", "source_location": "L2"},
+    {"source": "file:a.py", "target": "function:afoo", "relation": "contains", "source_file": "a.py", "source_location": "L5"},
+    {"source": "file:b.py", "target": "function:bbar", "relation": "contains", "source_file": "b.py", "source_location": "L2"},
+    {"source": "file:c.py", "target": "function:cbaz", "relation": "contains", "source_file": "c.py", "source_location": "L2"},
+    {"source": "class:cli", "target": "method:main", "relation": "contains", "source_file": "a.py", "source_location": "L3"},
+    {"source": "method:main", "target": "function:afoo", "relation": "calls", "source_file": "a.py", "source_location": "L4"},
+    {"source": "function:afoo", "target": "function:bbar", "relation": "calls", "source_file": "a.py", "source_location": "L6"},
+    {"source": "function:afoo", "target": "function:cbaz", "relation": "calls", "source_file": "a.py", "source_location": "L7"},
+    {"source": "function:bbar", "target": "function:cbaz", "relation": "calls", "source_file": "b.py", "source_location": "L3"}
+  ],
+  "failed_refs": [
+    {"from_node": "file:c.py", "callee_name": "b", "line": 3, "file_path": "c.py"}
+  ]
+}

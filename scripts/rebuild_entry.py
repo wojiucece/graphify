@@ -1,50 +1,28 @@
-"""单一重建入口：codegraph sync -> graphify 分析重建（指纹复核：变化不再重跑）。
+"""单一重建入口：extract(增量) → build → to_json(事实层落盘) → rebuild_fts(FTS 重投影) → 分析。
 
 三个触发面（watch.py 代码事件 / SessionEnd hook / PreCompact hook）都改指本入口。
-跨进程互斥用 mkdir 原子锁；完成信号用子进程退出码（codegraph 无对外 sync 事件，F1/F5）。"""
+跨进程互斥用 mkdir 原子锁；完成信号用状态文件（schema v2，graph_fingerprint =
+graph.json (mtime_ns, size) 指纹，旧 db_fingerprint 的事实层等价物）。
+
+Task 09 换源（spec §工具面迁移 scripts 重组）：codegraph sync 退役——输入源从 codegraph DB
+换成源码语料（extract 增量经 per-file cache，重跑廉价），产物对 = graph.json（事实层）+
+.fts-index.db（可重建派生缓存）。锁/stale 接管壳保留；A3 收敛语义诚实平移（重建期间
+事实层被并发推进 -> 不再重跑，交 watch/hook 事件流兜底）。状态文件 schema 1 -> 2：
+指纹字段换 graph.json 时间戳；旧状态文件（schema 1）的读取器只读 phase/started/
+last_duration/git_head 共字段，平滑兼容（不依赖 schema 号）。
+"""
 from __future__ import annotations
-import argparse, json, os, sqlite3, subprocess, sys, tempfile, time
+import argparse, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:            # import graphify（本地包，不依赖安装态）
     sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))   # import adapter / run_analysis
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # import fts_cache / run_analysis
 
 EXIT_OK, EXIT_LOCK, EXIT_SYNC_FAIL = 0, 3, 4
-SYNC_RETRIES, SYNC_RETRY_WAIT_S = 3, 2.0   # 锁竞争短重试；降级语义对齐移植的 5 次退避
-
-
-def run_codegraph_sync(root: Path) -> int:
-    """子进程跑 codegraph sync。CREATE_NO_WINDOW 防 Windows 弹窗（F5）。"""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    # 小偏差（健壮性）：codegraph 输出 UTF-8（┌◆ 等 box char），text=True 默认按 locale
-    # （GBK）解码 -> reader 线程 UnicodeDecodeError 噪声 + 潜在传播崩溃。显式 utf-8 + replace。
-    return subprocess.run(
-        ["codegraph", "sync", str(root)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=flags).returncode
-
-
-def _sync_with_retry(root: Path) -> int:
-    for _ in range(SYNC_RETRIES):
-        code = run_codegraph_sync(root)
-        if code == 0:
-            return 0
-        time.sleep(SYNC_RETRY_WAIT_S)
-    return code
-
-
-def db_fingerprint(db_path: Path) -> tuple[int, int]:
-    """(MAX(files.indexed_at), WAL mtime_ns)。indexed_at 捕获写入；
-    wal mtime 捕获含删除/纯 checkpoint 的任何写。误报方向是"多重建一轮"，安全（F7）。"""
-    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
-    try:
-        ts = conn.execute("SELECT COALESCE(MAX(indexed_at), 0) FROM files").fetchone()[0]
-    finally:
-        conn.close()
-    wal = db_path.parent / (db_path.name + "-wal")
-    return (ts, wal.stat().st_mtime_ns if wal.exists() else 0)
+EXTRACT_RETRIES, EXTRACT_RETRY_WAIT_S = 3, 2.0   # 提取失败短退避重试（对齐旧 sync 3 次退避）
+_STATE_SCHEMA = 2                                  # 状态文件 schema v2（graph_fingerprint 字段）
 
 
 def _log(msg: str) -> None:
@@ -114,8 +92,9 @@ def _finish_state(root: Path, lock: Path, started: float, error: bool = False) -
     """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）.
     C3/G3：git 可用时载荷加 git_head（rev-parse HEAD，基线锚点）——git 不可用/失败时
     省略字段（schema 只增不改，可缺省；读者侧缺失语义 = "基线未锚定"）。成功/错误路径
-    都记（git_head 是仓库事实，与 build 成败无关；父注释"成功路径"取此义）。"""
-    payload = {"schema": 1, "phase": "error" if error else "complete",
+    都记（git_head 是仓库事实，与 build 成败无关）。schema v2：complete 载荷不携带
+    指纹（以 rebuilding 载荷为准，与 schema 1 相同）；旧状态文件读取器只读共字段。"""
+    payload = {"schema": _STATE_SCHEMA, "phase": "error" if error else "complete",
                "started": started, "finished": time.time(),
                "last_duration": round(time.time() - started, 1),
                "project": str(root)}
@@ -145,7 +124,7 @@ def _read_prev_git_head(root: Path) -> str | None:
     git_head 可缺省（G3）——文件缺失/损坏/非 str/非 dict -> None（首次重建无锚点，摘要
     跳过）。Minor-3：合法 JSON 但非 dict（如 []）必须 isinstance(d, dict) 防护——调用点在
     rebuild() 的 try/finally 外，AttributeError 会冒泡且锁未清（stale 锁）；与 serve.py
-    侧已捕获 AttributeError 对称。"""
+    侧已捕获 AttributeError 对称。schema v1/v2 均读 git_head 共字段（平滑兼容）。"""
     try:
         d = json.loads(_state_path(root).read_text(encoding="utf-8"))
         gh = d.get("git_head") if isinstance(d, dict) else None
@@ -184,19 +163,176 @@ def _read_prev_duration(root: Path) -> float:
     try:
         d = json.loads(_state_path(root).read_text(encoding="utf-8"))
         if not isinstance(d, dict):
-            # 终审 Imp-1 连带：非 dict（如 []）直接 .get 会 AttributeError——一次重建
-            # 崩溃后自愈；与 serve._derive_freshness 同防护（兄弟读取器三处统一）。
             return 0.0
         return float(d.get("last_duration", 0))
     except (OSError, ValueError, TypeError):
         return 0.0
 
 
-def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | None = None,
+# === 新链路编排：extract(增量) → build → to_json → rebuild_fts → 分析 ===============
+# 事实层指纹复用 fts_cache.fingerprint（graph.json (mtime_ns, size)，缺失 -> None）——
+# 状态文件 schema v2 的 graph_fingerprint 字段即其输出（06 票 freshness 指纹平移语义）。
+
+def _detect_code_files(root: Path) -> list[Path]:
+    """detect() 语料：code 文件 + 有 AST 提取器的 document 文件（对齐 watch.py
+    _rebuild_code 语料口径——markdown 等文档走 AST 提取；语义面由 semantic seed 承载）。
+    detect 失败（空目录/无文件）-> 空列表（extract 空输入 -> 空事实层，诚实产出）。"""
+    from graphify.detect import detect
+    from graphify.extract import _get_extractor
+    detected = detect(root)
+    files = [Path(f) for f in detected["files"].get("code", [])]
+    for doc in detected["files"].get("document", []):
+        p = Path(doc)
+        if _get_extractor(p) is not None:
+            files.append(p)
+    return files
+
+
+def _extract_with_retry(root: Path) -> dict:
+    """提取增量（per-file cache 使重跑廉价）+ 失败短退避重试（对齐旧 sync 3 次退避）。
+    无代码文件 -> 空 extraction（事实层为空图，不 crash）。extract 失败重试耗尽 -> 抛
+    （与旧 sync 失败降级退出同语义：交下个触发面兜底）。"""
+    from graphify.extract import extract
+    paths = _detect_code_files(root)
+    last_e: Exception | None = None
+    for _ in range(EXTRACT_RETRIES):
+        try:
+            if not paths:
+                return {"nodes": [], "edges": [], "hyperedges": []}
+            # cache_root=root：缓存落 root/graphify-out/cache（不随 CWD 漂移）；root 锚定
+            # source_file 相对化/id（与 watch.py _rebuild_code 的 extract 调用同口径）。
+            return extract(paths, cache_root=root, root=root)
+        except Exception as e:
+            last_e = e
+            _log(f"extract 失败（{EXTRACT_RETRIES - 1 - _} 次后放弃）: {e}")
+            time.sleep(EXTRACT_RETRY_WAIT_S)
+    raise last_e if last_e is not None else RuntimeError("extract 失败")
+
+
+# === 语义种子（从 run_analysis 迁入：rebuild_entry 是 build 编排者）==================
+# run_analysis 瘦身为 analysis-only（读事实层 + 生成报告），seed 合并/refresh upsert/
+# 锚定校验随 build 步骤迁到本入口。函数与旧 run_analysis 同源（自包含副本，不互相导入）。
+
+
+def _norm_sf(x) -> "str | None":
+    """source_file/路径 POSIX 归一化：反斜杠 -> 正斜杠，剥 './' 前缀。"""
+    if not x:
+        return None
+    s = str(x).replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s or None
+
+
+def _sf_match(sf, rf) -> bool:
+    """seed 节点/边的 source_file 与 refresh 文件 rf 是否同一源文件（upsert 匹配规则）.
+
+    双方 POSIX 归一化后【相等】或【一方为另一方的路径后缀（以 / 为边界，防 'mydocs'
+    误匹配 'docs'）】。覆盖组合：seed 存 root 相对路径 x rf 绝对路径（watch 触发面）->
+    后缀命中；双方同为相对路径 -> 相等命中。已知残余风险（接受）：大小写敏感、裸名
+    source_file 会匹配任意目录下同名文件（同项目内罕见）。"""
+    a, b = _norm_sf(sf), _norm_sf(rf)
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+_SEMANTIC_FILE_TYPES = frozenset({"concept", "document", "rationale", "image"})
+
+
+def validate_semantic_anchors(seed: dict) -> list[str]:
+    """semantic 引用必须锚定文件级节点（§6.3 Q2）.
+    B2: 真实种子无 kind，按 id 前缀判定--file: 前缀或 file_type 在语义集为合规锚点；
+    符号级 id（原生 kind+hash 形态）判违规（符号移动行号即变 id，易失）。"""
+    node_info = {n["id"]: n for n in seed.get("nodes", [])}
+    violations = []
+    for e in seed.get("edges", []):
+        for end in ("source", "target"):
+            nid = e.get(end, "")
+            n = node_info.get(nid, {})
+            # semantic 自身节点不判违规
+            if nid.startswith(("concept:", "rationale:", "document:", "image:")):
+                continue
+            if n.get("_origin") == "semantic" or n.get("file_type") in _SEMANTIC_FILE_TYPES:
+                continue
+            # 合规锚点：file: 前缀 或 kind=file
+            if nid.startswith("file:") or n.get("kind") == "file":
+                continue
+            # 其余为符号级 -> 违规
+            violations.append(f"semantic 边 {end} 锚定符号级节点 {nid}（易失），应锚定文件级节点")
+    return violations
+
+
+def _merge_seed(extraction: dict, out: Path, semantic_seed: Path | None,
+                semantic_refresh: list[Path] | None, root: Path) -> tuple[dict, list]:
+    """把 semantic seed 状态合并进 extraction（从 run_analysis 迁入的 build 步骤）.
+
+    - seed 加载：显式 semantic_seed 优先；默认发现路径 <out>/semantic-seed.json。
+      锚定校验违规仅告警 stderr 不阻断（存量种子可能有合法悬挂锚点）。
+    - semantic_refresh：对每个 refresh 文件做语义提取，按 source_file 身份 upsert 进
+      seed 状态（无 seed 则建），并把合并后的 seed 写回 seed 路径（下一轮无 refresh
+      的 rebuild 自动拾取，链路闭合防 shrink-guard 砖死）。
+
+    返回 (merged_extraction, seed_hyperedges)——hyperedges 由调用方 attach 回图。
+    """
+    seed_path = Path(semantic_seed) if semantic_seed is not None else out / "semantic-seed.json"
+    _seed_raw: dict = {}
+    seed_nodes: list = []
+    seed_edges: list = []
+    seed_hyperedges: list = []
+    if seed_path.exists():
+        _seed_raw = json.loads(seed_path.read_text(encoding="utf-8"))
+        _violations = validate_semantic_anchors(_seed_raw)
+        if _violations:
+            print(f"[rebuild_entry] semantic 语义锚定违规 {len(_violations)} 条，"
+                  f"首条: {_violations[0]}", file=sys.stderr)
+        seed_nodes = list(_seed_raw.get("nodes", []))
+        seed_edges = list(_seed_raw.get("edges", []))
+        seed_hyperedges = list(_seed_raw.get("hyperedges", []))
+    elif semantic_seed is not None:
+        # 显式 seed 路径不存在 -> stderr 警告（fail-loud 保留，不静默跳过后缩量砖死）
+        print(f"[rebuild_entry] 警告: 显式 --semantic-seed 路径不存在: {seed_path}"
+              f"——请检查 --semantic-seed 拼写；将按 AST-only 图继续（无语义面）",
+              file=sys.stderr)
+    if semantic_refresh:
+        from graphify.extract import extract as _extract_semantic
+        for rf in semantic_refresh:
+            try:
+                r = _extract_semantic([Path(rf)], root=str(root),
+                                      cache_root=root)
+                for n in r.get("nodes", []):
+                    # refresh 合入的 .md 节点强制标 semantic（extract 产出 _origin='ast'）
+                    n["_origin"] = "semantic"
+            except Exception as e:
+                print(f"[rebuild_entry] semantic_refresh 提取失败 {rf}: {e}",
+                      file=sys.stderr)
+                continue
+            # upsert 语义（按 source_file 替换，防重复膨胀）：先删同源旧 seed 节点/边，
+            # 再插入本次 extract 的新节点/边。已删源文件的驱逐留给全量重切兜底。
+            seed_nodes = [n for n in seed_nodes if not _sf_match(n.get("source_file"), rf)]
+            seed_edges = [e for e in seed_edges if not _sf_match(e.get("source_file"), rf)]
+            seed_nodes += r.get("nodes", [])
+            seed_edges += r.get("edges", [])
+        # 写回 seed 状态（无 seed 则建）。hyperedges 与未知键从旧 seed 原样保留。
+        try:
+            _seed_out = dict(_seed_raw)
+            _seed_out["nodes"] = seed_nodes
+            _seed_out["edges"] = seed_edges
+            _seed_out["hyperedges"] = seed_hyperedges
+            seed_path.write_text(json.dumps(_seed_out, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+        except Exception as e:
+            print(f"[rebuild_entry] seed 落盘失败 {seed_path}: {type(e).__name__}: {e}"
+                  f"——下一轮无 refresh 重建将丢失语义面", file=sys.stderr)
+    extraction = {"nodes": extraction["nodes"] + seed_nodes,
+                  "edges": extraction["edges"] + seed_edges}
+    return extraction, seed_hyperedges
+
+
+def rebuild(project_root: Path, *, out_dir: Path | None = None,
             semantic_seed: Path | None = None, semantic_refresh: list[Path] | None = None,
-            skip_sync: bool = False) -> Path:
+            skip_sync: bool = False, wiki: bool = False) -> Path:
     root = Path(project_root).resolve()
-    db = db_path or root / ".codegraph" / "codegraph.db"
     out = out_dir or root / "graphify-out"
     # CUSTOM: seed 默认发现（最终审查 C1）。三个自动触发面（watch _trigger_rebuild /
     # SessionEnd / PreCompact hook）都不传 --semantic-seed，迁移后首次自动重建若不带 seed
@@ -218,47 +354,75 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
     t0 = time.time()
     exc_happened = False
     try:
-        # db 存在性检查在锁之后（测试 test_lock_held_exits_3 预建锁 -> 应 exit 3 而非 FileNotFoundError）
-        if not db.exists():
-            raise FileNotFoundError(f"{db} 不存在--先跑 codegraph init")
-        for _ in range(2):                                    # 指纹复核，最多两轮
-            if not skip_sync:
-                code = _sync_with_retry(root)                 # 非零短退避重试后仍失败 -> 降级退出
-                if code != 0:
-                    _log(f"sync 重试后仍失败（exit {code}），放弃本轮，交下个触发面兜底")
-                    sys.exit(EXIT_SYNC_FAIL)
-            f0 = db_fingerprint(db)
-            # A1a: rebuilding 标记（幂等）。db_fingerprint 复用 f0——不额外调 db_fingerprint
-            # （少一次只读查询）；f0 即本轮收敛基线，语义与重查一致。N2: 继承上轮
-            # last_duration（否则时效逃生 2x 项恒 0，设计静默失效）。写权在锁 owner；
-            # serve 只读无写竞态。
-            _write_state(root, lock, {
-                "schema": 1, "phase": "rebuilding", "started": t0,
-                "project": str(root), "db_fingerprint": list(f0),
-                "last_duration": _read_prev_duration(root)})
-            from run_analysis import run                        # 懒导入（scripts/ 在 sys.path）
-            run(db, output_dir=out, root=str(root),
-                semantic_seed=semantic_seed, semantic_refresh=semantic_refresh)
-            # B4: cache GC 挂载（成功路径末尾、finally 前，锁内）。manifest 锚定
-            # mark-and-sweep + 频率门控摊销扫描；GC 失败绝不影响 rebuild 结果。
-            # root 显式传项目根（live 重算的 file_hash path-salt 锚点；--out-dir 自定义
-            # 时 cache_root.parent 不是项目根）。
-            try:
-                from cache_gc import gc_cache
-                gc_cache(out, out / "manifest.json", root=root)
-            except Exception as e:   # GC 失败绝不影响 rebuild 结果
-                _log(f"cache gc 异常（忽略）: {e}")
-            # C3: rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD，
-            # 进当时活跃会话上下文）。prev_head 不可得/孤儿 hash -> 内部静默。
-            _log_changed_summary(root, prev_git_head)
-            # A3（Task 6 裁决）：重建期间 DB 变化不再重跑——记录日志即返回，收敛交给
-            # watch/hook 事件流兜底（变化本身说明后续触发面已排队/即将触发，重跑只
-            # 增加锁内阻塞时长）。循环结构保留（range(2) 仅走一轮），便于回滚对比。
-            if db_fingerprint(db) == f0:
-                return out
-            _log("重建期间 DB 变化（daemon 并发写入），已记录日志；不再重跑，交下个触发面兜底")
-            return out
-        _log("两轮不收敛，交下个触发面兜底")                    # watch/hook 事件流保证最终触发
+        # 新链路编排（Task 09 换源）：extract(增量) → build → to_json(事实层落盘) →
+        # rebuild_fts(FTS 重投影)。skip_sync 为已废弃 no-op（codegraph sync 已退役，
+        # 保留 CLI 兼容 watch.py 既有调用）。
+        from fts_cache import rebuild_fts, fingerprint
+        extraction = _extract_with_retry(root)
+        extraction, seed_hyperedges = _merge_seed(extraction, out, semantic_seed,
+                                                  semantic_refresh, root)
+        # A1a: rebuilding 标记（幂等）。graph_fingerprint = 重建前事实层指纹 f0（复用
+        # fingerprint 一次——不额外 stat；语义与旧 db_fingerprint 的"输入状态标记"对齐）。
+        # N2: 继承上轮 last_duration（否则时效逃生 2x 项恒 0，设计静默失效）。
+        f0 = fingerprint(out / "graph.json")
+        _write_state(root, lock, {
+            "schema": _STATE_SCHEMA, "phase": "rebuilding", "started": t0,
+            "project": str(root),
+            "graph_fingerprint": list(f0) if f0 else None,
+            "last_duration": _read_prev_duration(root)})
+        from graphify.build import build_from_json
+        from graphify.export import to_json, attach_hyperedges
+        from graphify.cluster import cluster
+        G = build_from_json(extraction, root=root)
+        # C2: hyperedges 挂回图（export.py:180）；seed_hyperedges 已由 _merge_seed 备好
+        if seed_hyperedges:
+            attach_hyperedges(G, seed_hyperedges)
+        communities = cluster(G)
+        # 事实层落盘（node_link 格式，links 键；serve.py hot-reload 依赖）。
+        # B4/审查 fix（Important）：force=True 会绕过 #479 shrink-guard，使缩量
+        # （seed/refresh 丢失等）静默覆盖旧图。改 force=False 恢复保护——现有
+        # graph.json 节点数 >= 新图时 to_json 返回 False 拒绝写入，据此报错，防止
+        # 重复跑进同一 output_dir 时旧图被静默缩量覆盖。
+        _ok = to_json(G, communities, str(out / "graph.json"), force=False,
+                      built_at_commit=None, community_labels={})
+        if not _ok:
+            from graphify.export import existing_graph_node_count, MALFORMED_GRAPH
+            _old_n = existing_graph_node_count(out / "graph.json")
+            if _old_n is MALFORMED_GRAPH:
+                _old_desc = "无法解析（疑似损坏或写入中途）"
+            else:
+                _old_desc = f"{_old_n} 个节点"
+            raise RuntimeError(
+                f"[rebuild_entry] shrink-guard 拦截写入 {out / 'graph.json'}："
+                f"现有图 {_old_desc}，新图 {G.number_of_nodes()} 个节点，拒绝覆盖"
+                f"（#479 防静默缩量）。若确认缩量是数据本身的真实变化，可手动删除 "
+                f"{out / 'graph.json'} 后重跑，或临时把 scripts/rebuild_entry.py 中 "
+                f"to_json 调用的 force=False 改为 force=True 强制重建。"
+            )
+        # FTS 重投影（事实层派生缓存，原子替换——删除无损，指纹失效自动重建）
+        rebuild_fts(out / "graph.json", out / ".fts-index.db")
+        # A3（Task 9 换源）：重建期间事实层被并发推进（我们自己写入后的 f_after 与
+        # 分析结束时的指纹不一致 = 其他进程在分析窗口期替换了 graph.json）-> 记录日志
+        # 不再重跑，收敛交给 watch/hook 事件流兜底。锁内正常路径不会触发（仅 stale
+        # 接管竞态窗口可达）。
+        f_after = fingerprint(out / "graph.json")
+        # 分析（analysis-only）：报告/百科 + knowledge-gaps（读事实层，不写图）
+        from run_analysis import run
+        run(out / "graph.json", output_dir=out, root=str(root), wiki=wiki)
+        if f_after is not None and fingerprint(out / "graph.json") != f_after:
+            _log("重建期间事实层被并发推进，已记录日志；不再重跑，交下个触发面兜底")
+        # B4: cache GC 挂载（成功路径末尾、finally 前，锁内）。manifest 锚定
+        # mark-and-sweep + 频率门控摊销扫描；GC 失败绝不影响 rebuild 结果。
+        # root 显式传项目根（live 重算的 file_hash path-salt 锚点；--out-dir 自定义
+        # 时 cache_root.parent 不是项目根）。
+        try:
+            from cache_gc import gc_cache
+            gc_cache(out, out / "manifest.json", root=root)
+        except Exception as e:   # GC 失败绝不影响 rebuild 结果
+            _log(f"cache gc 异常（忽略）: {e}")
+        # C3: rebuild 成功后 stderr 附加一行变更摘要（git diff --name-only <prev>..HEAD，
+        # 进当时活跃会话上下文）。prev_head 不可得/孤儿 hash -> 内部静默。
+        _log_changed_summary(root, prev_git_head)
         return out
     except BaseException:
         exc_happened = True
@@ -269,9 +433,8 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
         _finish_state(root, lock, t0, error=exc_happened)
         # 误接管防御：若本进程超 _LOCK_STALE_S 被另进程接管，锁目录已含对方的 pid 文件，
         # 非空目录 rmdir 抛 OSError，会掩盖本进程的正常返回或原始异常。包 except 吞掉。
-        # 修正（Task 13 E2E 发现）：brief 原文仅 rmdir 非空目录 -> 恒 OSError 被吞 ->
-        # 锁永不释放，每次重建都漏锁，后续触发面 600s 内全 exit 3。改为先删本进程 pid
-        # 文件再 rmdir；pid 不匹配（已被接管）则不碰对方的锁。
+        # 修正（Task 13 E2E 发现）：先删本进程 pid 文件再 rmdir；pid 不匹配（已被接管）
+        # 则不碰对方的锁。
         try:
             if (lock / "pid").read_text(encoding="utf-8").strip() == str(os.getpid()):
                 (lock / "pid").unlink(missing_ok=True)
@@ -281,28 +444,30 @@ def rebuild(project_root: Path, *, db_path: Path | None = None, out_dir: Path | 
 
 
 def _parse_refresh(s: str | None) -> list[Path] | None:
-    """CLI --semantic-refresh 逗号分隔解析：过滤空段（用户审查 M1，两端一致）.
+    """CLI --semantic-refresh 逗号分隔解析：过滤空段（用户审查 M1）。
 
-    "a.md," 此前产生 Path('') -> Path('.')，refresh 指向整个 CWD（与 run_analysis.py
-    CLI 已有的空段过滤不一致）。scripts 无包结构，两文件各持自包含副本，不互相导入。
-    None 透传（无 refresh 语义）；"" 返回 []（falsy，下游 if semantic_refresh 等价）。"""
+    "a.md," 此前产生 Path('') -> Path('.')，refresh 指向整个 CWD（与旧 run_analysis.py
+    CLI 已有的空段过滤不一致）。None 透传（无 refresh 语义）；"" 返回 []（falsy，
+    下游 if semantic_refresh 等价）。"""
     if s is None:
         return None
     return [Path(p) for p in s.split(",") if p]
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="codegraph sync + graphify 分析重建（单一入口）")
+    ap = argparse.ArgumentParser(
+        description="extract(增量) → build → to_json(事实层落盘) → rebuild_fts(FTS 重投影) → 分析（单一重建入口）")
     ap.add_argument("--project", required=True, help="项目根")
-    ap.add_argument("--db", default=None, help="codegraph DB 路径（默认 <project>/.codegraph/codegraph.db）")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--semantic-seed", default=None)
     ap.add_argument("--semantic-refresh", default=None, help="逗号分隔的语义文件路径")
-    ap.add_argument("--skip-sync", action="store_true")
+    ap.add_argument("--skip-sync", action="store_true",
+                    help="已废弃 no-op（codegraph sync 已退役；保留供 watch.py 既有调用兼容）")
+    ap.add_argument("--wiki", action="store_true", help="生成 Obsidian wiki 出口")
     args = ap.parse_args()
     # CUSTOM: 经 _parse_refresh 过滤空段（M1）："a.md," 不再产生 Path('') -> '.'
     refresh = _parse_refresh(args.semantic_refresh)
-    rebuild(args.project, db_path=Path(args.db) if args.db else None,
+    rebuild(args.project,
             out_dir=Path(args.out_dir) if args.out_dir else None,
             semantic_seed=Path(args.semantic_seed) if args.semantic_seed else None,
-            semantic_refresh=refresh, skip_sync=args.skip_sync)
+            semantic_refresh=refresh, skip_sync=args.skip_sync, wiki=args.wiki)
