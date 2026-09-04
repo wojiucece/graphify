@@ -21,20 +21,21 @@ blocked-by: []
 
 ## Resolution
 
-（2026-09-04，实施票 11 落档）六项落地，其中**第 1/2/3 项（主树协调项）pending**——worktree
-内已完成；主 checkout `.codegraph/`/vendored 删除与主树/存量项目新链路重建待主树迁移执行
-（见 MAP status=closed-pending-migration）：
+（2026-09-04，实施票 11 落档）六项全落地；**主树迁移已完成**（controller 实测：主 checkout
+`.codegraph/`/vendored 已删、rebuild_entry 新链路重建 886 文件 → graph.json 16722 节点 +
+failed_refs 3892、金标默认根点亮）。**存量项目（jianshen/wuziqi 等）首次迁移为独立后续**：
 
 1. **`.codegraph/` 退役**：`.gitignore` 移除 `.codegraph/` 与 vendored `codegraph/` 条目；
    `graphify/watch.py` 三处 `.codegraph/codegraph.db` 门控退役；hooks（sessionend/
    precompact）移除 `.codegraph` 门控统一路由 `rebuild_entry`。主 checkout 的 `.codegraph/`
-   目录由主树迁移删除（worktree 隔离范围外，见退役 ADR §金标门点亮）。
+   目录已删（主树迁移完成，controller 实测 37M 旧 DB）。
 2. **vendored `codegraph/` 副本**：v1.5.0 参考副本仅存在于主 checkout（gitignore 条目已删）；
-   MIT 署名保留在吸收处代码注释（`graphify/watch.py` 移植 codegraph 防抖/退避处）。主树删除
-   副本为协调项。
+   MIT 署名保留在吸收处代码注释（`graphify/watch.py` 移植 codegraph 防抖/退避处）。主树
+   已删除副本（迁移完成，controller 实测 151M）。
 3. **存量项目首次新链路重建**：worktree 本仓已完成（rebuild_entry 首次 rebuild，graph.json
-   含六件套契约 + failed_refs 3888 条 + `.fts-index.db` 投影）；主 checkout 与 jianshen/
-   wuziqi 等存量项目迁移在主树执行（协调项，步骤见退役 ADR）。
+   含六件套契约 + failed_refs 3888 条 + `.fts-index.db` 投影）；**主 checkout 已重建**
+   （886 文件 → 16722 节点 + failed_refs 3892 + FTS 缓存）；jianshen/wuziqi 等存量项目
+   迁移为独立后续（主树执行，步骤见退役 ADR）。
 4. **文档修订与 ADR**：merge-plan v4.2 加已取代横幅 + 事实源条款作废说明；phase5 v1.1
    作废标记；phase4 v1.15 已取代标记；退役 ADR = `docs/adr/0001-retire-codegraph-runtime.md`。
 5. **基准重落**：efficiency benchmark 换源 `.fts-index.db` 重跑，结果 JSON 落档

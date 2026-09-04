@@ -1,17 +1,18 @@
 # Wayfinder 地图 — graphify 原生索引能力（codegraph 优点吸收）
 
 label: wayfinder:map
-status: closed-pending-migration
+status: closed
 
-> 2026-09-04 实施完成（票 01–11 全部落档）——**过渡态**：主树迁移完成前为
-> `closed-pending-migration`。退役 ADR：`docs/adr/0001-retire-codegraph-runtime.md`；
+> 2026-09-04 实施完成（票 01–11 全部落档），**主树迁移已完成**（controller 实测）：
+> ①主 checkout `D:/code/graphify_fork` 的 `.codegraph/`（37M 旧 DB）与 vendored `codegraph/`
+> （151M）已删；②rebuild_entry 新链路重建 886 文件 → graph.json 16722 节点 + 顶层
+> `failed_refs` 3892 + FTS 缓存；③**金标门默认根已点亮**（test_ranked_context golden
+> 默认根 2 passed，不再 SKIP）。退役 ADR：`docs/adr/0001-retire-codegraph-runtime.md`；
 > 精确实现坐标在各决策票 Resolution（`docs/wayfinder/tickets/01–07`）；新基线：
 > `benchmarks/results-2026-09-04.json`。
 >
-> **主树迁移待办（pending，worktree 隔离范围外）**：①删主 checkout `D:/code/graphify_fork`
-> 的 `.codegraph/` 与 vendored `codegraph/` 目录；②主 checkout 及存量项目（jianshen/
-> wuziqi 等）首次新链路 rebuild；③金标门默认根（`D:/code/graphify_fork`）基线重建后点亮
-> （此前保持 SKIP，CI 显式设 `GRAPHIFY_GOLDEN_ROOT`）。完成这三项后本 MAP 转 `closed`。
+> **残余（独立后续）**：存量项目（jianshen/wuziqi 等）首次新链路迁移尚未做——为主树
+> 执行的独立后续，不影响本 MAP 终态。
 
 ## Destination
 
