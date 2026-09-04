@@ -2003,66 +2003,6 @@ def _symbol_short_name(d: dict, nid: str) -> str:
     return str(d.get("label") or nid).split(" ")[0].rsplit(".", 1)[-1]
 
 
-_DISPATCH_RESOLVED_BY = frozenset({"instance-method", "fuzzy", "qualified-name"})
-
-
-def _dispatch_candidate(meta: dict | None) -> bool:
-    """B3 R4-2 双判据并集（serve 自包含副本，同 adapter._dispatch_candidate）：resolvedBy
-    ∈ {instance-method, fuzzy, qualified-name, None} 或 confidence<0.9 → 分发候选（宁多标
-    勿漏标）。无 metadata = resolvedBy None 分支（未记录解析方式 = 不可信）→ True。"""
-    if not meta:
-        return True
-    if meta.get("resolvedBy") in _DISPATCH_RESOLVED_BY or meta.get("resolvedBy") is None:
-        return True
-    conf = meta.get("confidence")
-    try:
-        if conf is not None and float(conf) < 0.9:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return False
-
-
-def _edge_dispatch_info(conn, source_file, kind, src_name, tgt_name) -> dict:
-    """B3 R4-2 铰链改键（serve 自包含副本，同 adapter._edge_dispatch_info）：合并边无
-    DB edge id——source_file+kind+两端短名 JOIN 定候选组，组内最保守取值（confidence=min、
-    dispatch_candidate=any、resolvedBy 数组）；空组 → dispatch_candidate=True 宁多标。
-    M2（review 注释登记，已知模糊面）：同名重载并组——同文件同 kind 同短名对的候选组
-    会把其他重载方法的 min confidence / resolvedBy 灌入。宁多标方向：保守可接受（Q11）。"""
-    rows = conn.execute(
-        "SELECT e.metadata FROM edges e "
-        "JOIN nodes ns ON e.source = ns.id "
-        "JOIN nodes nt ON e.target = nt.id "
-        "WHERE e.kind = ? AND ns.file_path = ? AND ns.name = ? AND nt.name = ?",
-        (kind, source_file, src_name, tgt_name)).fetchall()
-    resolved_by = []
-    confidences = []
-    candidate = False
-    for (meta_json,) in rows:
-        meta = None
-        if meta_json:
-            try:
-                meta = json.loads(meta_json)
-            except ValueError:
-                meta = None
-        candidate = candidate or _dispatch_candidate(meta)
-        if meta:
-            rb = meta.get("resolvedBy")
-            if rb is not None and rb not in resolved_by:
-                resolved_by.append(rb)
-            conf = meta.get("confidence")
-            if conf is not None:
-                try:
-                    confidences.append(float(conf))
-                except (TypeError, ValueError):
-                    pass
-    if not rows:
-        return {"resolvedBy": [], "confidence": None, "dispatch_candidate": True}
-    return {"resolvedBy": resolved_by,
-            "confidence": min(confidences) if confidences else None,
-            "dispatch_candidate": candidate}
-
-
 def _digraph_view(graph_path) -> nx.DiGraph:
     """B3 R3-1 有向视图：从原始 graph.json 的 links source/target 重建方向（DiGraph）。
     生产 graph.json 实测 directed:false——_load_graph 产 nx.Graph，node_link_graph 无向化
@@ -2102,11 +2042,12 @@ def _reverse_closure(DG: nx.DiGraph, node, depth, top_k) -> tuple[list[str], int
 
 
 def _fanout_targets(DG: nx.DiGraph, target_id) -> tuple[list[str], str]:
-    """B3 fan-out 重展开：dispatch 调用目标 → 全部分类 override 候选。
-    三边联走：反向 contains 且 predecessor kind=='class' 得所属类 → extends/implements
-    反向 BFS 得子类集 → 各子类 contains 出边下短名与 target 短名相等的节点 = 全部可能目标。
-    任一步无果 → (原单目标, 'unavailable: no owning class')。同名匹配只走 label
-    （id 是 hash 形态无语义，R3-2 _symbol_short_name）。"""
+    """B3 fan-out 重展开：多态调用目标（dispatch 退役后由边置信度 INFERRED/AMBIGUOUS
+    信号触发）→ 全部分类 override 候选。三边联走：反向 contains 且 predecessor
+    kind=='class' 得所属类 → extends/implements 反向 BFS 得子类集 → 各子类 contains
+    出边下短名与 target 短名相等的节点 = 全部可能目标。任一步无果 → (原单目标,
+    'unavailable: no owning class')。同名匹配只走 label（id 是 hash 形态无语义，
+    R3-2 _symbol_short_name）。"""
     # M5（review）：与 _reverse_closure 一致拒无向图——类型注解 + 运行时 isinstance 断言。
     if not isinstance(DG, nx.DiGraph):
         raise TypeError("_fanout_targets requires nx.DiGraph (call _digraph_view first)")
@@ -2146,7 +2087,9 @@ def _fanout_targets(DG: nx.DiGraph, target_id) -> tuple[list[str], str]:
 def _neighbors_lines(G, nid, rel_filter=""):
     """B3 缺省路径正文装配：direction/depth 未给定时的既有 G 语义——与扩展前
     _tool_get_neighbors 的 successors/predecessors 循环逐字节一致（无向图上双向输出
-    本就同集合；方向只在 B3 有向视图路径用）。模块级提取以便缺省回归锚点测试。"""
+    本就同集合；方向只在 B3 有向视图路径用）。模块级提取以便缺省回归锚点测试。
+    Task 08：边属性 resolved_by（04 打点）存在时附到行尾（缺省 fixture 无该属性，
+    字节锚点回归不变）——边置信度与 resolved_by 从响应读出。"""
     lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
 
     def _edge_at(d: dict) -> str:
@@ -2157,6 +2100,10 @@ def _neighbors_lines(G, nid, rel_filter=""):
             f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
             if loc else ""
         )
+
+    def _edge_rb(d: dict) -> str:
+        rb = d.get("resolved_by")
+        return f" [resolved_by={sanitize_label(str(rb))}]" if rb else ""
 
     # 生产 G 是 _load_graph 强制 directed:True 的 DiGraph（有向边逐一存储）——
     # 保持 successors/predecessors 双循环逐字节不变；无向 Graph（缺省锚点测试的
@@ -2173,7 +2120,8 @@ def _neighbors_lines(G, nid, rel_filter=""):
             continue
         lines.append(
             f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+            f"{_edge_rb(d)}{_edge_at(d)}"
         )
     for nb in pred_iter:
         d = edge_data(G, nb, nid)
@@ -2182,7 +2130,8 @@ def _neighbors_lines(G, nid, rel_filter=""):
             continue
         lines.append(
             f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+            f"{_edge_rb(d)}{_edge_at(d)}"
         )
     return lines
 
@@ -2198,15 +2147,16 @@ def _toward_edge(DG, closure_set, nid, u, incoming):
     return None, None
 
 
-def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=None,
+def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
                         fanout_limited=False):
     """B3 新路径正文装配（direction 或 depth>1 给定）：_digraph_view 产物上反向/正向闭包
-    + 逐节点 toward 边 + dispatch 标注（仅 depth>1 且 rel=='calls'，R5-5(b)：depth=1 普通
-    邻接不查 DB——hub 节点 50-200 邻边逐边 JOIN（edges 30k 行无 kind/source 索引）是 P95
-    杀手，且 depth=1 场景 agent 本要逐条看边、标注价值最低；I1 后仅 calls 边查 DB，top-50
-    截断后 ≤50 次 JOIN 有界）+ fanout 重展开 + 截断标志。edge_kinds 已由调用方过滤进 DG
-    （本函数不重收）；fanout_limited 由调用方按 edge_kinds 是否含 fanout 遍历关系判定
-    （M1b）。返回 (lines, closure_total)。
+    + 逐节点 toward 边 + 多态标注（仅 depth>1 且 rel=='calls'，R5-5(b)：depth=1 普通
+    邻接不标——hub 节点 50-200 邻边逐一展开是 P95 杀手，且 depth=1 场景 agent 本要逐条
+    看边、标注价值最低）+ fanout 重展开 + 截断标志。Task 08：dispatch 概念退役——
+    标注改读边属性 confidence（INFERRED/AMBIGUOUS 保留信号）+ resolved_by（04 提取期
+    打点），不再 JOIN codegraph DB。edge_kinds 已由调用方过滤进 DG（本函数不重收）；
+    fanout_limited 由调用方按 edge_kinds 是否含 fanout 遍历关系判定（M1b）。
+    返回 (lines, closure_total)。
     """
     if nid not in DG:
         return [f"Neighbors of {sanitize_label(str(nid))} "
@@ -2230,81 +2180,60 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter, db_path=No
         show = sorted(merged, key=lambda n: (-DG.degree(n), n))[:top_k]
         in_set, out_set = set(in_full), set(out_full)
     closure_full = in_set | out_set
-    conn = None
-    use_dispatch = depth > 1
-    if use_dispatch and db_path is not None:
-        db = Path(db_path)
-        if db.exists():
-            import sqlite3 as _sqlite3
-            try:
-                conn = _sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
-            except _sqlite3.Error:
-                conn = None
-    try:
-        for u in show:
-            # L1（review 注释登记）：both 闭包下节点双在 in/out 集时只按祖先侧展示
-            # （incoming=True + <-> 箭头）——toward 边归属非最优（双向节点可能两侧各
-            # 有一条 toward 边，只取祖先侧），已知近似不修（文本摘要工具，主信息
-            # "节点在闭包内 + 双向"已正确）。
-            if u in in_set and u in out_set:
-                arrow, incoming = "<->", True
-            elif u in out_set:
-                arrow, incoming = "-->", False
-            else:
-                arrow, incoming = "<--", True
-            v, ed = _toward_edge(DG, closure_full, nid, u, incoming)
-            if v is None:
-                continue
-            rel = str(ed.get("relation", ""))
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            loc = str(ed.get("source_location") or "")
-            at = (f" at={sanitize_label(str(ed.get('source_file') or ''))}:{sanitize_label(loc)}"
-                  if loc else "")
-            line = (f"  {arrow} {sanitize_label(str(DG.nodes[u].get('label') or u))} "
-                    f"[{sanitize_label(rel)}] [{sanitize_label(str(ed.get('confidence', '')))}]{at}")
-            # I1（controller 裁决）：dispatch/fanout 仅对 calls 类边触发——宁多标语义
-            # 对 contains/imports 无意义（无"分发到子类 override"语义），且非 calls 边
-            # 多为空组会产噪声（god node 52 行中 44 行）。非 calls 边不查 DB、不标
-            # dispatch、不 fanout。
-            if conn is not None and rel == "calls":
-                # C1（review）：out 方向边缘是 (调用方 v → 被调方 u)，caller/callee
-                # 必须随 incoming 分支定序——in/both 入侧真序恰与 (u, v) 一致（in 方向
-                # 回归测试锁定不变），只有 out/both 出侧失真需换 (v, u)。
-                caller, callee = (u, v) if incoming else (v, u)
-                # JOIN 用 caller→callee（DB calls 边的 source=caller/target=callee）
-                info = _edge_dispatch_info(
-                    conn,
-                    ed.get("source_file") or DG.nodes[u].get("source_file") or "",
-                    rel,
-                    _symbol_short_name(DG.nodes[caller], caller),
-                    _symbol_short_name(DG.nodes[callee], callee))
-                rb = ",".join(info["resolvedBy"]) or "unknown"
-                conf = info["confidence"]
-                conf_s = f"{conf:g}" if isinstance(conf, (int, float)) else "?"
-                if info["dispatch_candidate"]:
-                    line += f" [dispatch: resolvedBy={rb}, confidence={conf_s}]"
-                    # fanout 展开的是被调用方法（分发目标）的类层级
-                    fan_targets, note = _fanout_targets(DG, callee)
-                    if note:
-                        # M1b：edge_kinds 滤掉 fanout 遍历关系（contains/extends）时展开
-                        # 受限——文案须区分"被过滤"与"无所属类"（宁多标方向都诚实）。
-                        if fanout_limited:
-                            line += " fanout=(limited by edge_kinds filter: contains/extends removed)"
-                        else:
-                            line += f" fanout=({note})"
-                    elif len(fan_targets) > 1:
-                        # fanout 覆写用完整 label（短名歧义：Base.handle 与 Child.handle
-                        # 短名同为 handle，列表须可区分）。
-                        line += " fanout=(" + ", ".join(
-                            sanitize_label(str(DG.nodes[t].get("label") or t))
-                            for t in fan_targets[1:]) + ")"
-                else:
-                    line += f" [resolvedBy={rb}, confidence={conf_s}]"
-            lines.append(line)
-    finally:
-        if conn is not None:
-            conn.close()
+    for u in show:
+        # L1（review 注释登记）：both 闭包下节点双在 in/out 集时只按祖先侧展示
+        # （incoming=True + <-> 箭头）——toward 边归属非最优（双向节点可能两侧各
+        # 有一条 toward 边，只取祖先侧），已知近似不修（文本摘要工具，主信息
+        # "节点在闭包内 + 双向"已正确）。
+        if u in in_set and u in out_set:
+            arrow, incoming = "<->", True
+        elif u in out_set:
+            arrow, incoming = "-->", False
+        else:
+            arrow, incoming = "<--", True
+        v, ed = _toward_edge(DG, closure_full, nid, u, incoming)
+        if v is None:
+            continue
+        rel = str(ed.get("relation", ""))
+        if rel_filter and rel_filter not in rel.lower():
+            continue
+        loc = str(ed.get("source_location") or "")
+        at = (f" at={sanitize_label(str(ed.get('source_file') or ''))}:{sanitize_label(loc)}"
+              if loc else "")
+        line = (f"  {arrow} {sanitize_label(str(DG.nodes[u].get('label') or u))} "
+                f"[{sanitize_label(rel)}] [{sanitize_label(str(ed.get('confidence', '')))}]{at}")
+        # I1（controller 裁决）：多态/fanout 仅对 calls 类边触发——宁多标语义对
+        # contains/imports 无意义（无"分发到子类 override"语义），非 calls 边不展开。
+        # R5-5(b) 沿用：depth>1 才标（depth=1 普通邻接不标，与工具描述"depth>1 返回
+        # blast radius + fanout"一致）。
+        if depth > 1 and rel == "calls":
+            # C1（review）：out 方向边缘是 (调用方 v → 被调方 u)，fanout 展开的是被
+            # 调用方法（分发目标）的类层级——callee 必须随 incoming 分支定序（in/both
+            # 入侧真序恰与 (u, v) 一致；out/both 出侧失真需换 (v, u)）。
+            _, callee = (u, v) if incoming else (v, u)
+            # Task 08：dispatch 概念退役——不再 JOIN codegraph DB（_edge_dispatch_info
+            # 已删），标注改读边属性：resolved_by（04 打点，数据读出）+ confidence
+            # （INFERRED/AMBIGUOUS 保留信号，多态 fanout 判断）。
+            rb = ed.get("resolved_by")
+            if rb:
+                line += f" [resolved_by={sanitize_label(str(rb))}]"
+            if ed.get("confidence") in ("INFERRED", "AMBIGUOUS"):
+                # EXTRACTED 确定性调用不标注、不展开；INFERRED/AMBIGUOUS = 分发候选。
+                fan_targets, note = _fanout_targets(DG, callee)
+                if note:
+                    # M1b：edge_kinds 滤掉 fanout 遍历关系（contains/extends）时展开
+                    # 受限——文案须区分"被过滤"与"无所属类"（宁多标方向都诚实）。
+                    if fanout_limited:
+                        line += " fanout=(limited by edge_kinds filter: contains/extends removed)"
+                    else:
+                        line += f" fanout=({note})"
+                elif len(fan_targets) > 1:
+                    # fanout 覆写用完整 label（短名歧义：Base.handle 与 Child.handle
+                    # 短名同为 handle，列表须可区分）。
+                    line += " fanout=(" + ", ".join(
+                        sanitize_label(str(DG.nodes[t].get("label") or t))
+                        for t in fan_targets[1:]) + ")"
+        lines.append(line)
     if total > len(show):
         # M1a：both 分支语义对称性透明化——闭包是 in/out 两方向并集，标注去向
         by = "by degree across both directions" if direction == "both" else "by degree"
@@ -2577,7 +2506,10 @@ _TOOL_SPECS: list[dict] = [
             "Get neighbors of a node with edge details. depth=1 lists direct "
             "neighbors (undirected); depth>1 returns the blast radius on the "
             "directed view (callers for direction=in, callees for direction=out) "
-            "with dispatch/fanout annotations and low-confidence verdict. "
+            "with polymorphic fanout annotations and low-confidence verdict. "
+            "Dispatch semantics are read natively from edge confidence/resolved_by "
+            "(extraction-time inference, replacing external-resolver metadata); "
+            "INFERRED/AMBIGUOUS call edges expand to subclass overrides. "
             "edge_kinds restricts traversal to the given relation kinds."
         ),
         "inputSchema": {
@@ -3000,11 +2932,10 @@ def _build_server(graph_path: str):
             # fanout 展开受限——标注须区分"被过滤"与"无所属类"。
             fanout_limited = ("contains" not in kinds or
                               ("extends" not in kinds and "implements" not in kinds))
-        top_k = 50  # R5-5：top-50 截断后 dispatch 逐边 JOIN ≤50 次有界
-        db_path = Path(active_graph_path).parent.parent / ".codegraph" / "codegraph.db"
+        top_k = 50  # R5-5：top-50 截断（闭包可能远大于此，有界输出）
         lines, total = _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
-                                           db_path=db_path, fanout_limited=fanout_limited)
-        # R3-3 verdict：depth=1（无 dispatch 边，R5-5(b) 不查 DB）→ 走推导（ok）；
+                                           fanout_limited=fanout_limited)
+        # R3-3 verdict：depth=1（无多态展开，R5-5(b)）→ 走推导（ok）；
         # depth>1（blast-radius）→ low_confidence 经 verdict_override 直通 + advisory
         # 措辞（Q14——输出建立在边语义不完整的图上，advisory 不可省）。
         # N1：found=起点在图，scanned=闭包全量尺寸，extra_meta 带 _meta.closure_size。

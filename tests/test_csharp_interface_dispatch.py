@@ -78,6 +78,17 @@ def test_single_implementer_links_the_interface_method(tmp_path):
     assert (_find(r, ".Build()", "ireport"), _find(r, ".Build()", "report_report")) in dispatch
 
 
+def test_dispatch_edge_carries_native_semantic_attrs(tmp_path):
+    """Task 08 Ruling B：dispatches_to 边由边属性 confidence + resolved_by 原生承载
+    （dispatch 概念退役后语义统一走边属性）——INFERRED + instance-method。"""
+    _, r = _extract(tmp_path, _INJECTED)
+    dispatch_edges = [e for e in r["edges"] if e["relation"] == "dispatches_to"]
+    assert len(dispatch_edges) == 1
+    edge = dispatch_edges[0]
+    assert edge["confidence"] == "INFERRED"
+    assert edge["resolved_by"] == "instance-method"
+
+
 def test_chain_through_an_injected_dependency_becomes_reachable(tmp_path):
     dispatch, r = _extract(tmp_path, _INJECTED)
     assert dispatch

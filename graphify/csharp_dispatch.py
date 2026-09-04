@@ -146,6 +146,10 @@ def resolve_csharp_interface_dispatch(
                 "context": "call",
                 "confidence": "INFERRED",
                 "confidence_score": 0.9,
+                # Task 08 Ruling B：dispatch 语义由边属性原生承载——dispatches_to 是
+                # 经接口注入的调用，最接近 instance-method 解析路径（spec §提取契约
+                # resolved_by 映射：instance-method → "instance-method"）。
+                "resolved_by": "instance-method",
                 "source_file": str(impl_node.get("source_file", "")),
                 "source_location": impl_node.get("source_location"),
                 "weight": 1.0,
