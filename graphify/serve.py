@@ -2021,8 +2021,9 @@ def _get_node_tool(G, active_graph_path, arguments: dict) -> tuple[str, bool, in
 def _symbol_short_name(d: dict, nid: str) -> str:
     """B3 R3-2 合并图短名：label 首 token 末段（消歧后缀 ' (N)' 剥离）。
     serve 自包含副本——graphify 包不反向依赖 scripts/（rebuild_entry._parse_refresh
-    "scripts 无包结构，两文件各持自包含副本，不互相导入" 先例）；与 scripts/adapter.py
-    _symbol_short_name 同源，防漂移锁定靠 test_dispatch_trace 一致性测试。"""
+    "scripts 无包结构，两文件各持自包含副本，不互相导入" 先例）；与 scripts/symbol_utils.py
+    _symbol_short_name 同源（Task 09 adapter 退役后短名事实源迁入），防漂移锁定靠
+    test_dispatch_trace 一致性测试。"""
     return str(d.get("label") or nid).split(" ")[0].rsplit(".", 1)[-1]
 
 

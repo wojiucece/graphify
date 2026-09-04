@@ -31,8 +31,9 @@ _QUICK_SYNC_QUIET = 0.3          # 快窗 300ms（codegraph QUICK_SYNC_QUIET_MS 
 _MAX_SYNC_FAILURE_RETRIES = 5    # 连续重建失败上限（codegraph MAX_SYNC_FAILURE_RETRIES）
 _MAX_RETRY_BACKOFF = 30.0        # 退避上限 30s（codegraph MAX_RETRY_BACKOFF_MS / 1000）
 
-# CUSTOM: Phase 3 拓扑切换（方案 §6.2）--代码索引职能移交 codegraph。
-# AST 可提取文件 -> rebuild_entry（sync + 适配器重建）；
+# CUSTOM: Phase 3 拓扑切换（方案 §6.2）。Task 09 换源：rebuild_entry 内部已是
+# extract→build→to_json→rebuild_fts 新链路（codegraph sync/adapter 退役）。
+# AST 可提取文件 -> rebuild_entry（新链路重建）；
 # 非 AST 文件（.md/.pdf/...）-> 作为 semantic_refresh 随入口重建（保留语义提取职能）。
 from graphify.extract import _get_extractor as _ge
 

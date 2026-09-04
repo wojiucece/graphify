@@ -298,8 +298,7 @@ def ensure_fts(graph_path: str | Path, out_db: str | Path) -> bool:
 # ── 只读连接与查询面（消费侧接口：06/10 票）────────────────────────────────────
 
 def open_readonly(db_path: str | Path) -> sqlite3.Connection:
-    """URI 只读连接（ranked.py 直查 codegraph.db 时用 adapter._open_readonly；
-    缓存链路下 adapter 退役，同款连接函数下沉到本模块）。"""
+    """URI 只读连接（Task 09 adapter 退役后，消费侧统一查自建缓存时用本函数）。"""
     p = Path(db_path).resolve()
     return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
 

@@ -27,12 +27,11 @@ _SELF = Path(__file__).resolve().parent
 if str(_SELF) not in sys.path:        # scripts 无包结构——同目录 import（rebuild_entry 先例）
     sys.path.insert(0, str(_SELF))
 
-# 07 票：codegraph 运行时退役——B1 不再直查 .codegraph/codegraph.db（adapter 依赖移除），
-# 改查自建 FTS 缓存（graphify-out/.fts-index.db，scripts/fts_cache.py，05 票产物）。
+# 07 票：codegraph 运行时退役——B1 不再直查 .codegraph/codegraph.db（Task 09 adapter
+# 整体退役），改查自建 FTS 缓存（graphify-out/.fts-index.db，scripts/fts_cache.py，05 票产物）。
 # fts_cache 是 scripts 模块，lazy import（见 _fts_cache）——graphify 包不反向依赖 scripts/。
-# Q6（v1.7 裁决）：id 折叠复用同一实现，不复刻——adapter._disambiguate_ids 同款写法
-# （graphify.ids.normalize_id，NFKC+casefold 折叠；brief 所述 adapter._normalize_id 系
-# 同源别名，adapter 未导出该名，故直接从 graphify.ids 取同函数）。
+# Q6（v1.7 裁决）：id 折叠复用同一实现，不复刻——graphify.ids.normalize_id（NFKC+casefold
+# 折叠，即旧 adapter._disambiguate_ids 同款折叠规则；adapter 退役后直接从 graphify.ids 取）。
 from graphify.ids import normalize_id as _normalize_id
 
 _FTS_LIMIT = 40      # FTS5 BM25 候选池上限
@@ -44,7 +43,7 @@ _CJK_SCORE = 0.4
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[\u4e00-\u9fff]+")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
-# Q6 \u78b0\u649e\u5224\u5b9a\uff1aadapter._disambiguate_ids \u6d88\u6b67\u540e\u7f00\u4e3a `__cg{n}`\uff0c\u7ecf _normalize_id \u6298\u53e0
+# Q6 \u78b0\u649e\u5224\u5b9a\uff1a\u65e7 adapter \u6d88\u6b67\u540e\u7f00\u4e3a `__cg{n}`\uff08\u5df2\u968f adapter \u9000\u5f79\uff09\uff0c\u4f46\u5386\u53f2\u56fe\u53ef\u80fd\u6b8b\u7559\uff0c\u7ecf _normalize_id \u6298\u53e0
 # \uff08NFKC+casefold\uff0c\u8fde\u7eed\u4e0b\u5212\u7ebf\u584c\u7f29\u4e3a\u5355\u7ebf\uff09\u540e\u4e3a `_cg{n}`\u2014\u2014\u7528\u6298\u53e0\u540e\u5f62\u6001\u68c0\u6d4b\uff08ruling \u539f\u6587
 # "fold \u7ed3\u679c\u542b\u6d88\u6b67\u540e\u7f00"\uff09\uff0c\u5e26\u5c3e\u6570\u5b57\u9632\u81ea\u7136\u540d `foo_cg` \u8bef\u5224\u3002
 _CG_SUFFIX_RE = re.compile(r"_cg\d+$")

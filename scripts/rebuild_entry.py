@@ -20,6 +20,8 @@ if str(_ROOT) not in sys.path:            # import graphify（本地包，不依
     sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # import fts_cache / run_analysis
 
+# 退出码空间（评审 Minor）：EXIT_SYNC_FAIL=4 已随 codegraph sync 退役而无引用——保留
+# 常量作退出码契约文档（hook/调用方不应复用 4 作其他语义），勿误删。
 EXIT_OK, EXIT_LOCK, EXIT_SYNC_FAIL = 0, 3, 4
 EXTRACT_RETRIES, EXTRACT_RETRY_WAIT_S = 3, 2.0   # 提取失败短退避重试（对齐旧 sync 3 次退避）
 _STATE_SCHEMA = 2                                  # 状态文件 schema v2（graph_fingerprint 字段）
@@ -263,6 +265,31 @@ def validate_semantic_anchors(seed: dict) -> list[str]:
     return violations
 
 
+def _relativize_failed_refs(extraction: dict, root: Path) -> None:
+    """failed_refs.file_path 相对化到 root（原地修改）。
+
+    extract 产出的 failed_refs.file_path 是绝对路径（raw_calls source_file 原样），
+    而 graph.json 节点 source_file 是 root 相对形态——07 逐出 identity 匹配
+    （watch._reconcile_existing_graph / cli._prune_graph_json_sources）要求同源相对
+    posix。watch._relativize_source_files 对 failed_refs 桶同款语义（file_path 字段）；
+    无法相对（root 外文件）时保持原样（诚实，不臆造路径）。
+    """
+    root = Path(root).resolve()
+    for fr in extraction.get("failed_refs") or []:
+        if not isinstance(fr, dict):
+            continue
+        fp = fr.get("file_path")
+        if not fp:
+            continue
+        p = Path(fp)
+        if not p.is_absolute():
+            continue
+        try:
+            fr["file_path"] = p.resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
+
+
 def _merge_seed(extraction: dict, out: Path, semantic_seed: Path | None,
                 semantic_refresh: list[Path] | None, root: Path) -> tuple[dict, list]:
     """把 semantic seed 状态合并进 extraction（从 run_analysis 迁入的 build 步骤）.
@@ -272,8 +299,13 @@ def _merge_seed(extraction: dict, out: Path, semantic_seed: Path | None,
     - semantic_refresh：对每个 refresh 文件做语义提取，按 source_file 身份 upsert 进
       seed 状态（无 seed 则建），并把合并后的 seed 写回 seed 路径（下一轮无 refresh
       的 rebuild 自动拾取，链路闭合防 shrink-guard 砖死）。
+    - **failed_refs 透传（评审 Critical）**：重建 dict 时保留 extract 失败收集器产物
+      （知识缺口查询源——knowledge-gaps.json / ranked gap_hit 依赖 graph.json 顶层
+      failed_refs）；file_path 相对化到 root（extract 原样绝对路径，07 逐出 identity
+      匹配要求相对 posix）。
 
-    返回 (merged_extraction, seed_hyperedges)——hyperedges 由调用方 attach 回图。
+    返回 (merged_extraction, seed_hyperedges)——hyperedges 由调用方 attach 回图；
+    extract 不产 hyperedges（返回键集仅 nodes/edges/failed_refs 等），无丢失面。
     """
     seed_path = Path(semantic_seed) if semantic_seed is not None else out / "semantic-seed.json"
     _seed_raw: dict = {}
@@ -298,7 +330,8 @@ def _merge_seed(extraction: dict, out: Path, semantic_seed: Path | None,
         from graphify.extract import extract as _extract_semantic
         for rf in semantic_refresh:
             try:
-                r = _extract_semantic([Path(rf)], root=str(root),
+                # root 传 Path（与 cache_root 同类型，M4 风格统一）
+                r = _extract_semantic([Path(rf)], root=root,
                                       cache_root=root)
                 for n in r.get("nodes", []):
                     # refresh 合入的 .md 节点强制标 semantic（extract 产出 _origin='ast'）
@@ -324,8 +357,12 @@ def _merge_seed(extraction: dict, out: Path, semantic_seed: Path | None,
         except Exception as e:
             print(f"[rebuild_entry] seed 落盘失败 {seed_path}: {type(e).__name__}: {e}"
                   f"——下一轮无 refresh 重建将丢失语义面", file=sys.stderr)
+    # 评审 Critical：failed_refs 透传 + file_path 相对化（extract 失败收集器是知识
+    # 缺口唯一事实源，重建 dict 时不可丢——graph.json 顶层是 ranked gap 通道消费点）。
+    _relativize_failed_refs(extraction, root)
     extraction = {"nodes": extraction["nodes"] + seed_nodes,
-                  "edges": extraction["edges"] + seed_edges}
+                  "edges": extraction["edges"] + seed_edges,
+                  "failed_refs": extraction.get("failed_refs", [])}
     return extraction, seed_hyperedges
 
 

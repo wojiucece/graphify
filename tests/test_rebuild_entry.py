@@ -42,6 +42,31 @@ def test_rebuild_produces_fact_layer_and_cache(tmp_path):
         conn.close()
 
 
+def test_rebuild_preserves_failed_refs_from_real_extract(tmp_path):
+    """评审 Critical：一键重建的 graph.json 顶层必须含 extract 失败收集器产出的
+    failed_refs（真实 extract 驱动，非手工 fixture）——knowledge-gaps.json / ranked
+    gap_hit 依赖它。此前 _merge_seed 重建 dict 时 failed_refs 键被丢，任务 07 持久化
+    在主入口被打穿。"""
+    import rebuild_entry
+    root = tmp_path
+    (root / "a.py").write_text(
+        "def existing():\n    return 1\n\ndef caller():\n    return undefined_fn()\n",
+        encoding="utf-8")
+    out = Path(rebuild_entry.rebuild(root))
+    data = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    refs = data.get("failed_refs")
+    assert refs, "graph.json 顶层 failed_refs 缺失（_merge_seed 丢弃 extract 产物）"
+    names = {fr["callee_name"] for fr in refs}
+    assert "undefined_fn" in names, f"failed_refs 未含 extract 失败收集器产物: {refs}"
+    # file_path 相对化（extract 原样绝对路径；graph.json 节点 source_file 是 root 相对）
+    for fr in refs:
+        assert fr["file_path"] == "a.py", f"failed_refs.file_path 未相对化到 root: {fr}"
+    # knowledge-gaps sidecar 同步非空（消费者链路闭合：run_analysis 读 graph.json failed_refs）
+    gaps = json.loads((out / "knowledge-gaps.json").read_text(encoding="utf-8"))
+    assert any(g["ref"] == "undefined_fn" for g in gaps), \
+        f"knowledge-gaps 未消费 failed_refs: {gaps}"
+
+
 def test_pipeline_order_extract_build_tojson_rebuildfts_analysis(monkeypatch, tmp_path):
     """编排顺序：extract → build → to_json → rebuild_fts → run_analysis（换源后的链路）."""
     import graphify.build, graphify.cluster, graphify.export, graphify.extract
