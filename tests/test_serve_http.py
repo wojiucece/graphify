@@ -429,3 +429,59 @@ def test_get_node_and_get_neighbors_agree_on_ambiguous_label(tmp_path):
         # A unique label still resolves cleanly on get_node.
         unique = _call_tool(client, headers, "get_node", {"label": "unique_helper"}, rid=4)
         assert "Node: unique_helper" in unique, unique
+
+
+# === Task 08 评审 F1/F2：/query 与 /health 端点修复（_GraphContextCache get/__contains__）====
+
+_SECRET_GRAPH = {
+    "directed": True,
+    "nodes": [
+        {"id": "a", "label": "Alpha sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+         "community": 0, "source_file": "x.py", "source_location": "L1"},
+        {"id": "b", "label": "Beta", "community": 0,
+         "source_file": "y.py", "source_location": "L1"},
+    ],
+    "edges": [
+        {"source": "a", "target": "b", "relation": "calls", "confidence": "EXTRACTED"},
+    ],
+}
+
+
+def _secret_graph_file(tmp_path: Path) -> str:
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps(_SECRET_GRAPH), encoding="utf-8")
+    return str(p)
+
+
+def test_query_endpoint_returns_200_and_redacts(tmp_path):
+    """F1：/query 端点不再必然 500（_GraphContextCache.get 曾缺失→AttributeError），
+    且正文过 _redact（A2 脱敏与 call_tool 出口一致，节点 label 里的密钥被替换）。"""
+    app = serve_mod._build_http_app(_secret_graph_file(tmp_path), json_response=True)
+    with _client(app) as client:
+        resp = client.post("/query", json={"prompt": "Alpha"})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "result" in body and body["result"]
+        assert "[REDACTED:openai]" in body["result"], body["result"]
+        assert "sk-AAAAAAAA" not in body["result"]
+
+
+def test_health_endpoint_returns_200_with_loaded_graph(tmp_path):
+    """F2：/health 端点不再必然 500（_GraphContextCache.__contains__ 曾缺失→TypeError）；
+    默认图已加载 → graph_loaded=true。"""
+    app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
+    with _client(app) as client:
+        resp = client.get("/health")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "ok"
+        assert resp.json()["graph_loaded"] is True
+
+
+def test_health_endpoint_missing_graph_reports_not_loaded(tmp_path):
+    """F2 边界：默认 graph.json 缺失时 /health 仍 200，graph_loaded=false（不 500）。"""
+    app = serve_mod._build_http_app(str(tmp_path / "missing" / "graph.json"),
+                                    json_response=True)
+    with _client(app) as client:
+        resp = client.get("/health")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["graph_loaded"] is False

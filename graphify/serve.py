@@ -171,6 +171,29 @@ class _GraphContextCache:
                     self._entries.popitem(last=False)
             return entry["G"], entry["communities"]
 
+    def get(self, resolved_path: str) -> dict | None:
+        """Return the cached entry dict for an already-loaded path, else None.
+
+        Pure cache peek: no stat, no LRU touch — ``load`` owns freshness and
+        cache-key construction. Callers that need a fresh context load first
+        (``_select_graph`` does) and then peek here. (Task 08 评审 F1：修复 /query
+        端点调用不存在的 ``.get`` 导致的必然 AttributeError→500。)
+        """
+        with self._lock:
+            entry = self._pinned.get(resolved_path)
+            if entry is not None:
+                return entry
+            return self._entries.get(resolved_path)
+
+    def __contains__(self, resolved_path: object) -> bool:
+        """True when the path currently has a cached entry (pinned or LRU).
+
+        (Task 08 评审 F2：修复 /health 端点 ``in`` 检查对无 ``__contains__`` 的
+        类触发 TypeError→500。)
+        """
+        with self._lock:
+            return resolved_path in self._pinned or resolved_path in self._entries
+
 
 def _strip_diacritics(text: str | None) -> str:
     import unicodedata
@@ -2214,6 +2237,9 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
             # Task 08：dispatch 概念退役——不再 JOIN codegraph DB（_edge_dispatch_info
             # 已删），标注改读边属性：resolved_by（04 打点，数据读出）+ confidence
             # （INFERRED/AMBIGUOUS 保留信号，多态 fanout 判断）。
+            # M1 澄清（评审）：spec "EXTRACTED 不标" 指不触发 fanout、不标 [dispatch
+            # 标记；resolved_by 作为提取期打点数据仍读出（与旧行为"非候选边仍显示
+            # resolvedBy"延续），EXTRACTED 边也照常展示——勿误读为连数据都隐藏。
             rb = ed.get("resolved_by")
             if rb:
                 line += f" [resolved_by={sanitize_label(str(rb))}]"
@@ -3387,7 +3413,7 @@ def _build_server(graph_path: str):
                 return JSONResponse({"error": "no graph loaded"}, status_code=404)
             G = ctx["G"]
         except Exception as e:
-            return JSONResponse({"error": f"graph load failed: {e}"}, status_code=500)
+            return JSONResponse({"error": _redact(f"graph load failed: {e}")}, status_code=500)
 
         try:
             # v3 修订（审核优化 #5）：改用关键字参数
@@ -3395,9 +3421,12 @@ def _build_server(graph_path: str):
                 G, question=prompt, mode="bfs", depth=depth,
                 token_budget=budget, context_filters=None,
             )
-            return JSONResponse({"result": result})
+            # Task 08 评审 F1：/query 是 HTTP JSON 出口（非 MCP call_tool 信封出口），
+            # 正文与错误消息与 call_tool 同承诺过 _redact（A2 脱敏面补齐；信封/verdict
+            # 不适用于该 JSON 端点，脱敏一致即可）。
+            return JSONResponse({"result": _redact(result)})
         except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            return JSONResponse({"error": _redact(str(e))}, status_code=500)
 
     async def _handle_health(request):
         from starlette.responses import JSONResponse

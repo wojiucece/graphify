@@ -268,6 +268,19 @@ def test_blast_radius_contains_edge_no_dispatch_annotation():
     body = "\n".join(lines)
     assert "resolved_by" not in body and "dispatch" not in body and "fanout" not in body, body
 
+def test_blast_radius_fanout_out_direction_lists_subclass_overrides():
+    """Task 08 评审 F4（二轮 I1）：out 方向 fanout 定序回归锁——caller 调 Base.handle，
+    ChildA/ChildB 覆写，从 out 方向（direction=out, depth=2）断言输出含子类展开。
+    C1 定序变体若回归（callee 误取调用侧/入侧），展开会落到 caller 类层级或降级
+    'no owning class'，静默逃逸——此锁防漏。"""
+    from graphify.serve import _blast_radius_lines
+    DG = _dispatch_digraph()
+    lines, total = _blast_radius_lines(DG, "function:c11", "out", 2, 50, "")
+    body = "\n".join(lines)
+    assert "resolved_by=instance-method" in body, body
+    assert "pkg.ChildA.handle" in body and "pkg.ChildB.handle" in body, body
+    assert "no owning class" not in body
+
 def test_blast_radius_fanout_limited_by_edge_kinds():
     """M1b：edge_kinds=['calls'] 滤掉 contains/extends → fanout 展开受限，降级 note 用
     'limited by edge_kinds filter' 而非 'no owning class'（区分"被过滤"与"无所属类"）。"""
