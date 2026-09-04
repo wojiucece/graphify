@@ -22,6 +22,9 @@ try:
 except ImportError:
     _jieba = None
 
+# Task 10 内置 watcher：默认关，--watch / GRAPHIFY_WATCH 显式开启。
+_WATCH_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+
 
 class ToolError(Exception):
     """Raised by a tool handler to signal an error result.
@@ -184,6 +187,18 @@ class _GraphContextCache:
             if entry is not None:
                 return entry
             return self._entries.get(resolved_path)
+
+    def invalidate(self, resolved_path: str) -> None:
+        """Drop a cached entry so the next ``load`` re-stats and reloads it.
+
+        Task 10: the built-in watcher calls this on pipeline completion to swap
+        the active graph in-process without waiting for a stat/mtime observation
+        (``load`` still re-validates the key, so this is a fast-forward, not a
+        bypass). No-op for paths that are not cached.
+        """
+        with self._lock:
+            self._pinned.pop(resolved_path, None)
+            self._entries.pop(resolved_path, None)
 
     def __contains__(self, resolved_path: object) -> bool:
         """True when the path currently has a cached entry (pinned or LRU).
@@ -2775,13 +2790,18 @@ def _all_tool_schemas() -> list[dict]:
     return schemas
 
 
-def _build_server(graph_path: str):
+def _build_server(graph_path: str, *, watch: bool | None = None):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
     ``mcp.server.Server`` instance; the caller picks the transport (stdio or
     Streamable HTTP) and runs it. Hot-reload of graph.json works the same way
     regardless of transport, since reloads happen inside the tool handlers.
+
+    ``watch`` (Task 10) enables the in-process file watcher: default off;
+    ``--watch`` or the GRAPHIFY_WATCH env var turns it on. The watcher rebuilds
+    the fact layer + FTS cache on save and invalidates the graph context cache
+    so the next query atomically swaps to the fresh graph.
     """
     try:
         from mcp.server import Server
@@ -2802,6 +2822,16 @@ def _build_server(graph_path: str):
     # while preventing a shared server from retaining every project it serves.
     _default_graph_path = str(Path(graph_path).resolve())
     _ctx_cache = _GraphContextCache(_max_server_contexts())
+
+    # === CUSTOM: 内置 watcher（Task 10）——默认关，--watch / GRAPHIFY_WATCH 显式开启 ===
+    # 挂载点（架构票 04：serve.py 挂载 diff ≤ 25 行）；逻辑全在 serve_watcher.py。
+    if watch is None:
+        watch = os.environ.get("GRAPHIFY_WATCH", "").strip().lower() in _WATCH_ENV_TRUE
+    if watch:
+        from graphify import serve_watcher
+        _watcher = serve_watcher.mount_watcher(_default_graph_path, _ctx_cache, watch=True)
+    else:
+        _watcher = None
 
     def _load_ctx(path: str):
         """Return the current default or project graph context as a tool error.
@@ -3442,11 +3472,26 @@ def _build_server(graph_path: str):
     server._graphify_health_handler = _handle_health
     # === CUSTOM: /query and /health HTTP endpoints for prompt-hook end ===
 
+    # === CUSTOM: Task 10 内置 watcher——挂到 server 供 transport 生命周期 stop ===
+    server._graphify_watcher = _watcher
+
     return server
 
 
+def _stop_graphify_watcher(server) -> None:
+    """transport 退出时阻塞停止内置 watcher（Task 10 铁律 2：批次完成 + 原子落盘）."""
+    watcher = getattr(server, "_graphify_watcher", None)
+    if watcher is not None:
+        watcher.stop()
+
+
 def serve(graph_path: str | None = None) -> None:
-    """Start the MCP server over stdio (the default, per-developer transport)."""
+    """Start the MCP server over stdio (the default, per-developer transport).
+
+    The built-in watcher (Task 10) is off by default; enable via ``--watch`` or
+    the GRAPHIFY_WATCH env var. On shutdown its ``stop()`` blocks until the
+    current rebuild batch has completed and written atomically.
+    """
     graph_path = graph_path or _default_graph_json()
     try:
         from mcp.server.stdio import stdio_server
@@ -3461,7 +3506,10 @@ def serve(graph_path: str | None = None) -> None:
             await server.run(streams[0], streams[1], server.create_initialization_options())
 
     _filter_blank_stdin()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        _stop_graphify_watcher(server)
 
 
 class _MCPASGIApp:
@@ -3590,7 +3638,11 @@ def _build_http_app(
         # The session manager owns an anyio task group that must wrap the whole
         # server lifetime, so enter it here rather than per-request.
         async with manager.run():
-            yield
+            try:
+                yield
+            finally:
+                # Task 10: 阻塞停止内置 watcher（当前批次完成 + 原子落盘）。
+                _stop_graphify_watcher(server)
 
     middleware = []
     if api_key:
@@ -3633,6 +3685,9 @@ def serve_http(
     check (``Authorization: Bearer <key>`` or ``X-API-Key: <key>``). OAuth is a
     deliberate follow-up. Binding ``0.0.0.0`` exposes the server beyond
     localhost — set an api_key when you do.
+
+    The built-in watcher (Task 10) is off by default; enable via ``--watch`` or
+    the GRAPHIFY_WATCH env var.
     """
     graph_path = graph_path or _default_graph_json()
     try:
@@ -3721,8 +3776,18 @@ def _main(argv: list[str] | None = None) -> None:
         default=3600.0,
         help="Reap stateful sessions idle this many seconds (default: 3600; 0 disables)",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Watch the project for changes and auto-rebuild the graph on save "
+             "(default off; also toggled by GRAPHIFY_WATCH=1)",
+    )
     args = parser.parse_args(argv)
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
+
+    # Task 10: --watch 与 GRAPHIFY_WATCH 同语义——_build_server 是唯一读开关的挂载点。
+    if args.watch:
+        os.environ.setdefault("GRAPHIFY_WATCH", "1")
 
     if args.transport == "http":
         serve_http(
