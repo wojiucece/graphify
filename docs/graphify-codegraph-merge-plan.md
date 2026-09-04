@@ -1,6 +1,17 @@
 # graphify × codegraph 合并方案报告
 
-**版本**：v4.2（grill 质询决策落档：适配器位置、semantic 锚定规范、PR 时机、meta 图索引、验收口径五项已定）
+> ## ⚠️ 已被 native-indexing 取代（2026-09-04 收尾）
+>
+> 本方案（v4.2，分层融合路线：codegraph 作符号事实层 + 只读适配器）**已由
+> `docs/graphify-native-indexing-spec.md`（原生索引能力，codegraph 运行时退役）整体取代**。
+> 实施结论：codegraph TS 运行时退役，其四大优点（自动同步 / FTS5 全文检索 / 守护进程 /
+> 随时查询）在 graphify Python 自定义层原生重建；**graph.json + extract 产物是唯一事实层**，
+> 不建持久事实源数据库（"codegraph.db 事实源"条款作废），`.fts-index.db` 仅作可重建缓存，
+> watcher 内置于 serve 进程。决策链与退役 ADR 见 `docs/adr/0001-retire-codegraph-runtime.md`。
+> 本计划文档保留为历史决策记录（当时语境下的正确选择，被后续架构裁决取代），不再作为实施依据。
+> 文中所有"codegraph 作主索引 / 适配器 / .codegraph/codegraph.db 事实源"表述均指已退役方案。
+
+**版本**：v4.2（grill 质询决策落档：适配器位置、semantic 锚定规范、PR 时机、meta 图索引、验收口径五项已定。已取代，见上横幅）
 **日期**：2026-08-28
 **数据基线**：
 
