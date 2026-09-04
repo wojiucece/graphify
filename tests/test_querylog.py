@@ -1,4 +1,5 @@
 """Tests for graphify.querylog."""
+import inspect
 import json
 import os
 import pytest
@@ -221,3 +222,25 @@ def test_log_query_writes_nothing_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     log_query(kind="query", question="secret internal ticket TICKET-123", corpus=".", result="1 node found")
     assert not (tmp_path / ".cache" / "graphify-queries.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# 终审 T3 — cli.py query 命令 querylog 落盘脱敏（_qlog_redact 与 serve._redact 同源）
+# ---------------------------------------------------------------------------
+
+def test_cli_querylog_redact_is_serve_redact():
+    """CLI query 块 import serve._redact 作为 _qlog_redact——querylog 落盘前经同源脱敏，
+    密钥零进磁盘。源码级断言（_qlog_redact 是 dispatch_command 内局部别名，模块层不可导入）：
+    cli.py 必须从 serve import _redact as _qlog_redact 且 query 块 result 经它落盘。"""
+    import graphify.cli as cli_mod
+    src = inspect.getsource(cli_mod)
+    # 1) import 语句存在且同源（serve._redact 别名 _qlog_redact）
+    assert "from graphify.serve import _redact as _qlog_redact" in src, "cli 未 import serve._redact 作为 _qlog_redact（T3 对称断裂）"
+    # 2) querylog 落盘前经 _qlog_redact（不是裸 _result）
+    assert "result=_qlog_redact(_result)" in src, "querylog 落盘未走 _qlog_redact 脱敏（密钥可能进磁盘）"
+    # 3) 行为验证：serve._redact 确实脱敏厂商密钥（openai 模式 sk-[A-Za-z0-9]{32,}）
+    from graphify.serve import _redact
+    key = "sk-" + "A" * 32
+    r = _redact(f"result for {key}")
+    assert key not in r
+    assert "[REDACTED" in r

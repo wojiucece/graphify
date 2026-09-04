@@ -1215,6 +1215,7 @@ def dispatch_command(cmd: str) -> None:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _query_graph_text
+        from graphify.serve import _redact as _qlog_redact  # 终审 T3：querylog 记脱敏后文本（serve 同源，密钥零进磁盘）
         from graphify.security import sanitize_label
         from networkx.readwrite import json_graph
         from graphify import querylog
@@ -1323,7 +1324,7 @@ def dispatch_command(cmd: str) -> None:
             kind="query",
             question=question,
             corpus=str(gp),
-            result=_result,
+            result=_qlog_redact(_result),  # 终审 T3：querylog 侧门对称——response 落盘同源脱敏
             mode=_mode,
             depth=2,
             token_budget=budget,
