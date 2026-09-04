@@ -61,7 +61,12 @@ _SEMANTIC_DOC_SUFFIXES = frozenset({".md", ".mdx", ".qmd", ".skill"})
 
 
 def _route_flush_batch(watch_root: Path, changed_files: list[Path]) -> None:
-    """flush 批次分流：AST 文件 -> rebuild_entry(sync+重建)；非 AST -> semantic_refresh."""
+    """flush 批次分流：AST 文件 -> rebuild_entry(sync+重建)；非 AST -> semantic_refresh.
+
+    Task 11 收尾：watch 循环不再以 .codegraph 判别调用本函数（路由条件随 codegraph
+    退役恒 False，watch 循环统一走上游增量 pipeline + _notify_only）。保留本函数为
+    路由工具（tests/test_watch_rebuild_trigger.py 直接测其分流语义；hooks/serve_watcher
+    直接调用 rebuild_entry 主入口）。"""
     ast_files = [p for p in changed_files
                  if _ge(p) is not None and p.suffix.lower() not in _SEMANTIC_DOC_SUFFIXES]
     non_ast_files = [p for p in changed_files
@@ -1470,15 +1475,11 @@ def _rebuild_code(
             return ok
 
     watch_root = watch_path.resolve()
-    # CUSTOM: 全量重建门控（最终审查 I2）。全量分支（changed_paths is None：graphify update
-    # CLI / post-checkout hook 调用面）在 codegraph 项目上不得进旧 AST 管线——旧管线无
-    # semantic seed/refresh 语义面，全量覆盖 codegraph 重建图会缩量（shrink-guard 拒写使
-    # CLI exit 1，或 force 下静默丢失语义面）。增量批次（changed_paths 非 None）不受影响，
-    # 仍走下方 CUSTOM flush 路由（_route_flush_batch -> rebuild_entry）。
-    if changed_paths is None and (watch_root / ".codegraph" / "codegraph.db").exists():
-        print("CUSTOM: codegraph 项目请用 rebuild_entry（scripts/rebuild_entry.py --project）"
-              "而非 graphify update 全量路径；本次未改动现有图。")
-        return False
+    # Task 11 收尾：退役原"codegraph 项目请用 rebuild_entry"全量重建门控。该门控在
+    # codegraph-merge 迁移期阻止 `graphify update` 全量路径覆盖 codegraph-merged 图
+    # （旧管线无 semantic seed 语义面会缩量）。codegraph 运行时已退役（spec §Out of
+    # Scope），全量重建由 hooks/serve_watcher 统一走 rebuild_entry；上游全量路径对
+    # 存量 AST 图仍可用（其内部按 identity 保留既有语义节点，不静默丢弃）。
 
     # project_root stays CWD-anchored for a relative invocation on purpose: the
     # persisted graph rehomes source_file across invocation styles against it
@@ -1957,14 +1958,14 @@ def _rebuild_code(
             "total_words": detected.get("total_words", 0),
         }
 
-        # CUSTOM: Phase 3 拓扑切换 -- flush 路由（方案 §6.2）：代码索引职能移交 codegraph。
-        # codegraph 项目（有 .codegraph/codegraph.db）改走单一重建入口 rebuild_entry，
-        # 原 build_from_json 代码索引分支退役；非 codegraph 项目（迁移期）回退旧 pipeline 兜底，
-        # 避免无 codegraph 的存量项目 watch/update 静默失效（rebuild_entry 无 db 会 FileNotFoundError）。
-        # 仅增量批次（changed_paths 非 None）路由——watch 循环已传 flush 批次，全量重建（CLI）暂留旧路径。
-        if changed_paths is not None and (watch_root / ".codegraph" / "codegraph.db").exists():
-            _route_flush_batch(watch_path, changed_paths)
-            return True
+        # Task 11 收尾：退役 Phase 3 拓扑切换的 flush 路由（方案 §6.2）。该路由以
+        # codegraph 运行时 DB 存在与否判别"codegraph 项目 → rebuild_entry / 非
+        # codegraph 项目 → 旧 pipeline 兜底"。codegraph 运行时已退役，判别条件恒 False——
+        # 增量批次统一走下方上游增量 pipeline（build_from_json + failed_refs 携带，
+        # FTS 派生缓存由 serve 指纹惰性重建）；新链路全量重建由 hooks/serve_watcher
+        # 统一走 rebuild_entry（scripts/rebuild_entry.py，extract→build→to_json→
+        # rebuild_fts 编排）。_route_flush_batch 保留为路由工具（tests/test_watch_
+        # rebuild_trigger.py 直接测其分流语义）。
 
         # Inherit the existing graph's directed flag (#2342) so `graphify
         # update` can't silently downgrade a directed graph to undirected -
@@ -2382,18 +2383,13 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
             changed.clear()
             print(f"\n[graphify watch] {len(batch)} file(s) changed")
             # 上游 0.9.33+ 用 _batch_triggers_rebuild / _batch_needs_llm_flag 替代手动 has_code/has_non_code
-            # CUSTOM: Phase 3 (Fix I1) -- 纯文档批次判定：无代码文件但含 .md 家族（semantic 面）。
-            # _batch_triggers_rebuild 只认 code/deletion（.md 不在 _CODE_EXTENSIONS），纯 .md 修改
-            # 原走不进 _rebuild_code -> semantic_refresh 路径不达；此处补 elif 直接路由。
-            # Fix r2：_notify_only 守卫与 elif 门控同源（_routed_doc）——非 codegraph 项目纯文档批次
-            # 不路由时回退旧 _notify_only（needs_update 旗标+通知），不再被 not _pure_doc 静默丢弃。
-            _pure_doc = (not any(p.suffix.lower() in _CODE_EXTENSIONS for p in batch)
-                         and any(p.suffix.lower() in _SEMANTIC_DOC_SUFFIXES for p in batch))
-            _routed_doc = _pure_doc and (watch_root_for_ignore / ".codegraph" / "codegraph.db").exists()
+            # Task 11 收尾：退役 Phase 3 (Fix I1) 纯文档批次路由。原 `_routed_doc`
+            # （纯 .md 批次 && codegraph 项目）会把 .md 修改路由到 rebuild_entry
+            # （semantic_refresh）；codegraph 运行时已退役，判别恒 False——纯 .md 批次
+            # 统一回退 _notify_only（needs_update 旗标 + 通知），语义刷新由 hooks /
+            # serve_watcher 走 rebuild_entry --semantic-refresh 兜底。
             if _batch_triggers_rebuild(batch):
                 # CUSTOM: 失败计数 + 退避/降级（移植 codegraph flush 的 try/finally 退避）
-                # CUSTOM: Phase 3 -- 把 flush 批次传给 _rebuild_code（增量路径），
-                # 汇聚点据此路由到 rebuild_entry（AST 批次 sync+重建 / 非 AST 作 semantic_refresh）。
                 ok = _rebuild_code(watch_path, changed_paths=batch)
                 if not ok:
                     failure_count += 1
@@ -2411,11 +2407,7 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
                 else:
                     failure_count = 0
                     next_allowed_trigger = 0.0
-            elif _routed_doc:
-                # CUSTOM: Phase 3 (Fix I1) -- 纯 .md 文档批次（codegraph 项目）路由 rebuild_entry
-                # （skip_sync=True + semantic_refresh=[该批次]），替代仅写 needs_update 旗标。
-                _route_flush_batch(watch_path, batch)
-            if _batch_needs_llm_flag(batch) and not _routed_doc:
+            if _batch_needs_llm_flag(batch):
                 _notify_only(watch_path)
     except KeyboardInterrupt:
         print("\n[graphify watch] Stopped.")

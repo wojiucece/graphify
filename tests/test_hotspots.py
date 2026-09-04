@@ -25,14 +25,14 @@ def _mk_git_repo(tmp_path):
     """tmp git 仓库（生产形态：真实 git 历史）：a.py 2 次、b.py 1 次、c.py 2 次 commit.
 
     churn: a.py=2, b.py=1, c.py=2——a 与 c churn 相同，由度数轴区分排序（交叉积语义）。
-    .git/info/exclude 加 graphify-out/ + .codegraph/（生产仓 .gitignore 效果同源——
-    否则 _mk_graph 的 graph.json 会被 git add . 提交进历史污染 churn；exclude 不进 git
-    历史，不产生额外 churn 文件）。"""
+    .git/info/exclude 加 graphify-out/（生产仓 .gitignore 效果同源，Task 11 后已无
+    .codegraph/ 条目——否则 _mk_graph 的 graph.json 会被 git add . 提交进历史污染
+    churn；exclude 不进 git 历史，不产生额外 churn 文件）。"""
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     _git_run(tmp_path, "init"); _git_run(tmp_path, "config", "user.email", "t@t")
     _git_run(tmp_path, "config", "user.name", "t")
     (tmp_path / ".git" / "info").mkdir(exist_ok=True)   # git init 已建 info/（含样例）
-    (tmp_path / ".git" / "info" / "exclude").write_text("graphify-out/\n.codegraph/\n",
+    (tmp_path / ".git" / "info" / "exclude").write_text("graphify-out/\n",
                                                         encoding="utf-8")
     _git_run(tmp_path, "add", "."); _git_run(tmp_path, "commit", "-m", "c1")   # a.py
     (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")

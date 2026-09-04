@@ -8,7 +8,6 @@ from rebuild_entry import _state_path, _write_state, _lock_path
 @pytest.fixture
 def proj(tmp_path):
     (tmp_path / "graphify-out").mkdir()
-    (tmp_path / ".codegraph").mkdir()
     return tmp_path
 
 def test_state_path_is_under_graphify_out(proj):

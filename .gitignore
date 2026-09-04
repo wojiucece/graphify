@@ -14,7 +14,6 @@ build/
 *.egg
 .graphify/
 graphify-out/
-.codegraph/
 .graphify_*.json
 .graphify_python
 .claude/
@@ -48,7 +47,5 @@ paper/
 serve.log
 graphify-complete-plan-*.md
 方案审核报告.md
-# 第三方研究参考代码（移植 codegraph 算法时克隆的本地副本，不进 fork 仓库）
-codegraph/
 # 本地项目级 OpenCode hook（graphify install opencode 生成的 .opencode/plugins/graphify.js + opencode.json，不进 fork 仓库）
 .opencode/

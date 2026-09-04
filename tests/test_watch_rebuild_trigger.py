@@ -32,3 +32,17 @@ def test_hook_scripts_reference_rebuild_entry():
     root = Path(__file__).resolve().parent.parent
     for sh in ["scripts/sessionend-graphify-update.sh", "scripts/precompact-graphify-update.sh"]:
         assert "rebuild_entry.py" in (root / sh).read_text(encoding="utf-8"), f"{sh} 未改指 rebuild_entry"
+
+
+def test_no_codegraph_gate_remains():
+    """Task 11 收尾锁：codegraph 运行时已退役——watch.py 不得再直查 codegraph.db 路径，
+    两个 hook 不得再以 .codegraph 目录判别路由（旧 Phase 3 拓扑切换门控已删，统一路由
+    rebuild_entry）。静态防漂移：若未来误恢复 codegraph 门控，本测试立即红。
+    注：注释中的历史提及（"codegraph 已退役"叙述）不触发——只锁可执行的运行时依赖形态。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    watch_src = (root / "graphify" / "watch.py").read_text(encoding="utf-8")
+    assert "codegraph.db" not in watch_src, "watch.py 仍直查 codegraph.db（运行时已退役）"
+    for sh in ["scripts/sessionend-graphify-update.sh", "scripts/precompact-graphify-update.sh"]:
+        text = (root / sh).read_text(encoding="utf-8")
+        assert ".codegraph" not in text, f"{sh} 仍以 .codegraph 目录判别路由（应统一 rebuild_entry）"

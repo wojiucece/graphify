@@ -2427,10 +2427,11 @@ def _format_dead_code(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
     rate = r["unreachable_rate"]
     scanned = int(r["scanned"])
     if scanned == 0:
-        # 退化形态：图中无代码符号节点（节点缺 kind 属性——非 codegraph-merged 图，
-        # 如 graphify 原生 AST 图）。诚实声明，不谎报 "0 of 0 unreachable"。
+        # 退化形态：图中无代码符号节点（节点缺 kind 属性——原生 AST 图，非符号索引
+        # 图）。Task 11 收尾：措辞去掉已退役的 codegraph 术语。诚实声明，不谎报
+        # "0 of 0 unreachable"。
         return ("Dead-code scan: no code symbol nodes in this graph (nodes lack kind "
-                "attributes — not a codegraph-merged graph). Advisory only.")
+                "attributes — native AST graph without a symbol index). Advisory only.")
     if r.get("gate_failed"):
         head = (f"Dead-code scan degraded to orphan-symbol hints (advisory): unreachable "
                 f"rate {rate:.1%} ({len(unreach)}/{scanned}) exceeds the 50% gate — the "
@@ -2464,10 +2465,11 @@ def _format_untested(DG: nx.DiGraph, r: dict, show: int = 50) -> str:
     scanned = int(r["scanned"])
     n_tests = len(r["test_files"])
     if scanned == 0:
-        # 退化形态：图中无代码符号节点（节点缺 kind 属性——非 codegraph-merged 图，
-        # 如 graphify 原生 AST 图）。诚实声明，不谎报 "0 of 0 untested"。
+        # 退化形态：图中无代码符号节点（节点缺 kind 属性——原生 AST 图，非符号索引
+        # 图）。Task 11 收尾：措辞去掉已退役的 codegraph 术语。诚实声明，不谎报
+        # "0 of 0 untested"。
         return ("Untested-symbol scan: no code symbol nodes in this graph (nodes lack kind "
-                "attributes — not a codegraph-merged graph). Advisory only.")
+                "attributes — native AST graph without a symbol index). Advisory only.")
     if r.get("gate_failed"):
         head = (f"Untested-symbol scan degraded to suspected-untested hints (advisory): "
                 f"{len(untested)} of {scanned} symbols ({rate:.1%}) not reached from "

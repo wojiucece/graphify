@@ -23,20 +23,15 @@ if mkdir "$LOCK_DIR" 2>/dev/null; then
     # rebuild_entry 是分钟级（extract + 全量 build/cluster/analyze/report），hook 面同步执行会超时强杀
     # -> finally 不执行 -> 锁残留 -> 后续三触发面全 exit 3。改为后台 detach（与注释意图一致），
     # rebuild_entry 内的 stale 锁检测兜底强杀场景。
-    # Task 09 后 codegraph 退役：rebuild_entry 新链路（extract→build→to_json→rebuild_fts）不再需要
-    # .codegraph DB（无 DB 项目产出空图/纯 AST 图）。下方 .codegraph 门控为迁移期回退保留（非 codegraph
-    # 项目仍走旧 graphify update 路径）；收尾票可移除门控统一路由 rebuild_entry。
-    if [ -d "$cwd/.codegraph" ]; then
-        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-        PYTHON="${GRAPHIFY_PYTHON:-python}"
-        nohup "$PYTHON" "$SCRIPT_DIR/rebuild_entry.py" --project "$cwd" > /tmp/graphify-rebuild.log 2>&1 &
-        # A4 (v1.13): 零等待——直接读当前磁盘 graph.json 实时算快照落盘（主机制）；
-        # SessionStart(matcher:compact) hook 负责注入，本脚本只落盘不注入。
-        # 不等待 rebuild（timeout 实配 30s，同步等待分钟级 rebuild 必超时强杀致锁残留，见 E 裁决注释）
-        PYTHONUTF8=1 python "$SCRIPT_DIR/session_snapshot.py" "$cwd" > /tmp/graphify-snapshot.log 2>&1
-    else
-        graphify update . > /tmp/graphify-precompact-update.log 2>&1
-    fi
+    # Task 11 收尾：codegraph 运行时退役，移除旧 codegraph 目录判别门控——所有项目
+    # 统一路由 rebuild_entry（新链路单一重建入口 extract→build→to_json→rebuild_fts→分析）。
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PYTHON="${GRAPHIFY_PYTHON:-python}"
+    nohup "$PYTHON" "$SCRIPT_DIR/rebuild_entry.py" --project "$cwd" > /tmp/graphify-rebuild.log 2>&1 &
+    # A4 (v1.13): 零等待——直接读当前磁盘 graph.json 实时算快照落盘（主机制）；
+    # SessionStart(matcher:compact) hook 负责注入，本脚本只落盘不注入。
+    # 不等待 rebuild（timeout 实配 30s，同步等待分钟级 rebuild 必超时强杀致锁残留，见 E 裁决注释）
+    PYTHONUTF8=1 python "$SCRIPT_DIR/session_snapshot.py" "$cwd" > /tmp/graphify-snapshot.log 2>&1
     rmdir "$LOCK_DIR" 2>/dev/null
 fi
 # 锁已存在 → 已有触发在跑，跳过（幂等；真正的互斥由 rebuild_entry 内部锁承担）

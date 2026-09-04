@@ -37,11 +37,11 @@ def test_split_writes_output(tmp_path):
     assert "nodes" in data and "edges" in data and "hyperedges" in data
 
 
-def test_split_remaps_py_anchor_by_source_file(tmp_path):
-    """B6: 旧图锚点 file:src/app.py 改指 codegraph 文件节点 file:app.py（source_file 匹配，旧≠新）.
-    真实场景：旧图 id 是归一化形式，codegraph id 是 file:<path>."""
+def test_split_carries_anchors_as_is_without_codegraph_remap(tmp_path):
+    """Task 11 收尾：--codegraph-db 锚点改指退役——无 codegraph DB 可对，锚点按原样携带.
+    原 B6 场景（file:src/app.py 改指 codegraph file:app.py）随 codegraph 退役消失；
+    新链路文件节点 id 是 path 式，锚点 id 是否需映射由迁移方在目标图上决定。"""
     from split_semantic_seed import split
-    # 造一个旧图：semantic 边锚到 file:src/app.py（归一化 id）
     old = {
         "nodes": [
             {"id": "file:src/app.py", "label": "app.py", "source_file": "src/app.py", "_origin": "ast", "file_type": "code"},
@@ -51,26 +51,18 @@ def test_split_remaps_py_anchor_by_source_file(tmp_path):
         "hyperedges": [],
     }
     old_path = tmp_path / "old.json"
-    old_path.write_text(__import__("json").dumps(old), encoding="utf-8")
-    # codegraph DB：file 节点 id 是 file:app.py（路径差异）
-    import sqlite3
-    db = tmp_path / "cg.db"
-    _make_cg_db(db)
-    stats = split(old_path, output_path=None, codegraph_db=db)
+    old_path.write_text(json.dumps(old), encoding="utf-8")
+    stats = split(old_path, output_path=None)
     seed = stats["seed"]
-    # 锚点 id 改指为 codegraph id（seed 中非锚点节点无 source_file 键，用 get）
-    remapped = [n for n in seed["nodes"] if n.get("source_file") == "src/app.py"]
-    assert remapped and remapped[0]["id"] == "file:app.py", f"锚点未改指: {remapped}"
-    # 边端点同步 remap
-    edge = seed["edges"][0]
-    assert edge["target"] == "file:app.py", f"边端点未 remap: {edge}"
-    assert stats["anchor_remap"] == 1
+    ids = {n["id"] for n in seed["nodes"]}
+    # 锚点文件节点按原样携带（不做任何 id 改指）
+    assert "file:src/app.py" in ids
+    assert seed["edges"][0]["target"] == "file:src/app.py"
 
 
 def test_split_tolerates_null_source_file(tmp_path):
-    """生产 bug（Task 8 fork 迁移验收发现）：真实旧图有 source_file=null（JSON null -> None）的
-    semantic 概念节点与 ast 文件节点，锚点改指循环对 None.endswith 直接 AttributeError 崩溃.
-    修复后不抛异常，且 semantic 节点正常收进 seed."""
+    """旧图 source_file=null（JSON null -> None）节点：semantic 节点正常收进 seed，
+    不抛异常（退役后无锚点改指循环，null 天然容忍——保留测试防回归携带）。"""
     from split_semantic_seed import split
     old = {
         "nodes": [
@@ -83,17 +75,12 @@ def test_split_tolerates_null_source_file(tmp_path):
     }
     old_path = tmp_path / "old-null.json"
     old_path.write_text(json.dumps(old), encoding="utf-8")
-    import sqlite3
-    db = tmp_path / "cg.db"
-    _make_cg_db(db)
-    # 不抛异常即通过（None.endswith 崩溃点在锚点改指循环）
-    stats = split(old_path, output_path=None, codegraph_db=db)
+    stats = split(old_path, output_path=None)
     seed = stats["seed"]
     ids = {n["id"] for n in seed["nodes"]}
     assert "concept:nullsrc" in ids  # semantic 节点正常收进 seed
     assert "file:src/app.py" in ids  # 锚点文件节点正常携带
     assert stats["semantic_nodes"] == 1
-    assert stats["anchor_remap"] == 0  # source_file=null 无从 remap，不误计
 
 
 def test_split_rejects_legacy_no_origin(tmp_path):
@@ -115,13 +102,3 @@ def test_split_rejects_legacy_no_origin(tmp_path):
     assert stats["legacy_format"] is True
     assert stats["warning"]  # 非空：拒绝原因提示
     assert not out.exists()  # 拒绝路径不产出空种子文件
-
-
-def _make_cg_db(db):
-    import sqlite3
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER, description TEXT)")
-    conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT, qualified_name TEXT, file_path TEXT, language TEXT, start_line INTEGER, end_line INTEGER, start_column INTEGER, end_column INTEGER, docstring TEXT, signature TEXT, visibility TEXT, is_exported INTEGER, is_async INTEGER, is_static INTEGER, is_abstract INTEGER, decorators TEXT, type_parameters TEXT, return_type TEXT, updated_at INTEGER)")
-    conn.execute("INSERT INTO schema_versions VALUES (9,0,'fake')")
-    conn.execute("INSERT INTO nodes VALUES ('file:app.py','file','app.py','app.py','src/app.py','python',1,1,0,0,NULL,NULL,NULL,0,0,0,0,NULL,NULL,NULL,0)")
-    conn.commit(); conn.close()

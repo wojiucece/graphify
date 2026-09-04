@@ -21,18 +21,18 @@
     python benchmarks/efficiency_benchmark.py [--root <path>]
         [--budget 2000] [--tasks 12] [--skip-rebuild] [--out benchmarks/results-<date>.json]
     root 解析优先级（L1）：--root 显式 > GRAPHIFY_GOLDEN_ROOT env > 本仓根（自指）。
-    跑带 recall 的基准（金标 expect id 依赖 golden 根 DB）：GRAPHIFY_GOLDEN_ROOT=D:/code/graphify_fork
+    跑带 recall 的基准（金标 expect id 依赖 golden 根的 .fts-index.db）：GRAPHIFY_GOLDEN_ROOT=<新链路项目>
 
 声明：默认 --rebuild 会对 --root 跑 scripts/rebuild_entry.py 全量重建（写 root 的
-.codegraph/ + graphify-out/，是 fork 的既定重建入口；id 是内容 hash 幂等收敛，
-重建不改变未变代码的节点 id）。只读跑基准请 --skip-rebuild。
+graphify-out/——graph.json 事实层 + .fts-index.db 派生缓存；Task 11 收尾后 codegraph
+运行时/DB 已退役，fetch 与 recall 地面真值统一读 .fts-index.db nodes 元数据表，与
+serve.get_node 同源。重建不改变未变代码的节点 id）。只读跑基准请 --skip-rebuild。
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -112,7 +112,10 @@ def _run_rebuild(root: Path) -> dict:
 
 
 def _db_conn(root: Path) -> sqlite3.Connection | None:
-    db = root / ".codegraph" / "codegraph.db"
+    """新链路 fetch/recall 数据源：graphify-out/.fts-index.db nodes 元数据表
+    （05 票三表之一，serve.get_node 同源点查）。codegraph DB 已退役——缺失返回 None
+    （fetch/recall 降级为无 DB 分支，基准照跑）。"""
+    db = root / "graphify-out" / ".fts-index.db"
     if not db.exists():
         return None
     return sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
@@ -133,14 +136,8 @@ def _merged_stack(root: Path, conn: sqlite3.Connection | None, G, query: str, bu
     if res and conn is not None:
         nid = res[0]["id"]
         row = conn.execute(
-            "SELECT file_path, start_line, end_line, signature, docstring "
-            "FROM nodes WHERE id = ?", (nid,)).fetchone()
-        if row is None:
-            m = re.match(r"^(.*)__cg\d+$", nid)
-            if m:
-                row = conn.execute(
-                    "SELECT file_path, start_line, end_line, signature, docstring "
-                    "FROM nodes WHERE id = ?", (m.group(1),)).fetchone()
+            "SELECT source_file, source_location, end_line, end_byte, "
+            "signature, docstring FROM nodes WHERE id = ?", (nid,)).fetchone()
         if row is not None and row[0]:
             d = G.nodes[nid] if (G is not None and nid in G) else {}
             # 用户 L3：合并图无 name 属性（R3-2 三次裁决事实），删死代码分支——
@@ -148,15 +145,15 @@ def _merged_stack(root: Path, conn: sqlite3.Connection | None, G, query: str, bu
             short = str(d.get("label") or nid).rsplit(".", 1)[-1]
             card = [_serve._format_node_card(G, nid, d)] if (G is not None and nid in G) else [
                 f"Node: {nid}"]
-            sig = (row[3] or "").strip()
-            doc = (row[4] or "").strip()
+            sig = (row[4] or "").strip()
+            doc = (row[5] or "").strip()
             sig_line = _serve._signature_line(sig, short) if sig else ""
             if sig_line:
                 card.append(f"  Signature: {sig_line}")
             if doc:
                 card.append(f"  Doc: {_serve.sanitize_label(doc.splitlines()[0])}")
             text, ok, _s, _e = _serve._slice_source(
-                root, row[0], row[1], row[2], short,
+                root, row[0], row[1], row[2], row[3], short,
                 signature=sig_line or None, pad=0)
             if ok:
                 card.append("Code:")
@@ -191,7 +188,7 @@ def _grep_read_sim(root: Path, conn: sqlite3.Connection | None, expect: list[str
                    query: str) -> dict:
     """首 token 子串扫描（≈grep -rln）+ 按序读命中文件头部 200 行，tiktoken 累计.
 
-    命中检测 ground truth：expect 符号 id → DB file_path（基准只读一次 DB 做期望定位，
+    命中检测 ground truth：expect 符号 id → .fts-index.db source_file（基准只读一次缓存做期望定位，
     模拟的搜索行为只用查询首 token，不泄漏图知识进搜索）。file: 前缀 id 直接取路径。
     """
     needle = query.split()[0] if query.split() else query
@@ -199,7 +196,7 @@ def _grep_read_sim(root: Path, conn: sqlite3.Connection | None, expect: list[str
     gt_files: list[str] = []
     if conn is not None:
         for eid in expect:
-            row = conn.execute("SELECT file_path FROM nodes WHERE id = ?", (eid,)).fetchone()
+            row = conn.execute("SELECT source_file FROM nodes WHERE id = ?", (eid,)).fetchone()
             if row and row[0]:
                 gt_files.append(row[0].replace("\\", "/"))
             elif eid.startswith("file:"):
@@ -262,7 +259,7 @@ def main() -> None:
     ap.add_argument("--rebuild", dest="rebuild", action="store_true", default=True,
                     help="基准前对 --root 跑 rebuild_entry 全量重建（默认开，保证同一起跑线）")
     ap.add_argument("--skip-rebuild", dest="rebuild", action="store_false",
-                    help="跳过 rebuild（DB 已 fresh 的只读跑用；结果 JSON 如实标注）")
+                    help="跳过 rebuild（.fts-index.db 已 fresh 的只读跑用；结果 JSON 如实标注）")
     ap.add_argument("--out", default=None, help="结果 JSON 路径（默认 benchmarks/results-<date>.json）")
     args = ap.parse_args()
 
@@ -272,7 +269,7 @@ def main() -> None:
 
     rebuild_info = _run_rebuild(root) if args.rebuild else {
         "ran": False, "ok": None, "exit": "skipped",
-        "elapsed_s": 0.0, "note": "DB 与任务集已核对 fresh（golden 门过）",
+        "elapsed_s": 0.0, "note": ".fts-index.db 与任务集已核对 fresh（golden 门过）",
     }
 
     conn = _db_conn(root)

@@ -1,0 +1,343 @@
+{
+  "benchmark": "efficiency_benchmark",
+  "date": "2026-09-04",
+  "pinned_commit": "818a22dddafa6f3ea094d01d8e2f45cc7367eb86",
+  "root": "D:\\code\\graphify_fork\\.worktrees\\native-indexing",
+  "root_source": "env GRAPHIFY_GOLDEN_ROOT",
+  "token_count": "tiktoken",
+  "rebuild": {
+    "ran": true,
+    "ok": true,
+    "exit": 0,
+    "elapsed_s": 64.9
+  },
+  "task_set": {
+    "source": "tests/fixtures/ranked_golden.json",
+    "slice": "first 12 entries",
+    "n": 12
+  },
+  "tasks": [
+    {
+      "q": "sanitize_label",
+      "type": "identifier",
+      "expect": [
+        "graphify_security_sanitize_label",
+        "tests_test_security_test_sanitize_label_safe_passthrough"
+      ],
+      "merged": {
+        "search_tokens": 915,
+        "fetch_tokens": 84,
+        "fetch_label": "sanitize_label()",
+        "fetch_ok": false,
+        "total_tokens": 999,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "sanitize_label",
+        "grep_hit_files": 13,
+        "grep_tokens": 1897,
+        "read_files": 5,
+        "read_tokens": 10610,
+        "total_tokens": 12507,
+        "hit5": 1.0,
+        "rank": 5
+      }
+    },
+    {
+      "q": "normalize_id",
+      "type": "identifier",
+      "expect": [
+        "graphify_ids_normalize_id",
+        "tests_test_id_normalization_contract_test_normalize_id_is_idempotent"
+      ],
+      "merged": {
+        "search_tokens": 1227,
+        "fetch_tokens": 72,
+        "fetch_label": "normalize_id()",
+        "fetch_ok": false,
+        "total_tokens": 1299,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "normalize_id",
+        "grep_hit_files": 10,
+        "grep_tokens": 1551,
+        "read_files": 3,
+        "read_tokens": 5582,
+        "total_tokens": 7133,
+        "hit5": 1.0,
+        "rank": 3
+      }
+    },
+    {
+      "q": "god_nodes",
+      "type": "identifier",
+      "expect": [
+        "graphify_analyze_god_nodes",
+        "tests_test_analyze_test_god_nodes_returns_list"
+      ],
+      "merged": {
+        "search_tokens": 2090,
+        "fetch_tokens": 102,
+        "fetch_label": "god_nodes()",
+        "fetch_ok": false,
+        "total_tokens": 2192,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "god_nodes",
+        "grep_hit_files": 28,
+        "grep_tokens": 2154,
+        "read_files": 1,
+        "read_tokens": 2054,
+        "total_tokens": 4208,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "query_graph",
+      "type": "identifier",
+      "expect": [
+        "graphify_prompt_hook_query_graph",
+        "graphify_serve_query_graph_text"
+      ],
+      "merged": {
+        "search_tokens": 2052,
+        "fetch_tokens": 82,
+        "fetch_label": "_query_graph()",
+        "fetch_ok": false,
+        "total_tokens": 2134,
+        "hit5": 0.5
+      },
+      "grep_read": {
+        "needle": "query_graph",
+        "grep_hit_files": 9,
+        "grep_tokens": 889,
+        "read_files": 2,
+        "read_tokens": 4246,
+        "total_tokens": 5135,
+        "hit5": 1.0,
+        "rank": 2
+      }
+    },
+    {
+      "q": "watch debounce 降级",
+      "type": "cjk",
+      "expect": [
+        "graphify_watch_watch",
+        "graphify_watch_trigger_rebuild"
+      ],
+      "merged": {
+        "search_tokens": 1407,
+        "fetch_tokens": 96,
+        "fetch_label": "watch()",
+        "fetch_ok": false,
+        "total_tokens": 1503,
+        "hit5": 0.5
+      },
+      "grep_read": {
+        "needle": "watch",
+        "grep_hit_files": 41,
+        "grep_tokens": 11537,
+        "read_files": 13,
+        "read_tokens": 30435,
+        "total_tokens": 41972,
+        "hit5": 0.0,
+        "rank": 13
+      }
+    },
+    {
+      "q": "rebuild 状态文件",
+      "type": "cjk",
+      "expect": [
+        "graphify_watch_trigger_rebuild",
+        "tests_test_watch_test_incremental_rebuild_matches_full_rebuild_and_does_not_duplicate"
+      ],
+      "merged": {
+        "search_tokens": 2053,
+        "fetch_tokens": 121,
+        "fetch_label": "test_incremental_rebuild_matches_full_rebuild_and_does_not_duplicate()",
+        "fetch_ok": false,
+        "total_tokens": 2174,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "rebuild",
+        "grep_hit_files": 57,
+        "grep_tokens": 18456,
+        "read_files": 12,
+        "read_tokens": 28782,
+        "total_tokens": 47238,
+        "hit5": 0.0,
+        "rank": 12
+      }
+    },
+    {
+      "q": "rebuild_entry 锁 触发流程",
+      "type": "traversal",
+      "expect": [
+        "scripts_rebuild_entry_rebuild",
+        "tests_test_watch_rebuild_trigger_test_hook_scripts_reference_rebuild_entry"
+      ],
+      "merged": {
+        "search_tokens": 2096,
+        "fetch_tokens": 206,
+        "fetch_label": "test_hook_scripts_reference_rebuild_entry()",
+        "fetch_ok": true,
+        "total_tokens": 2302,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "rebuild_entry",
+        "grep_hit_files": 18,
+        "grep_tokens": 2817,
+        "read_files": 7,
+        "read_tokens": 18639,
+        "total_tokens": 21456,
+        "hit5": 0.0,
+        "rank": 7
+      }
+    },
+    {
+      "q": "fetch_prs 到 compute_pr_impact 的调用链",
+      "type": "traversal",
+      "expect": [
+        "graphify_prs_fetch_prs",
+        "graphify_prs_compute_pr_impact",
+        "graphify_prs_attach_graph_impact"
+      ],
+      "merged": {
+        "search_tokens": 1737,
+        "fetch_tokens": 98,
+        "fetch_label": "fetch_prs()",
+        "fetch_ok": false,
+        "total_tokens": 1835,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "fetch_prs",
+        "grep_hit_files": 3,
+        "grep_tokens": 175,
+        "read_files": 1,
+        "read_tokens": 1820,
+        "total_tokens": 1995,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "Counter 处理",
+      "type": "gap",
+      "expect": [
+        "graphify_diagnostics_py_counter",
+        "graphify_callflow_html_py_counter"
+      ],
+      "merged": {
+        "search_tokens": 823,
+        "fetch_tokens": 54,
+        "fetch_label": "CounterRecord",
+        "fetch_ok": false,
+        "total_tokens": 877,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "Counter",
+        "grep_hit_files": 20,
+        "grep_tokens": 725,
+        "read_files": 20,
+        "read_tokens": 42803,
+        "total_tokens": 43528,
+        "hit5": 0.0,
+        "rank": null
+      }
+    },
+    {
+      "q": "Path 处理",
+      "type": "gap",
+      "expect": [
+        "graphify_detect_os_path",
+        "graphify_extract_xaml_codebehind_path"
+      ],
+      "merged": {
+        "search_tokens": 2095,
+        "fetch_tokens": 93,
+        "fetch_label": "_sidecar_path()",
+        "fetch_ok": false,
+        "total_tokens": 2188,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "Path",
+        "grep_hit_files": 287,
+        "grep_tokens": 43136,
+        "read_files": 10,
+        "read_tokens": 21747,
+        "total_tokens": 64883,
+        "hit5": 0.0,
+        "rank": 10
+      }
+    },
+    {
+      "q": "build_from_json",
+      "type": "identifier",
+      "expect": [
+        "graphify_build_build_from_json",
+        "worked_mixed_corpus_raw_build_build_from_json"
+      ],
+      "merged": {
+        "search_tokens": 2082,
+        "fetch_tokens": 106,
+        "fetch_label": "build_from_json()",
+        "fetch_ok": false,
+        "total_tokens": 2188,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "build_from_json",
+        "grep_hit_files": 69,
+        "grep_tokens": 4557,
+        "read_files": 1,
+        "read_tokens": 2319,
+        "total_tokens": 6876,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    },
+    {
+      "q": "graph_diff",
+      "type": "identifier",
+      "expect": [
+        "graphify_analyze_graph_diff",
+        "tests_test_analyze_test_graph_diff_empty_diff"
+      ],
+      "merged": {
+        "search_tokens": 1166,
+        "fetch_tokens": 93,
+        "fetch_label": "graph_diff()",
+        "fetch_ok": false,
+        "total_tokens": 1259,
+        "hit5": 1.0
+      },
+      "grep_read": {
+        "needle": "graph_diff",
+        "grep_hit_files": 9,
+        "grep_tokens": 997,
+        "read_files": 1,
+        "read_tokens": 2054,
+        "total_tokens": 3051,
+        "hit5": 1.0,
+        "rank": 1
+      }
+    }
+  ],
+  "summary": {
+    "tasks": 12,
+    "merged_total_tokens": 20950,
+    "grep_read_total_tokens": 259982,
+    "merged_mean_hit5": 0.917,
+    "grep_read_mean_hit5": 0.583,
+    "merged_pct_of_grep_read": 8.1,
+    "hit5_note": "merged=expect 集上 recall 分数均值（连续）；grep_read=前 5 次读取内命中首期望文件的二值均值——两臂口径不同，不可直接比较"
+  }
+}

@@ -15,7 +15,7 @@ _SEMANTIC_ORIGIN = "semantic"
 _LEGACY_REJECT_WARNING = "旧格式无 _origin，拒绝作 seed，请先跑 graphify update 升级图再迁移"
 
 
-def split(graph_json_path, output_path=None, codegraph_db=None):
+def split(graph_json_path, output_path=None):
     data = json.loads(Path(graph_json_path).read_text(encoding="utf-8"))
     nodes = data.get("nodes", [])
     # A1: links 键优先，兼容旧 edges
@@ -28,7 +28,7 @@ def split(graph_json_path, output_path=None, codegraph_db=None):
     # 掩盖"未迁移"事实）——仅返回空 seed + 警告。
     if not has_origin:
         return {"seed": {"nodes": [], "edges": [], "hyperedges": []},
-                "semantic_nodes": 0, "seed_edges": 0, "anchor_remap": 0,
+                "semantic_nodes": 0, "seed_edges": 0,
                 "legacy_format": True, "warning": _LEGACY_REJECT_WARNING}
 
     sem_ids = {n["id"] for n in nodes if n.get("_origin") == _SEMANTIC_ORIGIN}
@@ -40,31 +40,15 @@ def split(graph_json_path, output_path=None, codegraph_db=None):
     seed_nodes = [n for n in nodes if n["id"] in carry_ids]
     seed_edges = [e for e in edges if e["source"] in sem_ids or e["target"] in sem_ids]
 
-    anchor_remap = 0
-    if codegraph_db:
-        import sqlite3
-        conn = sqlite3.connect(f"file:{Path(codegraph_db).resolve().as_posix()}?mode=ro", uri=True)
-        # 建 source_file -> codegraph file 节点 id 索引
-        sf_to_id = {row[1]: row[0] for row in conn.execute(
-            "SELECT id, file_path FROM nodes WHERE kind='file'")}
-        conn.close()
-        id_map = {}
-        for n in seed_nodes:
-            sf = n.get("source_file") or ""  # 防 JSON null -> None 崩溃（真实旧图有 source_file=null 的节点）
-            if sf.endswith(".py") and sf in sf_to_id:
-                old_id = n["id"]
-                new_id = sf_to_id[sf]
-                if old_id != new_id:
-                    n["id"] = new_id
-                    id_map[old_id] = new_id
-                    anchor_remap += 1
-        for e in seed_edges:  # remap 边端点
-            e["source"] = id_map.get(e["source"], e["source"])
-            e["target"] = id_map.get(e["target"], e["target"])
+    # Task 11 收尾：退役 --codegraph-db 锚点改指。原实现把旧图锚点 id（file:src/app.py
+    # 形态）按 source_file 匹配改指为 codegraph 文件节点 id（file:app.py）；codegraph
+    # 运行时已退役，无 DB 可对——且新链路文件节点 id 是 path 式（graphify_security_
+    # sanitize_label），改指目标本身已不存在。存量旧图 seed 迁移若锚点 id 与目标图不
+    # 一致，由迁移方在目标图上做 id 映射（超出本脚本范围）。
 
     seed = {"nodes": seed_nodes, "edges": seed_edges, "hyperedges": hyperedges}
     stats = {"seed": seed, "semantic_nodes": len(sem_ids), "seed_edges": len(seed_edges),
-             "anchor_remap": anchor_remap, "legacy_format": not has_origin,
+             "legacy_format": not has_origin,
              "warning": None}
     if output_path is not None:
         Path(output_path).write_text(json.dumps(seed, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -76,7 +60,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="旧 graph.json -> semantic 种子")
     ap.add_argument("graph_json")
     ap.add_argument("--output", default=None)
-    ap.add_argument("--codegraph-db", default=None)
     args = ap.parse_args()
     # CUSTOM: --output 未传时默认写 <graph_json 所在目录>/semantic-seed.json（最终审查 C1）
     # ——这是 rebuild_entry.rebuild() 的默认发现路径（<out>/semantic-seed.json，out 默认
@@ -84,7 +67,7 @@ if __name__ == "__main__":
     output = args.output
     if output is None:
         output = Path(args.graph_json).resolve().parent / "semantic-seed.json"
-    s = split(args.graph_json, output, args.codegraph_db)
+    s = split(args.graph_json, output)
     print(f"semantic 节点 {s['semantic_nodes']}/边 {s['seed_edges']}/hyperedges {len(s['seed']['hyperedges'])}"
           + (f"/{s['warning']}" if s.get('warning') else "")
           + f" -> 种子已写入 {output}")
