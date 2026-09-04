@@ -103,6 +103,10 @@
 | `edges.kind` | `relation` | 词表直映（`calls/imports/contains/references/extends/...`） |
 | `edges.provenance` | `confidence` | `'heuristic'` → `INFERRED`；NULL → `EXTRACTED` |
 | `edges.metadata`（JSON） | 边属性 | 展开（保留 `synthesizedBy`） |
+| source 端点 `nodes.file_path` | 边 `source_file` | **适配器补齐**（L1 用户审查）：edges 表无文件列，`LEFT JOIN nodes ON e.source = n.id` 取 source 端点 file_path，消 build REQUIRED_EDGE_FIELDS 告警；端点缺失（dangling 边）时为 None，validate.py 对边只查键存在故不告警，build 图阶段对 falsy 边 source_file 回退端点节点值兜底 |
+
+> 实际口径（实现偏差登记）：metadata 仅选择性提取 synthesizedBy（映射为边属性 synthesized_by / synthesized_by_list），其余 metadata 键丢弃不展开。
+
 | `unresolved_refs`（status='failed'） | Knowledge Gaps 输入 | 适配器附加导出 |
 
 **源码核读补充（v4.1，grill 核查）**：① build 对层级的判定是 `_origin` 优先、无标记时按形状回退（`source_location` 匹配 `^L\d` 即 AST 层，`_is_ast_tier`）——适配器输出 `L{n}` 即自动归入 AST 层，**无需自标 `_origin`**；② 同节点对的边折叠部分内建（generic 关系 `references/uses/mentions` 在折叠中必让位于具体关系，`_GENERIC_RELATIONS`）——适配器的折叠优先级只需覆盖 generic 之外的组合（如 `calls` vs `imports` vs `contains`）；③ codegraph 文件节点实测存在（`kind:'file'`，tree-sitter.ts L509）。
@@ -309,7 +313,7 @@ python -c "import sqlite3; c=sqlite3.connect(r'.codegraph/codegraph.db'); print(
 | R1 | 仓库符号规模超预期，全图算法不可行 | 低（实测校准） | 存量最大 18,108 节点，全图路线即可；门控保留用于新仓库；Louvain 回退省内存 |
 | R2 | codegraph schema 演进破坏适配器 | 中 | 实测增量演进（v8→v9 仅加列）；`schema_versions` 门控上限以实测 DB 版本为准；月度 diff 上游 schema 文件 |
 | R3 | WAL/只读连接细节 | 低 | `mode=ro` 禁 `immutable=1`；短任务连接；驻留周期重开（v1.6.0 的 WAL 修复不改变该策略） |
-| R4 | 语言集合与词表不一致（codegraph 22+ vs graphify ~36–40） | 中 | 映射表集中单点；未知 kind 透传不丢弃；以 codegraph 为主索引 |
+| R4 | 语言集合与词表不一致（codegraph 22+ vs graphify ~36–40） | 中（实测：fork DB node kind 19 种、edge kind 8 种，未知 kind 透传已确认） | 映射表集中单点；未知 kind 透传不丢弃；以 codegraph 为主索引 |
 | R5 | graphify 迭代极快（0.9.x 周更级） | 中 | fork 已验证 11+ 次合并流程；只依赖 4 个契约入口；analyze.py 补丁保持最小 diff（§5.1） |
 | R6 | 上游方向变化（graphify 商业平台 / codegraph hosted platform） | 中 | 只依赖各自开源核心；双宽松许可允许独立衍生；分层结构退出成本最低 |
 | R7 | 存量 semantic 边迁移失联 | 低（实测校准） | 锚点 100% 文件级、0 符号级；种子整体携带下预期失联仅 4 个 .py 锚点；失联边显式入 Knowledge Gaps |

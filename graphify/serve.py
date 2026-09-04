@@ -2044,9 +2044,12 @@ def _symbol_short_name(d: dict, nid: str) -> str:
 
 def _digraph_view(graph_path) -> nx.DiGraph:
     """B3 R3-1 有向视图：从原始 graph.json 的 links source/target 重建方向（DiGraph）。
-    生产 graph.json 实测 directed:false——_load_graph 产 nx.Graph，node_link_graph 无向化
-    即丢方向（links 的 source/target 被折叠进无向邻接）；B3 不吃无向 G，反向闭包在无向
-    图上混入下游调用方（系统性过报）。
+    磁盘 graph.json 的 directed:false 是逻辑标志（links 数组顺序承载弧序语义）；_load_graph
+    加载时强制 directed:True（仅让 renderers 恢复弧序 #2309），serve 侧 _logical_directed
+    保存逻辑真相（#2487）——_load_graph 产物本就是 DiGraph，不丢方向。本视图委托
+    ranked.get_digraph 从原始 links 独立重建 DiGraph：方向与 _load_graph 产物等价
+    （links source→target 同源）；B3/C 显式走它而非 serve 的 _GraphContextCache 链路，
+    是为不依赖模块级 G 且吃统一缓存增量。
     I2（用户 L3 裁决）：单入口单一载荷缓存（scripts/ranked.py _GRAPH_CACHE lazy 双视图）
     ——DiGraph 与 B1 结构派生（degree/collision_bases/nodes）同 entry 驻留，不二次
     json.loads；独立 _DIGRAPH_CACHE 已删除。serve 接 scripts 走既有 lazy sys.path+import

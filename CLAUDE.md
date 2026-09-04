@@ -4,7 +4,7 @@ This project has a knowledge graph at graphify-out/ with god nodes, community st
 
 Rules:
 - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.（本项目当前未生成 wiki/，此条暂不适用）
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
@@ -94,22 +94,38 @@ Rules:
 - 排查：`bash scripts/check-custom.sh` 扫描所有 graphify.exe 标出上游版
 - 清理：`uv pip uninstall graphifyy --python <venv>/Scripts/python.exe`
 
-## 分层融合自定义面（feat/codegraph-merge）
+## 分层融合自定义面（feat/native-indexing，spec: docs/graphify-native-indexing-spec.md）
 
-新增自定义文件（scripts/，与上游 graphify/ 零交叠）：
-- adapter.py -- codegraph DB 只读适配器（门控上限9 + 映射 + 折叠 + id 消歧 + Knowledge Gaps + 锚定校验）
-- run_analysis.py -- 编排器（adapter->build->cluster->analyze->report + export.to_json + graph_diff）
-- split_semantic_seed.py -- 旧图 semantic 种子拆分（links 键 + hyperedges + .py 锚点改指）
-- rebuild_entry.py -- 单一重建入口（codegraph sync + 指纹收敛 + mkdir 锁）
+codegraph TS 运行时已退役（spec §Out of Scope 裁决）：graph.json + extract 产物是唯一
+事实层（不建持久事实源 DB），FTS5 检索由落盘可重建缓存承载（删除无损），自动同步由
+serve 内置 watcher 承载。实施顺序与精确坐标（文件:行）见 spec + wayfinder 票 01–07。
+adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
+
+新增自定义文件（scripts/ + graphify/，与上游 graphify/ 零交叠）：
+- fts_cache.py -- FTS 缓存构建（graphify-out/.fts-index.db 三表 nodes/nodes_fts/meta；
+  bm25 权重 (0,3,2,0.2,1) 逐字对齐 ranked.py；camel 预拆索引/查询双侧同函数；nodes_fts
+  用常规独立 FTS5 表非外部内容表——对 05 设计 schema 的有据偏差，见模块 docstring）
+- rebuild_entry.py -- 单一重建入口（extract→build→to_json→rebuild_fts 编排 + 分析；
+  mkdir 原子锁 + stale 接管；状态文件 schema v2，指纹 = graph.json (mtime_ns, size)）
+- run_analysis.py -- analysis-only 编排器（graph.json 直读；cluster/analyze/report/wiki +
+  knowledge-gaps sidecar 从 graph.json failed_refs 派生；不写图）
+- split_semantic_seed.py -- 旧图 semantic 种子拆分（rebuild_entry.py:377 引用默认种子路径
+  <out>/semantic-seed.json）
+- graphify/serve_watcher.py -- serve 内置 watcher（默认关，--watch / GRAPHIFY_WATCH 显式
+  开启；防抖/退避常量移植 codegraph 算法；watchdog 软依赖降级 mtime 轮询）
 
 上游补丁（最小 diff，提 PR 后若被接受则移除）：
 - graphify/analyze.py:63 _is_file_node 加 kind='file' 短路
 
-Phase 3 拓扑切换（三触发面单入口）：
-- graphify/watch.py flush 路由改指 rebuild_entry（退役代码索引）：AST 批次 sync+重建，纯文档 elif 走 skip_sync 语义重提取；`.codegraph` 守卫非 codegraph 项目回退旧行为（_routed_doc 同源）
-- scripts/sessionend/precompact-graphify-update.sh 改指 rebuild_entry
+Phase 3 拓扑切换（三触发面单入口；.codegraph 判别已退役恒 False）：
+- graphify/watch.py flush 路由统一走 rebuild_entry（extract→build→to_json→rebuild_fts）：
+  AST 批次重建，纯文档 elif 走 skip_sync 语义重提取；_route_flush_batch 保留为路由工具
+- scripts/precompact-graphify-update.sh 改指 rebuild_entry
 
 同步检查项：
 - 4 契约入口（build_from_json/cluster/report.generate/export.to_json）签名未变即可
 - analyze.py 若上游改 _is_file_node，重放补丁（3 行 kind 短路）
 - watch.py 若上游改自定义防抖区，重放 _trigger_rebuild 路由
+- check-custom.sh 已登记全部新增文件（fts_cache/rebuild_entry/run_analysis/split_semantic_seed/
+  serve_watcher/cache_gc/symbol_utils + 对应 tests），升级后跑一遍确认无假阳性
+- 上游重构搬文件时防丢：fts_cache.py / serve_watcher.py 与 .fts-index.db 生成链路逐文件核对
