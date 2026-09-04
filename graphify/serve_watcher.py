@@ -366,7 +366,7 @@ class ServeWatcher:
                         self._changed = set()
                         self._deleted = set()
                         self._pending = False
-                if changed:
+                if changed or deleted:  # 纯删除批次 changed==[] 也要 flush（铁律 1/2）
                     try:
                         self._flush_batch(changed, deleted)
                     except Exception as exc:

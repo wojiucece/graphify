@@ -360,6 +360,40 @@ def test_stop_flushes_pending_batch(polling, tmp_path):
         watcher.stop()
 
 
+def test_stop_flushes_pending_deletion_batch(polling, tmp_path):
+    """stop() 时 pending 纯删除批次也被 flush（铁律 1/2：亡灵节点不因停机幸存）。
+
+    回归：final flush 曾用 `if changed:` 判定——纯删除批次 changed==[]（falsy）被静默丢弃，
+    graph.json 残留 b.py 亡灵节点。修法 `if changed or deleted:`。
+    """
+    import graphify.serve_watcher as W
+    root = _mini_proj(tmp_path)
+    import rebuild_entry
+    rebuild_entry.rebuild(root)
+    assert "bar()" in _labels(root), "前置：b.py 基线进图"
+    watcher = W.ServeWatcher(root, poll_interval=0.2, debounce=10.0)  # 事件入 pending，防抖未到
+    calls = {"n": 0}
+    real = watcher._run_pipeline
+
+    def recorder(changed, deleted, sr):
+        calls["n"] += 1
+        return real(changed, deleted, sr)
+    watcher._run_pipeline = recorder
+    watcher.start()
+    try:
+        time.sleep(0.6)  # 基线
+        (root / "b.py").unlink()  # 纯删除事件
+        time.sleep(0.5)  # 让删除进入 pending（debounce 未到，不 flush）
+        watcher.stop()   # 应 flush 一次 pending 删除批次（changed==[], deleted=[b.py]）
+        assert calls["n"] >= 1, "stop 未 flush pending 删除批次"
+        assert "bar()" not in _labels(root), "停机后 b.py 亡灵节点幸存"
+        data = json.loads((root / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+        assert not any(n.get("source_file") == "b.py" for n in data["nodes"]), \
+            "停机后 b.py source_file 残留"
+    finally:
+        watcher.stop()
+
+
 # === 失败退避与上限（复用 watch.py 已移植常量语义）==============================
 
 def test_backoff_retries_same_batch_and_recovers(polling, tmp_path):
