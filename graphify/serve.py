@@ -3786,8 +3786,10 @@ def _main(argv: list[str] | None = None) -> None:
     graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
     # Task 10: --watch 与 GRAPHIFY_WATCH 同语义——_build_server 是唯一读开关的挂载点。
+    # 评审 M-1：显式 CLI 标志赢过 env——直接赋值（setdefault 会让已存在的
+    # GRAPHIFY_WATCH=0/false 静默覆盖 --watch）。
     if args.watch:
-        os.environ.setdefault("GRAPHIFY_WATCH", "1")
+        os.environ["GRAPHIFY_WATCH"] = "1"
 
     if args.transport == "http":
         serve_http(

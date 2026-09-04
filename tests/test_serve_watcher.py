@@ -46,6 +46,15 @@ def _labels(root: Path) -> set:
     return set(_graph_nodes(root))
 
 
+def _graph_hyperedges(out: Path) -> list:
+    """graph.json 的 hyperedges 列表（顶层或 graph.hyperedges 嵌套，兼容两种落盘形态）。"""
+    g = out / "graph.json"
+    if not g.exists():
+        return []
+    data = json.loads(g.read_text(encoding="utf-8"))
+    return data.get("hyperedges") or data.get("graph", {}).get("hyperedges") or []
+
+
 def _wait_for_fts_hit(root: Path, term: str, timeout: float = 15.0) -> bool:
     """FTS 检索重试探针：容忍 watcher 线程并发原子替换 .fts-index.db 的瞬时
     sqlite/PermissionError（Windows 文件锁），也容忍旧缓存未重投影的窗口。"""
@@ -271,6 +280,65 @@ def test_seed_pruned_for_deleted_file(tmp_path):
     assert all(n.get("source_file") != "a.md" for n in updated["nodes"])
     assert all(e.get("source_file") != "a.md" for e in updated["edges"])
     assert any(n.get("source_file") == "b.md" for n in updated["nodes"])
+
+
+def test_seed_pruned_for_deleted_hyperedge(tmp_path):
+    """评审 I-2：_prune_seed_for_deleted 也修剪 hyperedges（source_file ∈ 删除集）。"""
+    import graphify.serve_watcher as W
+    root = tmp_path
+    out = root / "graphify-out"
+    out.mkdir()
+    seed_path = out / "semantic-seed.json"
+    seed = {
+        "nodes": [],
+        "edges": [],
+        "hyperedges": [
+            {"id": "hg:b", "label": "b 簇", "nodes": ["concept:c"], "source_file": "b.py"},
+            {"id": "hg:a", "label": "a 簇", "nodes": ["concept:d"], "source_file": "a.py"},
+        ],
+    }
+    seed_path.write_text(json.dumps(seed), encoding="utf-8")
+    watcher = W.ServeWatcher(root, out_dir=out)
+    watcher._prune_seed_for_deleted([root / "b.py"])
+    updated = json.loads(seed_path.read_text(encoding="utf-8"))
+    ids = {h.get("id") for h in updated["hyperedges"]}
+    assert "hg:b" not in ids, "删除集 hyperedge 未从 seed 修剪"
+    assert "hg:a" in ids, "非删除集 hyperedge 被误删"
+
+
+def test_deleted_seed_hyperedge_not_attached(polling, tmp_path):
+    """评审 I-2 端到端：seed hyperedge 携带已删文件 source_file → watcher 重建后
+    当前图与 seed 都不含该 hyperedge（铁律 1 防亡灵 + 防下轮复活）。"""
+    import graphify.serve_watcher as W
+    root = _mini_proj(tmp_path)
+    out = root / "graphify-out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "semantic-seed.json").write_text(json.dumps({
+        "nodes": [{"id": "concept:c", "label": "C", "_origin": "semantic", "file_type": "concept",
+                   "source_file": "notes.md"}],
+        "edges": [],
+        "hyperedges": [{"id": "hg:b", "label": "b 簇", "nodes": ["concept:c"], "source_file": "b.py"}],
+    }), encoding="utf-8")
+    import rebuild_entry
+    rebuild_entry.rebuild(root)  # 基线：seed hyperedge hg:b 进图
+    hes0 = _graph_hyperedges(out)
+    assert any(h.get("id") == "hg:b" for h in hes0), "前置：seed hyperedge 基线进图"
+    watcher = W.ServeWatcher(root, poll_interval=0.2, debounce=0.1)
+    watcher.start()
+    try:
+        time.sleep(0.6)  # 基线
+        (root / "b.py").unlink()
+
+        def pruned():
+            hes = _graph_hyperedges(out)
+            if any(h.get("id") == "hg:b" for h in hes):
+                return False
+            seed = json.loads((out / "semantic-seed.json").read_text(encoding="utf-8"))
+            return all(h.get("id") != "hg:b" for h in seed.get("hyperedges", []))
+
+        assert _wait_for(pruned), "watcher 重建后僵尸 hyperedge 仍存活（图或 seed）"
+    finally:
+        watcher.stop()
 
 
 def test_graphify_out_writes_do_not_retrigger(polling, tmp_path):
@@ -541,6 +609,36 @@ def test_mount_watcher_env_enables(tmp_path, monkeypatch):
         watcher.stop()
     finally:
         monkeypatch.delenv("GRAPHIFY_WATCH", raising=False)
+
+
+def test_cli_watch_flag_overrides_env(monkeypatch):
+    """评审 M-1：显式 --watch 赢过已存在的 GRAPHIFY_WATCH=0（setdefault 优先级颠倒修复）。"""
+    import os
+    import graphify.serve as S
+    monkeypatch.setenv("GRAPHIFY_WATCH", "0")
+    captured = {}
+
+    def fake_serve(graph_path):
+        captured["env"] = os.environ.get("GRAPHIFY_WATCH")
+
+    monkeypatch.setattr(S, "serve", fake_serve)
+    S._main(["--watch", "dummy.json"])
+    assert captured["env"] == "1", "显式 --watch 应覆盖 GRAPHIFY_WATCH=0 env"
+
+
+def test_cli_no_watch_leaves_env_untouched(monkeypatch):
+    """无 --watch 时 env 原样保留（GRAPHIFY_WATCH=0 继续关闭）。"""
+    import os
+    import graphify.serve as S
+    monkeypatch.setenv("GRAPHIFY_WATCH", "0")
+    captured = {}
+
+    def fake_serve(graph_path):
+        captured["env"] = os.environ.get("GRAPHIFY_WATCH")
+
+    monkeypatch.setattr(S, "serve", fake_serve)
+    S._main(["dummy.json"])
+    assert captured["env"] == "0", "无 --watch 不应改动 env"
 
 
 # === watchdog 真后端（软依赖存在时）=============================================

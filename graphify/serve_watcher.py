@@ -446,7 +446,17 @@ class ServeWatcher:
         if deleted:
             extraction = self._filter_deleted(extraction, deleted)
             self._prune_seed_for_deleted(deleted)
-        # 5) 全量 build + 社区检测
+        # 5) 全量 build + 社区检测。seed_hyperedges 从 seed 原样加载——attach 前对照
+        #    pending 删除集过滤（评审 I-2：hyperedge 也可携带 source_file，不过滤则
+        #    僵尸 hyperedge 存活进当前图；_filter_deleted 已滤 extraction 但 seed
+        #    hyperedge 走 _merge_seed 返回值，在此补滤）。
+        if seed_hyperedges and deleted:
+            deleted_norm = {self._norm_rel(p) for p in deleted if self._norm_rel(p)}
+            if deleted_norm:
+                seed_hyperedges = [
+                    h for h in seed_hyperedges
+                    if not (isinstance(h, dict) and self._in_deleted(h.get("source_file"), deleted_norm))
+                ]
         G = build_from_json(extraction, root=root)
         if seed_hyperedges:
             attach_hyperedges(G, seed_hyperedges)
@@ -530,12 +540,19 @@ class ServeWatcher:
             return
         nodes = seed.get("nodes", [])
         edges = seed.get("edges", [])
+        hyperedges = seed.get("hyperedges", [])
         new_nodes = [n for n in nodes if not self._in_deleted(n.get("source_file"), deleted_norm)]
         new_edges = [e for e in edges if not self._in_deleted(e.get("source_file"), deleted_norm)]
-        if len(new_nodes) == len(nodes) and len(new_edges) == len(edges):
+        new_hyperedges = [
+            h for h in hyperedges
+            if not (isinstance(h, dict) and self._in_deleted(h.get("source_file"), deleted_norm))
+        ]
+        if (len(new_nodes) == len(nodes) and len(new_edges) == len(edges)
+                and len(new_hyperedges) == len(hyperedges)):
             return
         seed["nodes"] = new_nodes
         seed["edges"] = new_edges
+        seed["hyperedges"] = new_hyperedges
         try:
             seed_path.write_text(json.dumps(seed, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as exc:
