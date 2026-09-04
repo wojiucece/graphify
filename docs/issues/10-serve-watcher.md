@@ -12,3 +12,10 @@
 - [ ] 停止时阻塞等待当前批次完成（不产生半写的事实层文件）；落盘全程原子替换
 - [ ] 无监听库环境下自动降级轮询且行为等价；默认关闭时 serve 行为与现状逐字节一致
 - [ ] 连续失败触发退避与上限（复用已移植的防抖/退避常量语义）
+
+## Resolution 指针
+
+精确实现坐标（~250–350 行新文件、serve 挂载点 ≤25 行、三条实现陷阱：删除语义 / graceful
+shutdown / 无轮询降级先例）见 wayfinder 决策票
+[`tickets/04-serve-watcher-architecture.md`](../wayfinder/tickets/04-serve-watcher-architecture.md)
+的 Resolution 段；本票为验收清单，不携带实现坐标。

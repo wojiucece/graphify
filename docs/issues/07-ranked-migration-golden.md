@@ -10,3 +10,9 @@
 - [ ] gap 联动通道在新失败引用源上保留（查询词与失败引用匹配语义不变）
 - [ ] 融合检索金标在提取契约落地后的新数据上重建，通过率 ≥ 95%
 - [ ] 降级路径（缓存不可用时回退纯图通道）行为不变
+
+## Resolution 指针
+
+精确实现坐标（BM25 通道逐字平移、gap 通道换 failed_refs、金标重建 + 95% 闸门）
+见 wayfinder 决策票 [`tickets/06-tool-surface-migration.md`](../wayfinder/tickets/06-tool-surface-migration.md)
+的 Resolution 段；本票为验收清单，不携带实现坐标。

@@ -338,6 +338,7 @@
     "merged_mean_hit5": 0.917,
     "grep_read_mean_hit5": 0.583,
     "merged_pct_of_grep_read": 8.1,
-    "hit5_note": "merged=expect 集上 recall 分数均值（连续）；grep_read=前 5 次读取内命中首期望文件的二值均值——两臂口径不同，不可直接比较"
+    "hit5_note": "merged=expect 集上 recall 分数均值（连续）；grep_read=前 5 次读取内命中首期望文件的二值均值——两臂口径不同，不可直接比较",
+    "fetch_ok_disclosure": "11/12 任务 merged 无源码 fetch（fetch_ok=False：新链路节点 label 带 () 后缀，benchmark 的 short 名派生（label.rsplit(\".\",1)[-1]）未剥 ()，_slice_source 校验失败走 absent）——merged_total_tokens 低估真实 fetch 成本，8.1% 与旧基线 13.9% 不可直接对比；待主树重建后重测修正"
   }
 }

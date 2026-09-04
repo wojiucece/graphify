@@ -10,3 +10,11 @@
 - [ ] 解析失败引用以结构化形态（来源节点/被调名/行号/文件）可从提取产物取回
 - [ ] 失败收集不改变既有解析行为与边集（只增信号，不改语义）
 - [ ] 既有解析相关测试无回归
+
+## Resolution 指针
+
+精确实现坐标（resolved_by 三映射 static-type→qualified-name / instance-method /
+heuristic→fuzzy、raw_calls 失败收集器）见 wayfinder 决策票
+[`tickets/03-field-contract.md`](../wayfinder/tickets/03-field-contract.md)（resolved_by）与
+[`tickets/06-tool-surface-migration.md`](../wayfinder/tickets/06-tool-surface-migration.md)
+（gap 通道换源语义）的 Resolution 段；本票为验收清单，不携带实现坐标。

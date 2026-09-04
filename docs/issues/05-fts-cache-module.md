@@ -12,3 +12,9 @@
 - [ ] 过滤路径可用：先元数据表收窄（类型/文件）再 JOIN 全文匹配
 - [ ] 删除缓存文件后下次访问自动重建；事实层未变时指纹命中不重建
 - [ ] 构建过程原子替换（中途失败不留下半成品缓存）
+
+## Resolution 指针
+
+精确实现坐标（schema/权重/camel 预拆/过滤路径/失效指纹细则）见 wayfinder 决策票
+[`tickets/05-fts-cache-design.md`](../wayfinder/tickets/05-fts-cache-design.md) 的 Resolution 段；
+本票为验收清单，不携带实现坐标。

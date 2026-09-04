@@ -14,3 +14,9 @@
 
 - [ ] 既有全语言提取测试无回归
 
+## Resolution 指针
+
+精确实现坐标（15 语言 LanguageConfig + 变量签名三条规则）见 wayfinder 决策票
+[`tickets/03-field-contract.md`](../wayfinder/tickets/03-field-contract.md) 的 Resolution 段；
+本票为验收清单，不携带实现坐标。
+

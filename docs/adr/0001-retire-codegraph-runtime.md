@@ -1,7 +1,7 @@
 # ADR-0001：退役 codegraph TS 运行时，Python 原生重建索引能力
 
 - 状态：Accepted（2026-09-04，native-indexing 收尾落档）
-- 决策链：[wayfinder 地图](../wayfinder/MAP.md)（7 票决议 01–07）→ [实施 spec](../graphify-native-indexing-spec.md)（label: ready-for-agent）→ 实施票 `docs/issues/01–11`（各票 Resolution 为精确坐标）
+- 决策链：[wayfinder 地图](../wayfinder/MAP.md)（7 票决议 01–07，精确实现坐标在各决策票 Resolution：`docs/wayfinder/tickets/01–07`）→ [实施 spec](../graphify-native-indexing-spec.md)（label: ready-for-agent）→ 实施票 `docs/issues/01–11`（验收清单；精确实现坐标见 wayfinder 决策票 tickets/01–07 的 Resolution）
 - 关联文档：[合并方案 v4.2（已取代）](../graphify-codegraph-merge-plan.md)、[Phase 4 深化 v1.15（已取代）](../graphify-codegraph-phase4-plan.md)、[Phase 5 v1.1（作废）](../graphify-codegraph-phase5-plan.md)
 
 ## 为什么是 ADR
@@ -73,4 +73,4 @@ conftest 金标门（`tests/conftest.py` `_golden_gate`）默认根 `GRAPHIFY_GO
 - 新链路全链路重建（rebuild_entry 首次 rebuild，AST-only 零 token 成本）：graph.json 16642 节点，含六件套契约（signature 7274 / qualified_name 7458 / docstring 4203 / `L:C` 列定位 7458）+ 顶层 `failed_refs` 3888 条；`.fts-index.db` 投影生成。GRAPH_REPORT 基线：16653 节点 · 30451 边 · 1087 communities（97% EXTRACTED / 3% INFERRED）。
 - 四层 seam 测试通过 + 金标 95% 闸门 100%（`GRAPHIFY_GOLDEN_ROOT=<worktree>`，2 passed；默认根 `D:/code/graphify_fork` 旧数据仍 SKIP）。
 - efficiency benchmark 换源 `.fts-index.db` 后重跑，结果 JSON 落档 `benchmarks/results-2026-09-04.json`（直接替换基线不 diff）：merged 20950 tokens / grep_read 259982 = **8.1%**（旧基线 13.9%），merged hit@5 0.917 / grep_read 0.583（金标 pass 率 100%）。
-- 全量测试最终绿（以 `PYTHONPATH=<worktree>` 跑，环境依赖 `python -m graphify` 子进程；既有 pre-existing 失败：test_claude_md PreToolUse 断言（fork 有意禁用，CLAUDE.md）、test_uninstall_scope[gemini]、test_watch 两处 Windows cwd 锁 flake——base commit 同样失败）。
+- 全量测试通过（5278 passed / 262 skipped / 39 failed——39 项全部为环境性 pre-existing，与 base 818a22d 失败集逐项 IDENTICAL，本票零新失败；清单含 test_install/hooks/uninstall/settings_merge/terraform/non_regular_files/provider/ollama/claude_md PreToolUse 断言（fork 有意禁用，CLAUDE.md）/watch 两处 Windows cwd 锁等。以 `PYTHONPATH=<worktree>` 跑，环境依赖 `python -m graphify` 子进程）。

@@ -21,7 +21,9 @@ blocked-by: []
 
 ## Resolution
 
-（2026-09-04，实施票 11 落档）六项全落地：
+（2026-09-04，实施票 11 落档）六项落地，其中**第 1/2/3 项（主树协调项）pending**——worktree
+内已完成；主 checkout `.codegraph/`/vendored 删除与主树/存量项目新链路重建待主树迁移执行
+（见 MAP status=closed-pending-migration）：
 
 1. **`.codegraph/` 退役**：`.gitignore` 移除 `.codegraph/` 与 vendored `codegraph/` 条目；
    `graphify/watch.py` 三处 `.codegraph/codegraph.db` 门控退役；hooks（sessionend/
@@ -38,5 +40,8 @@ blocked-by: []
 5. **基准重落**：efficiency benchmark 换源 `.fts-index.db` 重跑，结果 JSON 落档
    `benchmarks/results-2026-09-04.json`（merged 占 grep/read 8.1%，hit@5 merged 0.917）；
    GRAPH_REPORT 由 rebuild 重新生成（graphify-out 派生产物，gitignore）。
+   **fetch 披露**：11/12 任务 merged 无源码 fetch（fetch_ok=False，新链路 label 带 `()`
+   后缀与 benchmark 的 short 名派生不匹配，`_slice_source` 校验失败走 absent）——
+   8.1% 低估真实 fetch 成本，与旧基线 13.9% 不可直接对比；待主树重建后重测修正。
 6. **依赖清理 + 登记**：pyproject 无 codegraph 依赖（watchdog extras 保留供 serve_watcher）；
    check-custom.sh 全绿（exit 0，无 ✗）。

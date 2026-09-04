@@ -11,3 +11,9 @@
 - [ ] 首语句判定精确：仅 body 首子语句且内部恰为单个字符串节点（无拼接、无 f/b/r 前缀）
 - [ ] JS/TS 的 JSDoc 块关联到紧随其后的函数/类节点
 - [ ] 既有 rationale 节点行为不受影响（语义面保持不动）
+
+## Resolution 指针
+
+精确实现坐标（docstring 1500 上限智能截断 + 量化超限标记细则）见 wayfinder 决策票
+[`tickets/03-field-contract.md`](../wayfinder/tickets/03-field-contract.md) 的 Resolution 段；
+本票为验收清单，不携带实现坐标。

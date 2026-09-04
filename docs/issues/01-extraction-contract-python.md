@@ -18,3 +18,10 @@
 
 - [ ] 下游既有判定（AST 层识别、文件节点筛选）在新格式下全绿——既有提取/构建测试无一回归
 
+## Resolution 指针
+
+精确实现坐标（改动点坐标、行数估计、参考实现指针）见 wayfinder 决策票
+[`tickets/01-extraction-audit.md`](../wayfinder/tickets/01-extraction-audit.md)（提取层增强点盘点）
+与 [`tickets/03-field-contract.md`](../wayfinder/tickets/03-field-contract.md)（六字段契约设计）的
+Resolution 段；本票为验收清单，不携带实现坐标。
+

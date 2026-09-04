@@ -11,3 +11,9 @@
 - [ ] freshness 判定继续输出新鲜/陈旧 verdict（缓存落后于事实层时诚实标注）
 - [ ] 变更符号/热区工具输出与旧链路等价（度数单位差异按决议诚实标注）
 - [ ] 对应工具的既有 serve 测试在新数据源下全绿
+
+## Resolution 指针
+
+精确实现坐标（点查换 .fts-index.db、源码切片升级 end_byte、dispatch 标注语义映射）
+见 wayfinder 决策票 [`tickets/06-tool-surface-migration.md`](../wayfinder/tickets/06-tool-surface-migration.md)
+的 Resolution 段；本票为验收清单，不携带实现坐标。

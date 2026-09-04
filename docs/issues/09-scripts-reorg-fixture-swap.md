@@ -11,3 +11,11 @@
 - [ ] 状态文件的指纹字段换为事实层时间戳（schema 升版，旧状态文件平滑处理）
 - [ ] 旧数据库 fixture 全部替换，不留双 fixture 中间态；全量测试绿
 - [ ] 自定义面登记脚本收录全部新增文件
+
+## Resolution 指针
+
+精确实现坐标（run_analysis 改 analysis-only、rebuild_entry 换编排 + 指纹字段换
+graph.json 时间戳、adapter 依赖删除、测试一次性换源）见 wayfinder 决策票
+[`tickets/06-tool-surface-migration.md`](../wayfinder/tickets/06-tool-surface-migration.md)
+（scripts 重组）与 [`tickets/04-serve-watcher-architecture.md`](../wayfinder/tickets/04-serve-watcher-architecture.md)
+（增量 = extract cache + 全量 rebuild 语义）的 Resolution 段；本票为验收清单，不携带实现坐标。
