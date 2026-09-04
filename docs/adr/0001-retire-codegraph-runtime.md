@@ -65,12 +65,12 @@ graphify 的图语义原样保留：无向 networkx.Graph、边属性标方向�
 
 conftest 金标门（`tests/conftest.py` `_golden_gate`）默认根 `GRAPHIFY_GOLDEN_ROOT=D:/code/graphify_fork`；金标数据（`tests/fixtures/ranked_golden.json`）已按新链路 path-id 重建（票 07），仅当指向的 graph.json 顶层含 `failed_refs`（新链路事实层形态）时点亮（实测通过率 100%，20/20）。
 
-- **主 checkout 基线重建后默认根自动点亮**（协调项：`D:/code/graphify_fork` 首次新链路重建后，默认根不再 SKIP）。
+- **主 checkout 基线重建已完成，默认根已点亮**（controller 实测：`D:/code/graphify_fork` 新链路重建 16722 节点 + failed_refs 3892，test_ranked_context golden 默认根 2 passed，不再 SKIP）。存量项目（jianshen/wuziqi 等）首次迁移为独立后续。
 - **CI/隔离环境**：显式设 `GRAPHIFY_GOLDEN_ROOT` 指向已新链路重建的语料；`-m 'not golden'` 可整组排除。
 
 ## 验证摘要（2026-09-04，worktree 实证）
 
 - 新链路全链路重建（rebuild_entry 首次 rebuild，AST-only 零 token 成本）：graph.json 16642 节点，含六件套契约（signature 7274 / qualified_name 7458 / docstring 4203 / `L:C` 列定位 7458）+ 顶层 `failed_refs` 3888 条；`.fts-index.db` 投影生成。GRAPH_REPORT 基线：16653 节点 · 30451 边 · 1087 communities（97% EXTRACTED / 3% INFERRED）。
-- 四层 seam 测试通过 + 金标 95% 闸门 100%（`GRAPHIFY_GOLDEN_ROOT=<worktree>`，2 passed；默认根 `D:/code/graphify_fork` 旧数据仍 SKIP）。
+- 四层 seam 测试通过 + 金标 95% 闸门 100%（`GRAPHIFY_GOLDEN_ROOT=<worktree>`，2 passed；主树重建后默认根 `D:/code/graphify_fork` 亦已点亮，实测 golden 2 passed）。
 - efficiency benchmark 换源 `.fts-index.db` 后重跑，结果 JSON 落档 `benchmarks/results-2026-09-04.json`（直接替换基线不 diff）：merged 20950 tokens / grep_read 259982 = **8.1%**（旧基线 13.9%），merged hit@5 0.917 / grep_read 0.583（金标 pass 率 100%）。
 - 全量测试通过（5278 passed / 262 skipped / 39 failed——39 项全部为环境性 pre-existing，与 base 818a22d 失败集逐项 IDENTICAL，本票零新失败；清单含 test_install/hooks/uninstall/settings_merge/terraform/non_regular_files/provider/ollama/claude_md PreToolUse 断言（fork 有意禁用，CLAUDE.md）/watch 两处 Windows cwd 锁等。以 `PYTHONPATH=<worktree>` 跑，环境依赖 `python -m graphify` 子进程）。

@@ -4,14 +4,14 @@
 
 **Blocked by:** 10（serve 内置 watcher）
 
-**Status:** done（主树协调项 pending——见各条标注与 MAP status=closed-pending-migration）
+**Status:** done（主树迁移已完成；存量项目迁移为独立后续）
 
-- [x] 旧运行时进程停用、目录与忽略规则条目删除；仓库内无残留引用（文档中的历史引用除外）——worktree 内完成（`.gitignore` 条目删、watch.py 三处门控退役、hooks 统一 rebuild_entry）；主 checkout 的 `.codegraph/` 目录删除为协调项
-- [x] 本地参考副本删除；吸收处的第三方署名注释保留——gitignore 条目已删 + MIT 署名保留（watch.py）；主 checkout vendored `codegraph/` 副本删除为协调项
-- [x] 存量项目完成首次新链路重建，产物对齐备——worktree 本仓完成（graph.json 六件套 + failed_refs 3888 + `.fts-index.db`）；主 checkout 与 jianshen/wuziqi 等主树执行
+- [x] 旧运行时进程停用、目录与忽略规则条目删除；仓库内无残留引用（文档中的历史引用除外）——worktree 内完成（`.gitignore` 条目删、watch.py 三处门控退役、hooks 统一 rebuild_entry）；主 checkout `.codegraph/` 目录已删（controller 实测，37M 旧 DB）
+- [x] 本地参考副本删除；吸收处的第三方署名注释保留——gitignore 条目已删 + MIT 署名保留（watch.py）；主 checkout vendored `codegraph/` 副本已删（controller 实测，151M）
+- [x] 存量项目完成首次新链路重建，产物对齐备——worktree 本仓完成（graph.json 六件套 + failed_refs 3888 + `.fts-index.db`）；**主 checkout 已重建**（886 文件 → graph.json 16722 节点 + failed_refs 3892 + FTS 缓存）；jianshen/wuziqi 等存量项目迁移为独立后续（主树执行）
 - [x] 合并方案过时条款修订、作废方案标记、退役 ADR 落档（决策链引用 wayfinder 地图与各票决议）——完成（ADR-0001 + merge-plan/phase4/phase5 横幅 + 决策链 docs/issues/01-11 + wayfinder 落档）
 - [x] 新基线提交：完整重建报告 + 效率基准结果落档——完成（`benchmarks/results-2026-09-04.json`，8.1%；fetch 披露见 JSON summary 与 ticket 07）
-- [x] 金标门默认根点亮：主 checkout 基线重建后，conftest 金标门默认根（D:/code/graphify_fork）不再 SKIP；或 CI 显式设 GRAPHIFY_GOLDEN_ROOT 指向新链语料（Task 07 I4 决策承接）——机制验证 100%（worktree 根 2 passed / 默认根 2 skipped）；默认根点亮待主 checkout 重建，CI 可显式 `GRAPHIFY_GOLDEN_ROOT`
+- [x] 金标门默认根点亮：主 checkout 基线重建后，conftest 金标门默认根（D:/code/graphify_fork）不再 SKIP；或 CI 显式设 GRAPHIFY_GOLDEN_ROOT 指向新链语料（Task 07 I4 决策承接）——**默认根已点亮**（controller 实测：test_ranked_context golden 默认根 2 passed，不再 SKIP）；worktree 根同样 2 passed
 - [x] 依赖声明清理；全量测试最终绿——依赖清理完成（无 codegraph 依赖，watchdog extras 保留）；全量测试通过（5278 passed / 39 项环境性 pre-existing 失败，清单见 ADR 验证摘要）
 
 ## Resolution 指针
