@@ -35,9 +35,11 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
+from graphify.paths import GRAPHIFY_OUT_NAME as _GRAPHIFY_OUT_NAME
 
 # 防抖/退避常量复用 watch.py 已移植的 codegraph 算法（架构票 04 决策点定案：
 # 直接 import，不抽公共模块——同包私有常量，零成本零漂移；抽模块要动 watch.py 本体，
@@ -119,12 +121,14 @@ class ServeWatcher:
         out_dir: "str | Path | None" = None,
         debounce: float = DEFAULT_DEBOUNCE,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
+        gate: "threading.Semaphore | None" = None,
         on_pipeline_complete: "callable | None" = None,
     ) -> None:
         self._root = Path(project_root).resolve()
         self._out_dir = Path(out_dir).resolve() if out_dir is not None else self._root / _GRAPHIFY_OUT
         self._debounce = debounce
         self._poll_interval = poll_interval
+        self._gate = gate
         self._on_complete = on_pipeline_complete
         self._ignore_patterns = _load_graphifyignore(self._root)
 
@@ -207,6 +211,16 @@ class ServeWatcher:
     @property
     def backend_name(self) -> str:
         return "watchdog" if self._observer_mode else "polling"
+
+    @property
+    def is_alive(self) -> bool:
+        """主循环线程是否存活（registry 判定 dead/alive 用）。
+
+        与 ``_running`` 不同：``_run_loop`` 的 finally 在 final flush 后才清
+        ``_running``，而线程 ``is_alive()`` 覆盖到 run() 返回——registry 在查询时
+        检查此属性，避免把"正在收尾 flush 的 watcher"误判为 dead 提前替换。
+        """
+        return self._thread is not None and self._thread.is_alive()
 
     # ── 事件投递（watchdog handler / 轮询共用）───────────────────────────────
 
@@ -394,22 +408,35 @@ class ServeWatcher:
     # ── pipeline（触发链全链路）──────────────────────────────────────────────
 
     def _flush_batch(self, changed: list[Path], deleted: list[Path]) -> bool:
-        """批次分类 + 内联串行 pipeline。返回成功与否（失败由主循环退避/降级）。"""
+        """批次分类 + 内联串行 pipeline。返回成功与否（失败由主循环退避/降级）。
+
+        全局信号量（registry 传入的 gate）在此获取：所有 watcher 的重建管线互斥
+        串行（spec 并发与隔离）。等闸期间新事件继续并入各自防抖窗——_take_batch
+        已清空本批、后续事件进下一批（observer 线程持续 _record；轮询在管线结束后
+        用快照 diff 追平），不丢事件。gate=None（单机/单 watcher）零开销。
+        """
+        gate = self._gate
         semantic_refresh = [
             p for p in changed
             if p.suffix.lower() in _SEMANTIC_DOC_SUFFIXES and p.exists()
         ]
+        if gate is not None:
+            gate.acquire()
         try:
-            self._run_pipeline(changed, deleted, semantic_refresh)
-        except Exception as exc:
-            print(f"[graphify serve watcher] rebuild failed: {exc}", file=sys.stderr)
-            return False
-        if self._on_complete is not None:
             try:
-                self._on_complete()
+                self._run_pipeline(changed, deleted, semantic_refresh)
             except Exception as exc:
-                logger.warning("on_pipeline_complete callback failed: %s", exc)
-        return True
+                print(f"[graphify serve watcher] rebuild failed: {exc}", file=sys.stderr)
+                return False
+            if self._on_complete is not None:
+                try:
+                    self._on_complete()
+                except Exception as exc:
+                    logger.warning("on_pipeline_complete callback failed: %s", exc)
+            return True
+        finally:
+            if gate is not None:
+                gate.release()
 
     def _run_pipeline(
         self,
@@ -594,19 +621,139 @@ class ServeWatcher:
         return sf is not None and self._norm_rel(sf) in deleted_norm
 
 
-def mount_watcher(graph_path, ctx_cache, *, watch: "bool | None" = None) -> "ServeWatcher | None":
-    """serve 挂载点：读开关（--watch / GRAPHIFY_WATCH）+ 构建 + 启动 watcher。
+def default_project_root(graph_path: str) -> str:
+    """默认项目的监听根（查询侧解析链同源，不再无条件 parent.parent 反推）。
+
+    GRAPHIFY_OUT 为相对值时标准布局 ``<root>/<GRAPHIFY_OUT>/graph.json`` 成立，
+    root = 图目录的父目录（与 Task 10 现状一致）；GRAPHIFY_OUT 为绝对覆盖时图可能
+    在项目外，回退 serve 启动目录（cwd）——``graphify serve`` 在项目根启动的惯例下
+    即项目根。
+    """
+    resolved = Path(graph_path).resolve()
+    if not os.path.isabs(_GRAPHIFY_OUT) and resolved.parent.name == _GRAPHIFY_OUT_NAME:
+        return str(resolved.parent.parent)
+    return str(Path.cwd())
+
+
+class WatcherRegistry:
+    """serve 多项目 watcher 注册表：管理一组 ServeWatcher（每项目一个）。
+
+    与查询侧 ``_GraphContextCache`` 对称的 per-project 模型（spec 架构形态决策）：
+
+    - 惰性挂载：serve 侧 ``_select_graph`` 首次成功加载某项目图时 mount 该项目
+      watcher（默认项目在 serve 启动时 eager mount，不经本注册表的惰性路径）。
+    - 幂等挂载：同项目已有 alive watcher 则跳过（仅 touch 使用序）；dead watcher
+      则直接替换为全新实例（不经逐出）；并发首查同项目由 ``_lock`` 双检查保证只挂
+      一个。
+    - 全局信号量 = 1：所有 watcher 的重建管线互斥串行（等闸期间新事件并入各自防抖
+      窗，不丢事件——见 ServeWatcher._flush_batch 的 gate 获取点）。
+    - (project_root, out_dir) 全部由调用方（serve.py 查询侧解析链）显式传入，不再
+      从 graph_path 反推（out_dir 对齐约束，spec 路径解析）。
+
+    本票范围纪律：不含 LRU 容量逐出（票 03）、挂载补齐（票 03）、跨进程锁消费
+    （票 04）；stop_all 的按信号量持有序停机优化在票 04。
+    """
+
+    def __init__(
+        self,
+        ctx_cache,
+        *,
+        debounce: "float | None" = None,
+        poll_interval: "float | None" = None,
+        semaphore: "threading.Semaphore | None" = None,
+    ) -> None:
+        self._ctx_cache = ctx_cache
+        # None -> 构造时读模块常量（测试可 monkeypatch 常量注入短防抖/快轮询）。
+        self._debounce = DEFAULT_DEBOUNCE if debounce is None else debounce
+        self._poll_interval = DEFAULT_POLL_INTERVAL if poll_interval is None else poll_interval
+        self._sem = semaphore if semaphore is not None else threading.Semaphore(1)
+        self._watchers: OrderedDict[str, ServeWatcher] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def mount(self, project_root, out_dir) -> ServeWatcher:
+        """幂等挂载：alive 跳过（仅 touch 使用序）；dead 直接替换为全新实例。
+
+        (project_root, out_dir) 来自查询侧解析链（调用方保证），root 键 resolve
+        归一。并发首查同项目时 ``_lock`` 双检查只挂一个（spec 并发首查幂等）。
+        """
+        root = str(Path(project_root).resolve())
+        out = str(Path(out_dir).resolve())
+        with self._lock:
+            existing = self._watchers.get(root)
+            if existing is not None and existing.is_alive:
+                self._watchers.move_to_end(root)
+                return existing
+            if existing is not None:
+                # dead watcher：直接替换为全新实例（不经逐出路径，逐出是票 03 配额机制）。
+                self._watchers.pop(root, None)
+                existing.stop()
+            watcher = self._make_watcher(root, out)
+            self._watchers[root] = watcher
+            watcher.start()
+            print(f"[graphify serve] watching {watcher.project_root} "
+                  f"({watcher.backend_name} backend); saves auto-rebuild the graph",
+                  file=sys.stderr)
+            return watcher
+
+    def _make_watcher(self, root: str, out_dir: str) -> ServeWatcher:
+        graph_path = str((Path(out_dir) / "graph.json").resolve())
+        return ServeWatcher(
+            project_root=root,
+            out_dir=out_dir,
+            debounce=self._debounce,
+            poll_interval=self._poll_interval,
+            gate=self._sem,
+            on_pipeline_complete=lambda: self._ctx_cache.invalidate(graph_path),
+        )
+
+    def get(self, project_root) -> "ServeWatcher | None":
+        """按项目根取 watcher（registry 状态可查 / 测试断言用）。"""
+        root = str(Path(project_root).resolve())
+        with self._lock:
+            return self._watchers.get(root)
+
+    def status_summary(self) -> list[dict]:
+        """registry 状态汇总：每项目 project_root + backend + status（active/disabled）。
+
+        票 03 graph_stats 喂点；本票用于"registry 状态可查"（测试/排障）。
+        """
+        with self._lock:
+            return [
+                {"project_root": root,
+                 "backend": w.backend_name,
+                 "status": "active" if w.is_alive else "disabled"}
+                for root, w in self._watchers.items()
+            ]
+
+    def stop_all(self, *, join_timeout: "float | None" = None) -> None:
+        """停机：全部 watcher 依序 stop（final flush 落盘，不丢事件）。
+
+        按信号量持有序串行停机优化留票 04（三挂点调用形态零改动）。
+        """
+        with self._lock:
+            watchers = list(self._watchers.values())
+            self._watchers.clear()
+        for w in watchers:
+            w.stop(join_timeout=join_timeout)
+
+
+def mount_watcher(graph_path, ctx_cache, *, watch: "bool | None" = None,
+                  project_root: "str | Path | None" = None) -> "ServeWatcher | None":
+    """serve 挂载点（单项目兼容入口）：读开关 + 构建 + 启动 watcher。
 
     graph_path：默认 graph.json 的解析路径；ctx_cache：serve 侧 _GraphContextCache
-    实例（pipeline 完成回调直通失效，原子换图）。未开启时返回 None（零副作用）。
+    实例（pipeline 完成回调直通失效，原子换图）。project_root 显式传入则优先（查询
+    侧解析链同源，不再反推）；缺省回退 default_project_root() 的布局推导（Task 10
+    既有调用形态零回归）。未开启时返回 None（零副作用）。
     """
     if watch is None:
         watch = os.environ.get("GRAPHIFY_WATCH", "").strip().lower() in _WATCH_ENV_TRUE
     if not watch:
         return None
     resolved = Path(graph_path).resolve()
+    root = str(Path(project_root).resolve()) if project_root is not None else default_project_root(graph_path)
     watcher = ServeWatcher(
-        project_root=str(resolved.parent.parent),
+        project_root=root,
         out_dir=str(resolved.parent),
         on_pipeline_complete=lambda: ctx_cache.invalidate(str(resolved)),
     )

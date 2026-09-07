@@ -2828,14 +2828,20 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
     _default_graph_path = str(Path(graph_path).resolve())
     _ctx_cache = _GraphContextCache(_max_server_contexts())
 
-    # === CUSTOM: 内置 watcher（Task 10）——默认关，--watch / GRAPHIFY_WATCH 显式开启 ===
+    # === CUSTOM: 内置 watcher 注册表（per-project-watcher）——默认关，--watch / GRAPHIFY_WATCH 开启 ===
     # 挂载点（架构票 04：serve.py 挂载 diff ≤ 25 行）；逻辑全在 serve_watcher.py。
+    # 默认项目 eager mount 走查询侧解析链：(project_root, out_dir) 同源（out_dir 对齐）。
     if watch is None:
         watch = os.environ.get("GRAPHIFY_WATCH", "").strip().lower() in _WATCH_ENV_TRUE
     if watch:
         from graphify import serve_watcher
-        _watcher = serve_watcher.mount_watcher(_default_graph_path, _ctx_cache, watch=True)
+        _registry = serve_watcher.WatcherRegistry(_ctx_cache)
+        _watcher = _registry.mount(
+            serve_watcher.default_project_root(_default_graph_path),
+            str(Path(_default_graph_path).parent),
+        )
     else:
+        _registry = None
         _watcher = None
 
     def _load_ctx(path: str):
@@ -2876,6 +2882,13 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         path = _resolve_graph_path(project_path)
         G, communities = _load_ctx(path)
         active_graph_path = str(Path(path).resolve())
+        # 惰性挂载：首次成功加载某项目图时自动挂该项目 watcher（与查询侧"用到即加载"
+        # 对称）。(project_root, out_dir) 均来自查询侧解析链——out_dir = 查询目标的
+        # 父目录，GRAPHIFY_OUT 覆盖布局下监听目标与查询目标恒为同一 graph.json。
+        # project_path 为 None（默认图）不触发：默认项目启动时已 eager mount。
+        if _registry is not None and project_path:
+            _registry.mount(str(Path(project_path).resolve()),
+                            str(Path(path).resolve().parent))
 
     # NOTE: no decorators here — the handlers below are plain coroutines,
     # bound to the Server at the END of this function in a version-aware way:
@@ -3477,14 +3490,22 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
     server._graphify_health_handler = _handle_health
     # === CUSTOM: /query and /health HTTP endpoints for prompt-hook end ===
 
-    # === CUSTOM: Task 10 内置 watcher——挂到 server 供 transport 生命周期 stop ===
+    # === CUSTOM: 内置 watcher 注册表——挂到 server 供 transport 生命周期 stop ===
+    # _graphify_watcher 保留为默认项目 watcher（Task 10 外部契约）；_graphify_registry
+    # 停机 stop_all（惰性挂载项目不泄漏）；_graphify_select_graph 测试直驱惰性挂载。
     server._graphify_watcher = _watcher
+    server._graphify_registry = _registry
+    server._graphify_select_graph = _select_graph
 
     return server
 
 
 def _stop_graphify_watcher(server) -> None:
-    """transport 退出时阻塞停止内置 watcher（Task 10 铁律 2：批次完成 + 原子落盘）."""
+    """transport 退出时阻塞停止全部内置 watcher（Task 10 铁律 2：批次完成 + 原子落盘）."""
+    registry = getattr(server, "_graphify_registry", None)
+    if registry is not None:
+        registry.stop_all()
+        return
     watcher = getattr(server, "_graphify_watcher", None)
     if watcher is not None:
         watcher.stop()
