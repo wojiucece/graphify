@@ -204,6 +204,33 @@ def test_registry_max_watchers_defaults_and_fallback(monkeypatch):
     assert W.WatcherRegistry(_FakeCache())._max_watchers == 3, "无效值未回退默认（ctx 上限）"
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        (None, 8),    # 未设 env → 默认 8
+        ("4", 4),     # 有效值 → 解析（max(1,int) clamp 的上界路径）
+        ("", 8),      # 空/空白 → 默认 8
+        ("abc", 8),   # 无效 → 回退默认 8
+    ],
+)
+def test_default_max_watchers_mirrors_server_contexts(monkeypatch, env_value, expected):
+    """镜像契约：serve_watcher._default_max_watchers 与 serve._max_server_contexts 逐分支一致。
+
+    两函数 body 逐字相同（同 env 键 GRAPHIFY_MAX_CONTEXTS、blank→8、max(1,int) clamp、
+    ValueError→8），是刻意的重复——serve_watcher 不能 import serve（circular-import 约束：
+    serve 在 watcher 之后才 import 它），故各自持有解析逻辑。此测试钉死镜像：任一分支
+    漂移（改了一侧没改另一侧）即红。
+    """
+    import graphify.serve as S
+    import graphify.serve_watcher as W
+    if env_value is None:
+        monkeypatch.delenv("GRAPHIFY_MAX_CONTEXTS", raising=False)
+    else:
+        monkeypatch.setenv("GRAPHIFY_MAX_CONTEXTS", env_value)
+    assert W._default_max_watchers() == expected
+    assert S._max_server_contexts() == expected
+
+
 def test_registry_evict_graph_stops_and_removes(polling, tmp_path):
     """LRU 联动逐出：registry.evict_graph(graph_path) 停掉对应 watcher 并从 registry 移除；
     未挂载该图则 no-op（幂等）。"""
@@ -270,6 +297,43 @@ def test_registry_cap_evicts_dead_before_alive(polling, tmp_path, monkeypatch):
         assert registry.get(proj_a) is None, "dead watcher 未优先被清"
         assert wb.is_alive, "alive watcher 被误清"
         assert wc.is_alive
+    finally:
+        registry.stop_all()
+
+
+def test_registry_cap_evicts_dead_before_alive_mru(polling, tmp_path, monkeypatch):
+    """dead 优先于 alive 被清，即使 dead 在使用序 MRU 端（反例：LRU 序恰好不指向它）。
+
+    加固：test_registry_cap_evicts_dead_before_alive 的 dead watcher 恰是 LRU 头，无法区分
+    "dead 优先"与"LRU 恰好选中它"。本用例 dead 在 MRU 端、两个 alive 排在 LRU 序前面——
+    只有 dead-first 扫描会选中 MRU 端的 dead；纯 LRU 序逐出只会误逐 LRU 头 alive。
+    """
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    monkeypatch.setenv("GRAPHIFY_MAX_WATCHERS", "3")
+    monkeypatch.setattr(W, "_MAX_SYNC_FAILURE_RETRIES", 2)
+    proj_a = _mini_proj(tmp_path / "proj-a")
+    proj_b = _mini_proj(tmp_path / "proj-b")
+    proj_c = _mini_proj(tmp_path / "proj-c")
+    proj_d = _mini_proj(tmp_path / "proj-d")
+    rebuild_entry.rebuild(proj_c)  # 只有 c 建基线——让 c 可被真实管线驱动自禁用
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    wa = registry.mount(proj_a, proj_a / "graphify-out")
+    wb = registry.mount(proj_b, proj_b / "graphify-out")
+    wc = registry.mount(proj_c, proj_c / "graphify-out")  # 使用序 [a, b, c]，c 在 MRU 端
+
+    def boom(changed, deleted, sr):
+        raise RuntimeError("boom")
+    wc._run_pipeline = boom  # 让 MRU 端的 c 自禁用（dead）
+    try:
+        time.sleep(0.6)  # c 基线快照
+        (proj_c / "a.py").write_text("x = 1\n", encoding="utf-8")
+        assert _wait_for(lambda: not wc.is_alive, timeout=40), "c 未自禁用"
+        wd = registry.mount(proj_d, proj_d / "graphify-out")  # 超上限 → dead-first 应清 MRU 端 c
+        assert registry.get(proj_c) is None, "dead（MRU 端）未优先被清"
+        assert wa.is_alive, "LRU 头 alive 被误清（纯 LRU 序会逐 a）"
+        assert wb.is_alive, "alive 被误清"
+        assert wd.is_alive
     finally:
         registry.stop_all()
 

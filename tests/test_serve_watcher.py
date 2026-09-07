@@ -86,12 +86,20 @@ def polling(monkeypatch):
 
 # === 默认关 / 挂载点（serve.py）================================================
 
-def test_build_server_watch_default_off(tmp_path):
-    """默认关：无 --watch/GRAPHIFY_WATCH 时 server 无 watcher，且 serve_watcher 不 import."""
+def test_build_server_watch_default_off(tmp_path, monkeypatch):
+    """默认关：无 --watch/GRAPHIFY_WATCH 时 server 无 watcher，且 serve_watcher 不 import.
+
+    隔离：同会话早前跑的 registry 测试会经函数内 ``import graphify.serve_watcher`` 预填充
+    sys.modules（污染本断言）。构建前把目标模块从 sys.modules 摘除——若 watch-off 构建真去
+    import serve_watcher，模块会重新出现，断言照常红；不 import 则维持缺失（monkeypatch 测试
+    后自动还原原模块对象，不破坏后续用例）。断言保护的意义不变：默认关的构建在运行期绝不加载
+    serve_watcher。
+    """
     import graphify.serve as S
     root = _mini_proj(tmp_path)
     import rebuild_entry
     rebuild_entry.rebuild(root)
+    monkeypatch.delitem(sys.modules, "graphify.serve_watcher", raising=False)
     server = S._build_server(str(root / "graphify-out" / "graph.json"))
     assert getattr(server, "_graphify_watcher", None) is None
     assert "graphify.serve_watcher" not in sys.modules, "默认关不该 import serve_watcher"

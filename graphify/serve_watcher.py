@@ -206,6 +206,17 @@ class ServeWatcher:
             atexit.register(self.stop)
             self._atexit_registered = True
 
+    def _unregister_atexit(self) -> None:
+        """注销 start() 注册的 atexit handler（幂等，_atexit_registered 门控）。
+
+        start 注册、stop 注销，一一对应——否则 eviction churn（mount → evict → remount
+        循环）每个死亡 watcher 累计一个 idle handler，无界增长。double-stop 安全：首个
+        stop 已复位 _atexit_registered，次个 stop 走 no-op。
+        """
+        if self._atexit_registered:
+            atexit.unregister(self.stop)
+            self._atexit_registered = False
+
     def stop(self, *, join_timeout: float | None = None) -> None:
         """阻塞等待当前批次完成（铁律 2：只发信号不等待是禁止的）。
 
@@ -214,6 +225,10 @@ class ServeWatcher:
         批次（不丢事件）。graph.json 全程原子替换，stop() 返回时事实层文件必然完整。
         """
         if not self._running:
+            # 自禁用（auto-sync disabled）的 watcher 线程已在 finally 清 _running——此时
+            # stop() 也要注销 atexit handler：否则 dead watcher 被逐出/替换时 stop() 在此
+            # 早退，其 handler 残留，mount → self-disable → evict → remount 循环仍会无界累积。
+            self._unregister_atexit()
             return
         self._stop.set()
         if self._observer is not None:
@@ -232,6 +247,7 @@ class ServeWatcher:
             except Exception:
                 pass
         self._running = False
+        self._unregister_atexit()
 
     @property
     def project_root(self) -> str:
@@ -727,6 +743,11 @@ class WatcherRegistry:
                 return existing
             if existing is not None:
                 # dead watcher：直接替换为全新实例（不经逐出路径，逐出是配额机制）。
+                # 持注册表锁 stop() 安全仅因：dead watcher 的 stop() 立即返回（_running 假 或
+                # dead 线程 join 即瞬）。钉死前置条件——若未来 _run_loop 重构使非存活 watcher
+                # 的 stop() 阻塞，此断言在测试（非 -O）下先红，防止持锁阻塞/死锁被静默放行。
+                assert not existing.is_alive, \
+                    "dead-replace 前提：existing 已非存活（持锁 stop() 只对 dead watcher 无阻塞）"
                 self._watchers.pop(root, None)
                 self._by_graph.pop(_graph_path_of(str(existing._out_dir)), None)
                 existing.stop()
