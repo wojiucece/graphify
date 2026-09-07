@@ -548,3 +548,94 @@ def test_final_flush_retries_lock_busy(polling, tmp_path):
     finally:
         watcher.stop()
         _cleanup(root)
+
+
+# === Fix round 2：停机 final flush 撞收敛跳过——诚实告警 not flushed，不静默 restore ===
+
+def test_final_flush_shutdown_convergence_warns_not_flushed(polling, monkeypatch, capsys,
+                                                           tmp_path):
+    """Fix round 2：停机 final flush 撞收敛跳过（线程即将退出，restore 的批次永不再
+    flush）——不得静默 restore-return-True，必须诚实告警 not flushed + 自愈路径；
+    stop() 正常完成、无异常、有界耗时；后续惰性挂载补齐自愈拾取未 flush 事件。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)  # 基线 v1
+    # 弄陈旧：改语料不重建（shutdown_sym 是 hook 会捕获的编辑）
+    (root / "a.py").write_text(
+        "import b\n\ndef foo():\n    return b.bar()\n\ndef shutdown_sym():\n    return 5\n",
+        encoding="utf-8")
+    assert "shutdown_sym()" not in _labels(root / "graphify-out"), "前置：图未含新语料"
+    # hook 的 extract 完成后持锁留窗（模拟 FTS/analysis 窗口），并通告 extract 完成
+    extract_done = threading.Event()
+    release_extract = threading.Event()
+    real_extract = rebuild_entry._extract_with_retry
+
+    def slow_extract(proj_root):
+        result = real_extract(proj_root)
+        if not extract_done.is_set():
+            extract_done.set()
+            release_extract.wait(30)  # 持锁阻塞——让 watcher 在 extract 后窗口内锁忙
+        return result
+    monkeypatch.setattr(rebuild_entry, "_extract_with_retry", slow_extract)
+    watcher = W.ServeWatcher(root, out_dir=root / "graphify-out",
+                             poll_interval=0.2, debounce=0.1)
+    lock_busy_seen = threading.Event()
+    real_flush = watcher._flush_batch
+
+    def rec_flush(*a, **k):
+        r = real_flush(*a, **k)
+        if r is W._LOCK_BUSY:
+            lock_busy_seen.set()
+        return r
+    watcher._flush_batch = rec_flush
+    hook_err = {}
+
+    def run_hook():
+        try:
+            rebuild_entry.rebuild(root)
+        except BaseException as exc:
+            hook_err["exc"] = exc
+    hook_thread = threading.Thread(target=run_hook, daemon=True)
+    watcher.start()
+    try:
+        time.sleep(0.6)  # watcher 基线
+        hook_thread.start()
+        assert extract_done.wait(20), "hook extract 未完成"
+        # 编辑落在 hook 的 extract 之后（hook 捕获不到 pending_sym）
+        (root / "a.py").write_text(
+            "import b\n\ndef foo():\n    return b.bar()\n\ndef shutdown_sym():\n    return 5\n"
+            "\ndef pending_sym():\n    return 6\n",
+            encoding="utf-8")
+        # 正常循环 flush 撞锁忙（f1 参照已捕获，批次 restore，退避中）
+        assert lock_busy_seen.wait(15), "正常循环未观察到锁忙"
+        # hook 收敛：放行 extract 后的 build → graph f2（含 shutdown_sym、不含 pending_sym）→ 释放锁
+        release_extract.set()
+        # stop() 在正常循环退避到期前触发 → final flush 撞收敛 → 停机告警不静默 restore
+        t0 = time.time()
+        watcher.stop()
+        elapsed = time.time() - t0
+        hook_thread.join(30)
+        assert not hook_err, f"hook 重建异常: {hook_err}"
+        assert elapsed < 15, f"停机异常耗时: {elapsed:.1f}s"
+        err = capsys.readouterr().err
+        assert "not flushed" in err, f"停机收敛未诚实告警: {err!r}"
+        assert "next lazy-mount backfill" in err, f"告警未含自愈路径: {err!r}"
+        assert "for re-build" not in err, "停机上下文误打 'for re-build' 日志（误导）"
+        # hook 的收敛图：shutdown_sym 入图、pending_sym 未入图（extract 后编辑，诚实未 flush）
+        assert "shutdown_sym()" in _labels(root / "graphify-out"), "hook 未收敛出 shutdown_sym"
+        assert "pending_sym()" not in _labels(root / "graphify-out"), \
+            "前置：pending_sym 不应被本次停机 flush（否则测不到丢失窗口）"
+    finally:
+        watcher.stop()
+        _cleanup(root)
+    # 自愈（lighter E2E）：后续惰性挂载补齐重建当前语料 → pending_sym 被拾取入图
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    registry.mount(root, root / "graphify-out")
+    try:
+        assert _wait_for(lambda: "pending_sym()" in _labels(root / "graphify-out"), timeout=40), \
+            "后续惰性挂载补齐未拾取未 flush 的事件（自愈路径失效）"
+        assert "shutdown_sym()" in _labels(root / "graphify-out"), "自愈补齐丢了 shutdown_sym"
+    finally:
+        registry.stop_all()
+        _cleanup(root)

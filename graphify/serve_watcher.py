@@ -446,14 +446,16 @@ class ServeWatcher:
                         self._pending = False
                 if changed or deleted:  # 纯删除批次 changed==[] 也要 flush（铁律 1/2）
                     try:
-                        result = self._flush_batch(changed, deleted)
+                        # shutdown=True：final flush 的收敛跳过是停机态（线程即将退出），
+                        # 不静默 restore（Fix round 2——restore 批次在此上下文永不再 flush）。
+                        result = self._flush_batch(changed, deleted, shutdown=True)
                         for _ in range(_FINAL_FLUSH_LOCK_RETRIES):
                             if result is not _LOCK_BUSY:
                                 break
                             # 停机时锁忙：有界退避重试（铁律 2——stop() 返回前当前批次
                             # 必须落盘；hook 释放锁后重试即成功，最多 ~3s 额外停机延迟）。
                             time.sleep(_LOCK_BUSY_BACKOFF)
-                            result = self._flush_batch(changed, deleted)
+                            result = self._flush_batch(changed, deleted, shutdown=True)
                         if result is _LOCK_BUSY:
                             print(f"[graphify serve watcher] final flush skipped: "
                                   f"rebuild lock still busy after {_FINAL_FLUSH_LOCK_RETRIES} "
@@ -595,7 +597,8 @@ class ServeWatcher:
 
     # ── pipeline（触发链全链路）──────────────────────────────────────────────
 
-    def _flush_batch(self, changed: list[Path], deleted: list[Path]):
+    def _flush_batch(self, changed: list[Path], deleted: list[Path], *,
+                     shutdown: bool = False):
         """批次分类 + 内联串行 pipeline。返回 True=成功 / False=失败（退避重试）
         / _LOCK_BUSY=跨进程锁忙（restore + 退避，不计数不自杀）。
 
@@ -609,6 +612,13 @@ class ServeWatcher:
         restore 批次待退避重试），门闸在 finally 释放，不持闸等锁；重试时指纹命中
         （hook 已收敛）则跳过实际重建（不重复 build）。空批次（挂载补齐）写状态文件
         标记 rebuilding/complete（freshness 信封诚实标注）。
+
+        ``shutdown`` 标志区分收敛跳过的两种上下文（Fix round 2）：
+        - 运行态（循环存活，shutdown=False）：收敛 + 非空批次 → restore 待下轮重建
+          （FB2 封丢失窗口，下轮存在）；
+        - 停机态（final flush，shutdown=True）：线程即将退出，restore 的批次永不再
+          flush——诚实告警"not flushed"（含自愈路径），不静默 restore 也不跑全量
+          pipeline（保停机延迟有界）。
         """
         gate = self._gate
         semantic_refresh = [
@@ -628,11 +638,19 @@ class ServeWatcher:
             try:
                 if self._converged_while_waiting():
                     # hook 重建结果已收敛。空批次（纯补齐无并入编辑）：无事可丢，跳过
-                    # 实际重建。非空批次（真实编辑/删除）：hook 的全量重建可能未捕获
-                    # extract 之后到达的事件——restore 批次待下轮重建，封死丢失窗口
-                    # （评审 FB2；一次冗余重建是接受的代价，收敛参照一次性已消费无跳过
-                    # 循环）。
-                    if changed or deleted:
+                    # 实际重建。非空批次分两种上下文（Fix round 2）：
+                    #  - 运行态（循环存活，FB2）：hook 的全量重建可能未捕获 extract 之后
+                    #    到达的事件——restore 批次待下轮重建封死丢失窗口（一次冗余重建
+                    #    是接受的代价；收敛参照一次性已消费无跳过循环）；
+                    #  - 停机态（final flush，线程即将退出）：restore 的批次永不再 flush，
+                    #    "for re-build"日志会误导——诚实告警 not flushed + 自愈路径。
+                    if (changed or deleted) and shutdown:
+                        print(f"[graphify serve watcher] shutdown with {len(changed)} "
+                              f"changed / {len(deleted)} deleted event(s) not flushed — "
+                              f"hook rebuild converged while stopping; they will be picked "
+                              f"up by the next lazy-mount backfill, next edit, or next "
+                              f"hook rebuild", file=sys.stderr)
+                    elif changed or deleted:
                         self._restore_batch(changed, deleted)
                         print(f"[graphify serve watcher] hook converged during lock wait; "
                               f"restoring {len(changed)} changed / {len(deleted)} deleted "
