@@ -116,11 +116,13 @@ def _max_server_contexts() -> int:
 class _GraphContextCache:
     """Thread-safe graph contexts: one pinned default plus an LRU of projects."""
 
-    def __init__(self, max_contexts: int):
+    def __init__(self, max_contexts: int, on_evict: "callable | None" = None):
         self._max_contexts = max_contexts
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._pinned: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # 票 03：LRU 容量逐出回调（默认 None 零行为变化；仅容量 popitem 触发，invalidate 不触发）
+        self._on_evict = on_evict
 
     def _load_entry(self, resolved_path: str, key: tuple[int, int]) -> dict:
         """Build one entry for an already-resolved path and known file key.
@@ -153,6 +155,7 @@ class _GraphContextCache:
         ``pinned=True`` is reserved for the server's configured default graph;
         it remains warm without consuming a project-cache slot.
         """
+        evicted: list[str] = []
         with self._lock:
             try:
                 stat_result = Path(resolved_path).stat()
@@ -171,8 +174,13 @@ class _GraphContextCache:
             if not pinned:
                 self._entries.move_to_end(resolved_path)
                 while len(self._entries) > self._max_contexts:
-                    self._entries.popitem(last=False)
-            return entry["G"], entry["communities"]
+                    evicted_key, _ = self._entries.popitem(last=False)
+                    evicted.append(evicted_key)
+        # 票 03：on_evict 在缓存锁外执行（锁内调 stop→join 会与 pipeline 完成回调抢锁死锁）
+        for evicted_key in evicted:
+            if self._on_evict is not None:
+                self._on_evict(evicted_key)
+        return entry["G"], entry["communities"]
 
     def get(self, resolved_path: str) -> dict | None:
         """Return the cached entry dict for an already-loaded path, else None.
@@ -2839,6 +2847,7 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         _watcher = _registry.mount(
             serve_watcher.default_project_root(_default_graph_path),
             str(Path(_default_graph_path).parent),
+            pinned=True,  # 默认项目 watcher 不占 GRAPHIFY_MAX_WATCHERS 配额、永不被上限逐出
         )
     else:
         _registry = None

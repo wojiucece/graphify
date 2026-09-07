@@ -78,6 +78,35 @@ _VENDORED_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv", "bui
 _WATCH_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
 
 
+def _default_max_watchers() -> int:
+    """GRAPHIFY_MAX_WATCHERS 默认 = 生效的 ctx 上限（镜像 serve._max_server_contexts：
+    GRAPHIFY_MAX_CONTEXTS env 覆盖，默认 8，最小 1）。保证"每个缓存中的项目都可能有
+    watcher"是默认不变量（spec 生命周期与资源-上限）。"""
+    raw = os.environ.get("GRAPHIFY_MAX_CONTEXTS", "").strip()
+    if not raw:
+        return 8
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
+def _max_watchers_limit() -> int:
+    """GRAPHIFY_MAX_WATCHERS 解析：有效值用之；空/无效回退默认（跟随生效的 ctx 上限）。"""
+    raw = os.environ.get("GRAPHIFY_MAX_WATCHERS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return _default_max_watchers()
+
+
+def _graph_path_of(out_dir: str) -> str:
+    """out_dir → graph.json 绝对路径（registry 反向索引键，与查询侧解析链同源）。"""
+    return str((Path(out_dir) / "graph.json").resolve())
+
+
 if _FSHandler is not None:  # pragma: no cover - 依赖 watchdog 是否安装
     class _Handler(_FSHandler):
         """watchdog 事件 → _record（MovedEvent 拆 delete+create，铁律 1）。"""
@@ -668,32 +697,97 @@ class WatcherRegistry:
         self._poll_interval = DEFAULT_POLL_INTERVAL if poll_interval is None else poll_interval
         self._sem = semaphore if semaphore is not None else threading.Semaphore(1)
         self._watchers: OrderedDict[str, ServeWatcher] = OrderedDict()
+        # graph.json 绝对路径 → watcher（LRU 联动逐出的反向索引；evict_graph 用）。
+        self._by_graph: dict[str, ServeWatcher] = {}
+        # pinned 默认 watcher 的 root（不占 GRAPHIFY_MAX_WATCHERS 配额、永不被上限逐出）。
+        self._pinned_roots: set[str] = set()
         self._lock = threading.Lock()
+        self._max_watchers = _max_watchers_limit()
+        # 票 03：ctx 缓存 LRU 容量逐出 → 停对应 watcher。on_evict 仅容量 popitem 触发
+        # （invalidate() 不触发）；回调由缓存 load 在锁外调用——本注册表锁与缓存锁从不
+        # 嵌套持有（锁序约束，spec 明文）。构造顺序约束：serve 先建缓存后建本注册表，
+        # 故在此挂接而非缓存构造参数（构造参数 on_evict 默认 None 保留零行为变化）。
+        ctx_cache._on_evict = self.evict_graph
 
-    def mount(self, project_root, out_dir) -> ServeWatcher:
+    def mount(self, project_root, out_dir, *, pinned: bool = False) -> ServeWatcher:
         """幂等挂载：alive 跳过（仅 touch 使用序）；dead 直接替换为全新实例。
 
         (project_root, out_dir) 来自查询侧解析链（调用方保证），root 键 resolve
         归一。并发首查同项目时 ``_lock`` 双检查只挂一个（spec 并发首查幂等）。
+        ``pinned=True``（serve 启动时默认项目 eager mount 专用）：不占配额、永不被
+        上限逐出（spec 配额模型——否则逐出为腾位会停默认项目 watcher，违反单项目零回归）。
         """
         root = str(Path(project_root).resolve())
         out = str(Path(out_dir).resolve())
+        graph_path = _graph_path_of(out)
         with self._lock:
             existing = self._watchers.get(root)
             if existing is not None and existing.is_alive:
                 self._watchers.move_to_end(root)
                 return existing
             if existing is not None:
-                # dead watcher：直接替换为全新实例（不经逐出路径，逐出是票 03 配额机制）。
+                # dead watcher：直接替换为全新实例（不经逐出路径，逐出是配额机制）。
                 self._watchers.pop(root, None)
+                self._by_graph.pop(_graph_path_of(str(existing._out_dir)), None)
                 existing.stop()
             watcher = self._make_watcher(root, out)
             self._watchers[root] = watcher
+            self._by_graph[graph_path] = watcher
+            if pinned:
+                self._pinned_roots.add(root)
             watcher.start()
             print(f"[graphify serve] watching {watcher.project_root} "
                   f"({watcher.backend_name} backend); saves auto-rebuild the graph",
                   file=sys.stderr)
-            return watcher
+            victims = self._collect_cap_evictions()
+        # 上限逐出在注册表锁外 stop（join 期间 pipeline 完成回调不需要注册表锁，无锁环）。
+        for victim in victims:
+            victim.stop()
+        return watcher
+
+    def evict_graph(self, graph_path: str) -> None:
+        """LRU 联动逐出：ctx 缓存逐出某图 → 停掉对应 watcher 并从注册表移除。
+
+        由缓存 on_evict 回调调用（缓存锁外，见 _GraphContextCache.load）。stop 在注册表
+        锁外执行——join 期间 watcher 线程的 pipeline 完成回调（invalidate）不需要注册表锁，
+        且缓存锁此时已释放，无锁环。未挂载该图则 no-op（幂等）。"""
+        path = str(Path(graph_path).resolve())
+        with self._lock:
+            watcher = self._by_graph.pop(path, None)
+            if watcher is None:
+                return
+            self._watchers.pop(watcher.project_root, None)
+        watcher.stop()
+
+    def _collect_cap_evictions(self) -> list[ServeWatcher]:
+        """持 _lock 调用：非 pinned watcher 超 GRAPHIFY_MAX_WATCHERS → 逐出到配额内。
+
+        逐出序 = 使用序（OrderedDict 头 = 最近最少使用，mount/select 命中时 touch）；
+        dead watcher 优先于 alive 被清（腾位先扫死）。返回待停 watcher，调用方在锁外 stop。
+        """
+        limit = self._max_watchers
+        candidates = [(r, w) for r, w in self._watchers.items()
+                      if r not in self._pinned_roots]
+        over = len(candidates) - limit
+        if over <= 0:
+            return []
+        victims: list[tuple[str, ServeWatcher]] = []
+        for r, w in candidates:
+            if over == 0:
+                break
+            if not w.is_alive:
+                victims.append((r, w))
+                over -= 1
+        for r, w in candidates:
+            if over == 0:
+                break
+            if w.is_alive:
+                victims.append((r, w))
+                over -= 1
+        for r, w in victims:
+            self._watchers.pop(r, None)
+            self._by_graph.pop(_graph_path_of(str(w._out_dir)), None)
+        return [w for _, w in victims]
 
     def _make_watcher(self, root: str, out_dir: str) -> ServeWatcher:
         graph_path = str((Path(out_dir) / "graph.json").resolve())
@@ -733,6 +827,7 @@ class WatcherRegistry:
         with self._lock:
             watchers = list(self._watchers.values())
             self._watchers.clear()
+            self._by_graph.clear()
         for w in watchers:
             w.stop(join_timeout=join_timeout)
 
