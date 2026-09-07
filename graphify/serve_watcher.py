@@ -82,6 +82,8 @@ _VENDORED_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv", "bui
 _WATCH_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
 _LOCK_BUSY = object()         # 跨进程锁忙 sentinel（_flush_batch 返回；主循环 restore+退避）
 _LOCK_BUSY_BACKOFF = 1.0      # 锁忙退避（hook 分钟级重建窗口下 attempt 是廉价 stat+读状态，1s 足够）
+_FINAL_FLUSH_LOCK_RETRIES = 3  # 停机 final flush 锁忙有界重试（铁律 2：stop 前批次落盘；
+                               # 最多 ~3s 额外停机延迟，有界不放纵无界等待）
 
 
 def _default_max_watchers() -> int:
@@ -445,10 +447,18 @@ class ServeWatcher:
                 if changed or deleted:  # 纯删除批次 changed==[] 也要 flush（铁律 1/2）
                     try:
                         result = self._flush_batch(changed, deleted)
+                        for _ in range(_FINAL_FLUSH_LOCK_RETRIES):
+                            if result is not _LOCK_BUSY:
+                                break
+                            # 停机时锁忙：有界退避重试（铁律 2——stop() 返回前当前批次
+                            # 必须落盘；hook 释放锁后重试即成功，最多 ~3s 额外停机延迟）。
+                            time.sleep(_LOCK_BUSY_BACKOFF)
+                            result = self._flush_batch(changed, deleted)
                         if result is _LOCK_BUSY:
-                            # 停机时锁忙：restore（hook 持有锁并会收敛；线程即将退出，
-                            # 批次由 hook 的全量重建兜底，不丢事件语义）。
-                            self._restore_batch(changed, deleted)
+                            print(f"[graphify serve watcher] final flush skipped: "
+                                  f"rebuild lock still busy after {_FINAL_FLUSH_LOCK_RETRIES} "
+                                  f"retries ({len(changed)} changed, {len(deleted)} deleted "
+                                  f"pending; hook 全量重建兜底)", file=sys.stderr)
                     except Exception as exc:
                         print(f"[graphify serve watcher] final flush failed: {exc}",
                               file=sys.stderr)
@@ -617,7 +627,16 @@ class ServeWatcher:
                 return _LOCK_BUSY
             try:
                 if self._converged_while_waiting():
-                    # hook 重建结果已收敛：跳过实际重建（不重复 build），批次视为成功。
+                    # hook 重建结果已收敛。空批次（纯补齐无并入编辑）：无事可丢，跳过
+                    # 实际重建。非空批次（真实编辑/删除）：hook 的全量重建可能未捕获
+                    # extract 之后到达的事件——restore 批次待下轮重建，封死丢失窗口
+                    # （评审 FB2；一次冗余重建是接受的代价，收敛参照一次性已消费无跳过
+                    # 循环）。
+                    if changed or deleted:
+                        self._restore_batch(changed, deleted)
+                        print(f"[graphify serve watcher] hook converged during lock wait; "
+                              f"restoring {len(changed)} changed / {len(deleted)} deleted "
+                              f"for re-build (avoid dropping late edits)", file=sys.stderr)
                     return True
                 backfill = not changed and not deleted
                 if backfill:

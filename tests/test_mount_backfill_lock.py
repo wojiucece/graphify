@@ -286,7 +286,9 @@ def test_lock_busy_hook_holds_lock_watcher_restores(polling, tmp_path):
 # === 验收 5：收敛语义——hook 收敛后 watcher 重试指纹命中跳过重建 ===================
 
 def test_convergence_skips_redundant_build(polling, tmp_path):
-    """收敛语义：hook 重建结果收敛后 watcher 重试时指纹命中 → 跳过实际重建（不重复 build）。"""
+    """收敛语义：hook 重建结果收敛后 watcher 重试时指纹命中 → 空批次（纯补齐无并入
+    编辑）跳过实际重建（不重复 build）。非空批次的 restore 语义由
+    test_convergence_skip_restores_late_edit 覆盖（评审 FB2：防丢失，接受一次冗余重建）。"""
     import graphify.serve_watcher as W
     import rebuild_entry
     from fts_cache import fingerprint
@@ -305,42 +307,36 @@ def test_convergence_skips_redundant_build(polling, tmp_path):
         "schema": 2, "phase": "rebuilding", "started": time.time(),
         "project": str(root), "graph_fingerprint": list(fingerprint(root / "graphify-out" / "graph.json")),
     }), encoding="utf-8")
-    watcher = W.ServeWatcher(root, out_dir=root / "graphify-out",
-                             poll_interval=0.2, debounce=0.1)
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    w = registry.mount(root, root / "graphify-out")  # 惰性挂载 → 补齐入队（空批次）
     calls = {"n": 0}
-    real = watcher._run_pipeline
+    real = w._run_pipeline
 
     def rec(changed, deleted, sr):
         calls["n"] += 1
         return real(changed, deleted, sr)
-    watcher._run_pipeline = rec
+    w._run_pipeline = rec
     lock_busy_observed = threading.Event()
-    real_flush = watcher._flush_batch
+    real_flush = w._flush_batch
 
     def rec_flush(*a, **k):
         r = real_flush(*a, **k)
         if r is W._LOCK_BUSY:
             lock_busy_observed.set()
         return r
-    watcher._flush_batch = rec_flush
-    watcher.start()
+    w._flush_batch = rec_flush
     try:
-        time.sleep(0.6)  # 基线
-        (root / "a.py").write_text(
-            "import b\n\ndef foo():\n    return b.bar()\n\ndef converge_sym():\n    return 11\n"
-            "\ndef edit_after():\n    return 13\n",
-            encoding="utf-8")
+        # 补齐 flush 在 hook 持锁窗口内锁忙（记录参照 f1）
         assert lock_busy_observed.wait(15), "watcher 未观察到锁忙"
-        # hook 收敛：释放锁 + 真实 rebuild_entry 全量重建（graph 现含 converge_sym + edit_after）
+        # hook 收敛：释放锁 + 真实 rebuild_entry 全量重建（graph 现含 converge_sym）
         _cleanup(root)
         rebuild_entry.rebuild(root)
         assert "converge_sym()" in _labels(root / "graphify-out"), "hook 未收敛出新语料"
-        assert "edit_after()" in _labels(root / "graphify-out"), "hook 收敛后编辑未入图"
-        # watcher 重试：指纹命中（当前 ≠ hook 重建前参照）→ 跳过实际重建（不重复 build）
+        # watcher 重试：指纹命中（当前 ≠ 参照 f1）→ 空批次跳过实际重建（不重复 build）
         time.sleep(2.5)  # 跨过锁忙退避重试窗口（backoff 1.0s），让重试完成跳过判定
-        assert calls["n"] == 0, f"watcher 重复 build（收敛未跳过）: {calls}"
+        assert calls["n"] == 0, f"空批次（纯补齐）收敛后重复 build: {calls}"
     finally:
-        watcher.stop()
+        registry.stop_all()
         _cleanup(root)
 
 
@@ -420,4 +416,135 @@ def test_backfill_merges_immediate_edit(polling, tmp_path):
         assert calls["n"] == 1, f"补齐与编辑双跑（未并批）: {calls}"
     finally:
         registry.stop_all()
+        _cleanup(root)
+
+
+# === 评审 FB2：收敛跳过不得丢弃 extract 之后到达的编辑（restore 待下轮重建）===========
+
+def test_convergence_skip_restores_late_edit(polling, monkeypatch, tmp_path):
+    """评审 FB2 数据丢失窗口：编辑落在 hook 的 extract 完成之后、锁仍持有时——收敛跳过
+    必须 restore 批次待下轮重建（不得静默丢弃），late 编辑最终入图。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)  # 基线 v1
+    # 弄陈旧：改语料不重建（early_sym 是 hook 会看到的编辑）
+    (root / "a.py").write_text(
+        "import b\n\ndef foo():\n    return b.bar()\n\ndef early_sym():\n    return 21\n",
+        encoding="utf-8")
+    assert "early_sym()" not in _labels(root / "graphify-out"), "前置：图未含新语料"
+    # 让 hook 的 extract 完成后持锁留窗（模拟 FTS/analysis 窗口），并通告 extract 完成
+    extract_done = threading.Event()
+    real_extract = rebuild_entry._extract_with_retry
+
+    def slow_extract(proj_root):
+        result = real_extract(proj_root)
+        if not extract_done.is_set():
+            extract_done.set()
+            time.sleep(1.2)  # 持锁留窗——让 watcher 在此窗口内锁忙（编辑已到但 hook 未捕获）
+        return result
+    monkeypatch.setattr(rebuild_entry, "_extract_with_retry", slow_extract)
+    watcher = W.ServeWatcher(root, out_dir=root / "graphify-out",
+                             poll_interval=0.2, debounce=0.1)
+    calls = {"n": 0}
+    real = watcher._run_pipeline
+
+    def rec(changed, deleted, sr):
+        calls["n"] += 1
+        return real(changed, deleted, sr)
+    watcher._run_pipeline = rec
+    lock_busy_observed = threading.Event()
+    real_flush = watcher._flush_batch
+
+    def rec_flush(*a, **k):
+        r = real_flush(*a, **k)
+        if r is W._LOCK_BUSY:
+            lock_busy_observed.set()
+        return r
+    watcher._flush_batch = rec_flush
+    hook_err = {}
+
+    def run_hook():
+        try:
+            rebuild_entry.rebuild(root)
+        except BaseException as exc:  # 线程内捕获，主线程断言
+            hook_err["exc"] = exc
+    watcher.start()
+    hook_thread = threading.Thread(target=run_hook, daemon=True)
+    try:
+        time.sleep(0.6)  # watcher 基线
+        hook_thread.start()
+        # 等 hook 的 extract 完成（此后到达的编辑 hook 捕获不到）
+        assert extract_done.wait(20), "hook extract 未完成"
+        # 编辑落在 extract 之后：hook 的图不含 late_sym，watcher 批次含之
+        (root / "a.py").write_text(
+            "import b\n\ndef foo():\n    return b.bar()\n\ndef early_sym():\n    return 21\n"
+            "\ndef late_sym():\n    return 33\n",
+            encoding="utf-8")
+        # watcher 首次 flush 在 hook 持锁窗口内锁忙（记录收敛参照 f1）
+        assert lock_busy_observed.wait(15), "watcher 未观察到锁忙"
+        # hook 完成：graph 反映 early_sym 但 NOT late_sym（extract 已错过）
+        hook_thread.join(30)
+        assert not hook_thread.is_alive(), "hook 重建线程未退出"
+        assert not hook_err, f"hook 重建异常: {hook_err}"
+        assert "early_sym()" in _labels(root / "graphify-out"), "hook 未捕获 early_sym"
+        assert "late_sym()" not in _labels(root / "graphify-out"), \
+            "前置：hook 图不应含 extract 后编辑（否则测不到丢失窗口）"
+        # watcher 重试：指纹命中 → 收敛跳过，但批次非空 → FB2 restore 待下轮重建
+        # late_sym 最终入图（不得被静默丢弃）
+        assert _wait_for(lambda: "late_sym()" in _labels(root / "graphify-out"), timeout=40), \
+            "收敛跳过静默丢弃了 extract 后到达的编辑（FB2 丢失窗口未封死）"
+        assert calls["n"] >= 1, "收敛跳过后未重建批次（late 编辑未落地）"
+    finally:
+        watcher.stop()
+        _cleanup(root)
+
+
+# === 评审 FB3：停机 final flush 锁忙有界重试（铁律 2——stop 返回前批次落盘）===========
+
+def test_final_flush_retries_lock_busy(polling, tmp_path):
+    """评审 FB3：hook 持锁期间 stop() 带 pending 批次 → final flush 锁忙后
+    有界重试；hook 释放锁后重试成功，graph.json 反映 pending 批次（铁律 2 断言恢复）。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    assert rl._acquire_lock(root) is True, "测试前置：hook 未持到锁"
+    watcher = W.ServeWatcher(root, out_dir=root / "graphify-out",
+                             poll_interval=0.2, debounce=10.0)  # 长防抖：编辑进 pending 不 flush
+    lock_busy_observed = threading.Event()
+    real_flush = watcher._flush_batch
+
+    def rec_flush(*a, **k):
+        r = real_flush(*a, **k)
+        if r is W._LOCK_BUSY:
+            lock_busy_observed.set()
+        return r
+    watcher._flush_batch = rec_flush
+    watcher.start()
+    try:
+        time.sleep(0.6)  # 基线
+        (root / "a.py").write_text(
+            "import b\n\ndef foo():\n    return b.bar()\n\ndef final_flush_sym():\n    return 7\n",
+            encoding="utf-8")
+        time.sleep(0.5)  # 编辑进 pending（防抖未到，主循环不 flush）
+        # 辅助线程：final flush 观察到锁忙后释放 hook 锁（stop() 阻塞期间操作）
+        release_done = threading.Event()
+
+        def release_hook():
+            lock_busy_observed.wait(20)
+            _cleanup(root)  # 释放 hook 锁 → final flush 重试成功
+            release_done.set()
+        release_thread = threading.Thread(target=release_hook, daemon=True)
+        release_thread.start()
+        t0 = time.time()
+        watcher.stop()  # 阻塞直至 final flush 完成（锁释放后重试成功）
+        elapsed = time.time() - t0
+        release_thread.join(20)
+        assert release_done.is_set(), "hook 锁释放线程未完成"
+        assert elapsed < 15, f"final flush 停机耗时异常: {elapsed:.1f}s"
+        assert "final_flush_sym()" in _labels(root / "graphify-out"), \
+            "final flush 未落地 pending 批次（铁律 2 破坏）"
+    finally:
+        watcher.stop()
         _cleanup(root)
