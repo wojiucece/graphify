@@ -1,8 +1,10 @@
 """单一重建入口：extract(增量) → build → to_json(事实层落盘) → rebuild_fts(FTS 重投影) → 分析。
 
 三个触发面（watch.py 代码事件 / SessionEnd hook / PreCompact hook）都改指本入口。
-跨进程互斥用 mkdir 原子锁；完成信号用状态文件（schema v2，graph_fingerprint =
-graph.json (mtime_ns, size) 指纹，旧 db_fingerprint 的事实层等价物）。
+跨进程互斥用 mkdir 原子锁（锁原语已提升至 graphify/rebuild_lock.py——per-project-watcher
+01 票单一事实源；本文件只保留 acquire/释放壳与 exit 3 契约）；完成信号用状态文件
+（schema v2，graph_fingerprint = graph.json (mtime_ns, size) 指纹，旧 db_fingerprint
+的事实层等价物）。
 
 Task 09 换源（spec §工具面迁移 scripts 重组）：codegraph sync 退役——输入源从 codegraph DB
 换成源码语料（extract 增量经 per-file cache，重跑廉价），产物对 = graph.json（事实层）+
@@ -12,13 +14,16 @@ Task 09 换源（spec §工具面迁移 scripts 重组）：codegraph sync 退�
 last_duration/git_head 共字段，平滑兼容（不依赖 schema 号）。
 """
 from __future__ import annotations
-import argparse, json, os, subprocess, sys, tempfile, time
+import argparse, json, os, subprocess, sys, time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:            # import graphify（本地包，不依赖安装态）
     sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # import fts_cache / run_analysis
+
+# 锁原语单一事实源（per-project-watcher 01 票提升，算法本体在 graphify/rebuild_lock.py）
+from graphify.rebuild_lock import _LOCK_STALE_S, _acquire_lock, _lock_path
 
 # 退出码空间（评审 Minor）：EXIT_SYNC_FAIL=4 已随 codegraph sync 退役而无引用——保留
 # 常量作退出码契约文档（hook/调用方不应复用 4 作其他语义），勿误删。
@@ -29,46 +34,6 @@ _STATE_SCHEMA = 2                                  # 状态文件 schema v2（gr
 
 def _log(msg: str) -> None:
     print(f"[rebuild_entry] {msg}", file=sys.stderr)
-
-
-def _lock_path(root: Path) -> Path:
-    """确定性锁名：路径消毒（tr '/\\:' '___' 语义，沿用 sessionend hook 模式）.
-    禁用 hash()：Python 3.3+ 字符串 hash 按 PYTHONHASHSEED 进程随机化，
-    跨进程同 root 算出不同值 -> 锁路径不同 -> 互斥失效。"""
-    import re
-    safe = re.sub(r'[/\\:]', '_', str(root))
-    return Path(tempfile.gettempdir()) / f"graphify-rebuild-{safe}.lock"
-
-
-# E: 锁 stale 阈值。hook 面同步执行 rebuild_entry（分钟级窗口），
-# 若进程被强杀 finally 不执行 -> 锁残留 -> 后续三触发面全 exit 3。
-# 遇锁时检查年龄超此阈值即接管（清理重建）。
-_LOCK_STALE_S = 600  # 10 分钟
-
-
-def _acquire_lock(root: Path) -> bool:
-    """获取 mkdir 原子锁；遇已存在锁时检查年龄，超阈值则接管。返回是否获取。"""
-    lock = _lock_path(root)
-    try:
-        lock.mkdir(parents=True, exist_ok=False)
-        (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
-        return True
-    except FileExistsError:
-        # 检查锁年龄
-        try:
-            age = time.time() - (lock / "pid").stat().st_mtime
-        except OSError:
-            age = time.time() - lock.stat().st_mtime
-        if age > _LOCK_STALE_S:
-            _log(f"锁残留 {age:.0f}s（>{_LOCK_STALE_S}s），接管清理")
-            import shutil; shutil.rmtree(lock, ignore_errors=True)
-            try:
-                lock.mkdir(parents=True, exist_ok=False)
-                (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
-                return True
-            except FileExistsError:
-                return False
-        return False
 
 
 def _state_path(root: Path) -> Path:
