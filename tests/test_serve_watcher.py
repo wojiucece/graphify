@@ -576,12 +576,11 @@ def test_graph_context_cache_invalidate_atomic_swap(tmp_path):
     assert G_hit is G1, "未变化的图应命中缓存"
 
 
-def test_mount_watcher_on_complete_invalidates_cache(tmp_path):
-    """mount_watcher 的 on_pipeline_complete 回调 = _GraphContextCache.invalidate。"""
+def test_registry_on_complete_invalidates_cache(tmp_path):
+    """registry.mount 的 on_pipeline_complete 回调 = _GraphContextCache.invalidate
+    （mount_watcher 退役后，registry.mount 是唯一挂载入口——回调契约平移）。"""
     import graphify.serve_watcher as W
     root = _mini_proj(tmp_path)
-    import rebuild_entry
-    rebuild_entry.rebuild(root)
 
     class FakeCache:
         def __init__(self):
@@ -591,31 +590,41 @@ def test_mount_watcher_on_complete_invalidates_cache(tmp_path):
             self.invalidated.append(path)
 
     fake = FakeCache()
-    watcher = W.mount_watcher(str(root / "graphify-out" / "graph.json"), fake, watch=True)
-    assert watcher is not None
+    registry = W.WatcherRegistry(fake, poll_interval=0.2)
+    watcher = registry.mount(root, root / "graphify-out")
     try:
         watcher._on_complete()
         assert fake.invalidated == [str((root / "graphify-out" / "graph.json").resolve())]
     finally:
-        watcher.stop()
+        registry.stop_all()
 
 
-def test_mount_watcher_disabled_returns_none(tmp_path, monkeypatch):
-    """未开启（watch=None + 无 env）→ mount_watcher 返回 None（零副作用）。"""
-    import graphify.serve_watcher as W
+def test_watch_off_returns_no_registry(tmp_path, monkeypatch):
+    """未开启（watch=None + 无 env）→ _build_server 不建 watcher 注册表（零副作用）。"""
+    import graphify.serve as S
+    import rebuild_entry
     monkeypatch.delenv("GRAPHIFY_WATCH", raising=False)
-    assert W.mount_watcher(str(tmp_path / "graphify-out" / "graph.json"), object()) is None
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    server = S._build_server(str(root / "graphify-out" / "graph.json"))
+    assert getattr(server, "_graphify_registry", None) is None
+    assert getattr(server, "_graphify_watcher", None) is None
 
 
-def test_mount_watcher_env_enables(tmp_path, monkeypatch):
-    """env GRAPHIFY_WATCH=1 → mount_watcher 开启。"""
-    import graphify.serve_watcher as W
+def test_watch_env_enables_registry(tmp_path, monkeypatch):
+    """env GRAPHIFY_WATCH=1 → _build_server 建 watcher 注册表并 eager mount 默认项目。"""
+    import graphify.serve as S
+    import rebuild_entry
     monkeypatch.setenv("GRAPHIFY_WATCH", "1")
-    watcher = W.mount_watcher(str(tmp_path / "graphify-out" / "graph.json"), object())
-    assert watcher is not None
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    server = S._build_server(str(root / "graphify-out" / "graph.json"))
+    registry = getattr(server, "_graphify_registry", None)
     try:
-        watcher.stop()
+        assert registry is not None, "GRAPHIFY_WATCH=1 未建注册表"
+        assert registry.get(root) is not None, "默认项目未 eager mount"
     finally:
+        registry.stop_all()
         monkeypatch.delenv("GRAPHIFY_WATCH", raising=False)
 
 

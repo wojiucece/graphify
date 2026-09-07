@@ -3068,8 +3068,9 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
             f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
             f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
         # CUSTOM: N1 found=图非空（stats 反映图现状，空图即 absent+empty_graph），
-        # scanned=全图节点数（扫描语义表）。
-        ), G.number_of_nodes() > 0, G.number_of_nodes()
+        # scanned=全图节点数（扫描语义表）。5 元组末元 extra_meta 并入 _meta——graph_stats
+        # 喂点（票 05）：watched_projects 数组（project_root+backend+status）恒存在、空为 []。
+        ), G.number_of_nodes() > 0, G.number_of_nodes(), None, {"watched_projects": _registry.status_summary() if _registry else []}
 
     def _tool_shortest_path(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         # _shortest_path_text 保持 -> str（tests/test_serve.py 直接 import 测它，签名不可动）；

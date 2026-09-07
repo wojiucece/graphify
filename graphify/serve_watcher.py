@@ -79,7 +79,6 @@ DEFAULT_POLL_INTERVAL = 5.0   # 降级轮询间隔（架构票 04 陷阱 2：5s 
 _LOOP_SLEEP = 0.5             # observer 模式下主循环轮询间隔（对齐 watch.py main loop）
 _JOIN_TIMEOUT = 60.0          # stop() join 上限（阻塞等待当前批次；异常情况不永久卡死）
 _VENDORED_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv", "build", "dist", "dist-newstyle"})
-_WATCH_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
 _LOCK_BUSY = object()         # 跨进程锁忙 sentinel（_flush_batch 返回；主循环 restore+退避）
 _LOCK_BUSY_BACKOFF = 1.0      # 锁忙退避（hook 分钟级重建窗口下 attempt 是廉价 stat+读状态，1s 足够）
 _FINAL_FLUSH_LOCK_RETRIES = 3  # 停机 final flush 锁忙有界重试（铁律 2：stop 前批次落盘；
@@ -186,6 +185,13 @@ class ServeWatcher:
         # 一次性——重试时当前指纹 ≠ 参照 → hook 已收敛，跳过实际重建；= 参照 → 正常重建。
         self._waiting_fingerprint: "tuple[int, int] | None" = None
         self._state_started = 0.0  # 挂载补齐（backfill）重建的 started 时间锚（状态文件 schema v2）
+        # 票 05：挂载补齐周期标志——enqueue 置位、flush 消费。backfill 判定用此标志而非
+        # 空批次检测（merged batch 补齐+立即编辑非空也标注 rebuilding，freshness 诚实）。
+        self._backfill_cycle = False
+        # 票 05：全局信号量持有标记（stop_all 停机 join 优先序判定；pipeline 内 set/clear）。
+        self._holding_gate = False
+        # 票 05：跨进程锁忙 stderr 日志节流（每段锁忙只打一条，防 1s 重试刷屏）。
+        self._lock_busy_logged = False
         # 降级轮询基线：None = 尚未建立（首次扫描只建基线，不产出 diff）。
         self._prev_snapshot: dict[str, tuple[int, int]] | None = None
 
@@ -237,27 +243,51 @@ class ServeWatcher:
         批次（不丢事件）。graph.json 全程原子替换，stop() 返回时事实层文件必然完整。
         """
         if not self._running:
-            # 自禁用（auto-sync disabled）的 watcher 线程已在 finally 清 _running——此时
-            # stop() 也要注销 atexit handler：否则 dead watcher 被逐出/替换时 stop() 在此
-            # 早退，其 handler 残留，mount → self-disable → evict → remount 循环仍会无界累积。
+            # 自禁用（auto-sync disabled）的 watcher 线程已在 finally 清 _running——但
+            # watchdog observer 线程可能仍存活（自禁用路径不碰 observer）。统一咽喉：
+            # 所有"线程死了但 observer 可能活着"的路径都走这里停/join observer（修复
+            # observer 泄漏；否则 stop() 早退后 observer 线程悬挂至进程退出）。
+            # 同时注销 atexit handler：否则 dead watcher 被逐出/替换时 handler 残留，
+            # mount → self-disable → evict → remount 循环仍会无界累积。
+            self._stop_observer(join_timeout)
             self._unregister_atexit()
             return
+        self._signal_stop()
+        self._join_and_finish(join_timeout=join_timeout)
+
+    def _signal_stop(self) -> None:
+        """发停止信号（不阻塞）：置停止事件 + 停 observer（事件源先停——主循环退出后
+        不再收新事件）。stop() 与 stop_all() 的信号阶段共用。"""
         self._stop.set()
         if self._observer is not None:
             try:
                 self._observer.stop()
             except Exception:
                 pass
+
+    def _stop_observer(self, join_timeout: "float | None" = None) -> None:
+        """停/join watchdog observer（幂等；observer 未启动/已停则 no-op）。"""
+        if self._observer is not None:
+            try:
+                self._observer.stop()
+            except Exception:
+                pass
+            try:
+                self._observer.join(timeout=join_timeout or _JOIN_TIMEOUT)
+            except Exception:
+                pass
+
+    def _join_and_finish(self, *, join_timeout: float | None = None) -> None:
+        """阻塞等待主循环线程退出 + join observer + 复位状态/注销 atexit。
+
+        stop() 与 stop_all() 的 join 阶段共用；join 超时后 daemon 线程放任（不永久卡死）。
+        """
         if self._thread is not None:
             self._thread.join(timeout=join_timeout or _JOIN_TIMEOUT)
             if self._thread.is_alive():
                 logger.warning("serve watcher thread still alive after %.0fs join (daemon thread)",
                                join_timeout or _JOIN_TIMEOUT)
-        if self._observer is not None:
-            try:
-                self._observer.join(timeout=join_timeout or _JOIN_TIMEOUT)
-            except Exception:
-                pass
+        self._stop_observer(join_timeout)
         self._running = False
         self._unregister_atexit()
 
@@ -490,12 +520,18 @@ class ServeWatcher:
         同批次（不双跑），主循环防抖到期后 _take_batch → _flush_batch 全量重建
         （空 changed/deleted 批次 = 全量收敛到当前语料，补齐覆盖挂载前的历史陈旧）。
         已存在 pending 批次（事件先到）则合并即可，不重复置位（幂等）。
+
+        票 05：周期标志先置位——merged batch（补齐 + 立即编辑）非空也标注 rebuilding
+        （旧空批次检测 `not changed and not deleted` 在合并批次下丢 freshness 标注）。
         """
         with self._lock:
+            self._backfill_cycle = True
             if self._pending:
                 return
             self._pending = True
             self._last_trigger = time.monotonic()
+        print(f"[graphify serve watcher] backfill enqueued for {self._root} "
+              f"(lazy-mount cycle; full rebuild queued)", file=sys.stderr)
 
     # ── 跨进程互斥（票 04：rebuild_lock 消费，watcher↔hook 互斥）─────────────────
 
@@ -610,8 +646,9 @@ class ServeWatcher:
         跨进程互斥（票 04）：pipeline 全程持有 rebuild_lock（mkdir 原子锁，与 hook
         面 rebuild_entry 互斥）。短尝试语义——拿不到锁立即返回 _LOCK_BUSY（主循环
         restore 批次待退避重试），门闸在 finally 释放，不持闸等锁；重试时指纹命中
-        （hook 已收敛）则跳过实际重建（不重复 build）。空批次（挂载补齐）写状态文件
-        标记 rebuilding/complete（freshness 信封诚实标注）。
+        （hook 已收敛）则跳过实际重建（不重复 build）。挂载补齐（票 05：周期标志
+        _backfill_cycle，含 merged batch 非空也标注）写状态文件标记 rebuilding/complete
+        （freshness 信封诚实标注）。
 
         ``shutdown`` 标志区分收敛跳过的两种上下文（Fix round 2）：
         - 运行态（循环存活，shutdown=False）：收敛 + 非空批次 → restore 待下轮重建
@@ -625,16 +662,25 @@ class ServeWatcher:
             p for p in changed
             if p.suffix.lower() in _SEMANTIC_DOC_SUFFIXES and p.exists()
         ]
+        # 票 05：周期标志在锁忙早退前捕获（不消费）——重试时 merged batch 仍标注 rebuilding。
+        backfill = self._backfill_cycle
         if gate is not None:
             gate.acquire()
+            self._holding_gate = True
         try:
             if not self._acquire_rebuild_lock():
                 # 锁忙：记录收敛参照（hook 重建前的状态文件 graph_fingerprint），
                 # restore + 退避由主循环统一做；门闸在 finally 释放，不持闸等锁。
-                logger.debug("rebuild lock busy on %s (stale takeover threshold %ss)",
-                             self._root, _LOCK_STALE_S)
+                # 每段锁忙只打一条 stderr 日志（1s 重试期间防刷屏）。
+                if not self._lock_busy_logged:
+                    self._lock_busy_logged = True
+                    print(f"[graphify serve watcher] rebuild lock busy on {self._root} "
+                          f"(stale takeover threshold {_LOCK_STALE_S}s); will retry",
+                          file=sys.stderr)
                 self._capture_waiting_fingerprint()
                 return _LOCK_BUSY
+            self._lock_busy_logged = False  # 锁成功：复位（下轮锁忙再打一条）
+            self._backfill_cycle = False  # 票 05：消费周期标志（已承诺执行/跳过本批次）
             try:
                 if self._converged_while_waiting():
                     # hook 重建结果已收敛。空批次（纯补齐无并入编辑）：无事可丢，跳过
@@ -656,7 +702,7 @@ class ServeWatcher:
                               f"restoring {len(changed)} changed / {len(deleted)} deleted "
                               f"for re-build (avoid dropping late edits)", file=sys.stderr)
                     return True
-                backfill = not changed and not deleted
+                # 票 05：backfill 判定用周期标志（merged batch 非空也标注 rebuilding）。
                 if backfill:
                     self._begin_state()
                 try:
@@ -678,6 +724,7 @@ class ServeWatcher:
                 self._release_rebuild_lock()
         finally:
             if gate is not None:
+                self._holding_gate = False
                 gate.release()
 
     def _run_pipeline(
@@ -917,6 +964,9 @@ class WatcherRegistry:
         self._pinned_roots: set[str] = set()
         self._lock = threading.Lock()
         self._max_watchers = _max_watchers_limit()
+        # 票 05：停机已开始标记（stop_all 置位）。并发挂载竞态不变式："被 stop_all 停
+        # 或由 atexit 覆盖"，两者必居其一——新挂载 watcher 由 start() 注册的 atexit 兜底。
+        self._stopped = False
         # 票 03：ctx 缓存 LRU 容量逐出 → 停对应 watcher。on_evict 仅容量 popitem 触发
         # （invalidate() 不触发）；回调由缓存 load 在锁外调用——本注册表锁与缓存锁从不
         # 嵌套持有（锁序约束，spec 明文）。构造顺序约束：serve 先建缓存后建本注册表，
@@ -949,6 +999,8 @@ class WatcherRegistry:
                 self._watchers.pop(root, None)
                 self._by_graph.pop(_graph_path_of(str(existing._out_dir)), None)
                 existing.stop()
+                print(f"[graphify serve] replaced dead watcher for {root}; "
+                      f"remounting fresh instance (backfill re-enqueued)", file=sys.stderr)
             watcher = self._make_watcher(root, out)
             self._watchers[root] = watcher
             self._by_graph[graph_path] = watcher
@@ -969,6 +1021,9 @@ class WatcherRegistry:
             victims = self._collect_cap_evictions()
         # 上限逐出在注册表锁外 stop（join 期间 pipeline 完成回调不需要注册表锁，无锁环）。
         for victim in victims:
+            print(f"[graphify serve] cap eviction: stopped {victim.project_root} "
+                  f"over GRAPHIFY_MAX_WATCHERS={self._max_watchers} "
+                  f"(LRU order, dead-first)", file=sys.stderr)
             victim.stop()
         return watcher
 
@@ -984,6 +1039,8 @@ class WatcherRegistry:
             if watcher is None:
                 return
             self._watchers.pop(watcher.project_root, None)
+        print(f"[graphify serve] evicted watcher for {watcher.project_root} "
+              f"(LRU cache eviction); stopping", file=sys.stderr)
         watcher.stop()
 
     def _collect_cap_evictions(self) -> list[ServeWatcher]:
@@ -1047,40 +1104,39 @@ class WatcherRegistry:
             ]
 
     def stop_all(self, *, join_timeout: "float | None" = None) -> None:
-        """停机：全部 watcher 依序 stop（final flush 落盘，不丢事件）。
+        """停机：先向全部 watcher 发停止信号，再依序 join（信号量持有者优先）。
 
-        按信号量持有序串行停机优化留票 04（三挂点调用形态零改动）。
+        铁律 2（stop 前批次落盘）：final flush 在 watcher 自身线程执行且需抢全局信号量。
+        若逆序串行 stop，非持有者 join 时其 final flush 等闸（被持有者占用），与进程退出
+        赛跑丢 pending。故先向全部发停止信号（各 watcher 并行退出循环、各自 final flush，
+        不阻塞），再依序 join——信号量持有者（mid-build，最可能是默认项目）优先 join，
+        其管线完成释放闸，后续 join 不堵闸；每个沿用现有 join timeout，总预算 = 信号量
+        排队深度 × join_timeout（有界）。
+
+        stop_all 与并发挂载竞态（票 02 评审）：stop_all 开始后新挂载的 watcher 不在本
+        快照内，但 start() 已注册 atexit handler 兜底（进程退出时 stop 它）——不变式
+        "被 stop_all 停 或 由 atexit 覆盖"两者必居其一；_stopped 标记记录停机已开始
+        （测试/排障可查，挂载行为不变）。
         """
         with self._lock:
             watchers = list(self._watchers.values())
             self._watchers.clear()
             self._by_graph.clear()
+            self._stopped = True
+        # 先向全部发停止信号（不 join）：并行退出循环 + 各自 final flush
         for w in watchers:
-            w.stop(join_timeout=join_timeout)
+            w._signal_stop()
+        # 依序 join：信号量持有者优先（mid-build 的先 join）
+        for w in self._shutdown_order(watchers):
+            w._join_and_finish(join_timeout=join_timeout)
 
+    def _shutdown_order(self, watchers: list[ServeWatcher]) -> list[ServeWatcher]:
+        """停机 join 序：信号量持有者优先（best-effort 快照）。
 
-def mount_watcher(graph_path, ctx_cache, *, watch: "bool | None" = None,
-                  project_root: "str | Path | None" = None) -> "ServeWatcher | None":
-    """serve 挂载点（单项目兼容入口）：读开关 + 构建 + 启动 watcher。
-
-    graph_path：默认 graph.json 的解析路径；ctx_cache：serve 侧 _GraphContextCache
-    实例（pipeline 完成回调直通失效，原子换图）。project_root 显式传入则优先（查询
-    侧解析链同源，不再反推）；缺省回退 default_project_root() 的布局推导（Task 10
-    既有调用形态零回归）。未开启时返回 None（零副作用）。
-    """
-    if watch is None:
-        watch = os.environ.get("GRAPHIFY_WATCH", "").strip().lower() in _WATCH_ENV_TRUE
-    if not watch:
-        return None
-    resolved = Path(graph_path).resolve()
-    root = str(Path(project_root).resolve()) if project_root is not None else default_project_root(graph_path)
-    watcher = ServeWatcher(
-        project_root=root,
-        out_dir=str(resolved.parent),
-        on_pipeline_complete=lambda: ctx_cache.invalidate(str(resolved)),
-    )
-    watcher.start()
-    print(f"[graphify serve] watching {watcher.project_root} "
-          f"({watcher.backend_name} backend); saves auto-rebuild the graph",
-          file=sys.stderr)
-    return watcher
+        持有者（_holding_gate=True）mid-build 管线完成时释放全局闸——先 join 它则其他
+        watcher 的 final flush 不堵闸不丢 pending。快照可能滞后（持有者已释放），但
+        优先序是启发式不是正确性依赖：闸空闲时任意序都正确，闸被占时此序保证先释放。
+        """
+        holder = [w for w in watchers if w._holding_gate]
+        rest = [w for w in watchers if not w._holding_gate]
+        return holder + rest
