@@ -40,6 +40,10 @@ from pathlib import Path
 
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from graphify.paths import GRAPHIFY_OUT_NAME as _GRAPHIFY_OUT_NAME
+# 跨进程互斥原语（票 01 提升，单一事实源）：watcher 重建管线与 hook 面 rebuild_entry
+# 共用 mkdir 原子锁。仅消费三符号；stale 阈值沿用 600s。与 watch.py:220 的 flock 是
+# 两套机制（flock 管 CLI 进程内 watch 循环，本锁管跨进程重建互斥），语义不同勿混淆。
+from graphify.rebuild_lock import _LOCK_STALE_S, _acquire_lock, _lock_path
 
 # 防抖/退避常量复用 watch.py 已移植的 codegraph 算法（架构票 04 决策点定案：
 # 直接 import，不抽公共模块——同包私有常量，零成本零漂移；抽模块要动 watch.py 本体，
@@ -76,6 +80,8 @@ _LOOP_SLEEP = 0.5             # observer 模式下主循环轮询间隔（对齐
 _JOIN_TIMEOUT = 60.0          # stop() join 上限（阻塞等待当前批次；异常情况不永久卡死）
 _VENDORED_DIRS = frozenset({"node_modules", "__pycache__", ".venv", "venv", "build", "dist", "dist-newstyle"})
 _WATCH_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_LOCK_BUSY = object()         # 跨进程锁忙 sentinel（_flush_batch 返回；主循环 restore+退避）
+_LOCK_BUSY_BACKOFF = 1.0      # 锁忙退避（hook 分钟级重建窗口下 attempt 是廉价 stat+读状态，1s 足够）
 
 
 def _default_max_watchers() -> int:
@@ -174,6 +180,10 @@ class ServeWatcher:
         self._deleted: set[Path] = set()
         self._pending = False
         self._last_trigger = 0.0
+        # 票 04 跨进程互斥：锁忙时记录的收敛参照（hook 重建前的 graph_fingerprint）。
+        # 一次性——重试时当前指纹 ≠ 参照 → hook 已收敛，跳过实际重建；= 参照 → 正常重建。
+        self._waiting_fingerprint: "tuple[int, int] | None" = None
+        self._state_started = 0.0  # 挂载补齐（backfill）重建的 started 时间锚（状态文件 schema v2）
         # 降级轮询基线：None = 尚未建立（首次扫描只建基线，不产出 diff）。
         self._prev_snapshot: dict[str, tuple[int, int]] | None = None
 
@@ -395,7 +405,14 @@ class ServeWatcher:
                 if (now - last_trigger) < effective_debounce:
                     continue
                 changed, deleted = self._take_batch()
-                ok = self._flush_batch(changed, deleted)
+                result = self._flush_batch(changed, deleted)
+                if result is _LOCK_BUSY:
+                    # 票 04：跨进程锁忙（hook 重建窗口）——restore 批次待退避重试，
+                    # 不计数不自杀（hook 重建是瞬时状态，非 watcher 自身故障）。
+                    self._restore_batch(changed, deleted)
+                    next_allowed_trigger = time.monotonic() + _LOCK_BUSY_BACKOFF
+                    continue
+                ok = bool(result)
                 if not ok:
                     failure_count += 1
                     backoff = min(self._debounce * 2 ** max(0, failure_count - 1), _MAX_RETRY_BACKOFF)
@@ -427,7 +444,11 @@ class ServeWatcher:
                         self._pending = False
                 if changed or deleted:  # 纯删除批次 changed==[] 也要 flush（铁律 1/2）
                     try:
-                        self._flush_batch(changed, deleted)
+                        result = self._flush_batch(changed, deleted)
+                        if result is _LOCK_BUSY:
+                            # 停机时锁忙：restore（hook 持有锁并会收敛；线程即将退出，
+                            # 批次由 hook 的全量重建兜底，不丢事件语义）。
+                            self._restore_batch(changed, deleted)
                     except Exception as exc:
                         print(f"[graphify serve watcher] final flush failed: {exc}",
                               file=sys.stderr)
@@ -450,15 +471,134 @@ class ServeWatcher:
             self._deleted.update(deleted)
             self._pending = True
 
+    def _enqueue_backfill(self) -> None:
+        """挂载即无条件补齐：入队一次全量重建（per 挂载周期至多一次）。
+
+        走既有 pending 防抖机制——与普通事件同管道：补齐入队后到达的编辑事件并入
+        同批次（不双跑），主循环防抖到期后 _take_batch → _flush_batch 全量重建
+        （空 changed/deleted 批次 = 全量收敛到当前语料，补齐覆盖挂载前的历史陈旧）。
+        已存在 pending 批次（事件先到）则合并即可，不重复置位（幂等）。
+        """
+        with self._lock:
+            if self._pending:
+                return
+            self._pending = True
+            self._last_trigger = time.monotonic()
+
+    # ── 跨进程互斥（票 04：rebuild_lock 消费，watcher↔hook 互斥）─────────────────
+
+    def _acquire_rebuild_lock(self) -> bool:
+        """短尝试获取跨进程 mkdir 原子锁（graphify/rebuild_lock 单一事实源）。
+
+        watcher 重建管线与 hook 面 rebuild_entry 在同一项目互斥（防 extract cache
+        并发写损坏）。短尝试语义：拿不到立即返回 False，不阻塞不等待——调用方 restore
+        批次待退避重试，且不持闸等锁（否则其他 watcher 在 hook 分钟级重建窗口饿等）。
+        """
+        return _acquire_lock(self._root)
+
+    def _release_rebuild_lock(self) -> None:
+        """释放 mkdir 原子锁（仅当 pid 文件属于本进程；被 stale 接管则不动对方的锁）。"""
+        lock = _lock_path(self._root)
+        try:
+            if (lock / "pid").read_text(encoding="utf-8").strip() == str(os.getpid()):
+                (lock / "pid").unlink(missing_ok=True)
+                lock.rmdir()
+        except OSError:
+            pass
+
+    def _capture_waiting_fingerprint(self) -> None:
+        """锁忙时记录收敛参照：状态文件 schema v2 graph_fingerprint（hook 重建前的
+        事实层指纹，rebuilding 态才有）。无状态文件/非 rebuilding 态 → 退化为当前
+        事实层指纹（图在等待期间被他人推进也可判收敛）。"""
+        state = self._out_dir / ".rebuild-state.json"
+        try:
+            d = json.loads(state.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            d = None
+        fp = None
+        if isinstance(d, dict) and d.get("phase") == "rebuilding":
+            fp = d.get("graph_fingerprint")
+        if isinstance(fp, (list, tuple)) and len(fp) == 2:
+            try:
+                self._waiting_fingerprint = (int(fp[0]), int(fp[1]))
+                return
+            except (TypeError, ValueError):
+                pass
+        from fts_cache import fingerprint
+        self._waiting_fingerprint = fingerprint(self._out_dir / "graph.json")
+
+    def _converged_while_waiting(self) -> bool:
+        """等待期间事实层被他人（hook）推进 → 跳过实际重建（收敛语义）。
+
+        参照 = 锁忙时记录的 hook 重建前 graph_fingerprint。重试时当前指纹 ≠ 参照 →
+        hook 已收敛该图，跳过重复 build；= 参照 → 无人推进，正常重建。一次性判定
+        （同一参照只用于一轮重试）。
+        """
+        if self._waiting_fingerprint is None:
+            return False
+        from fts_cache import fingerprint
+        cur = fingerprint(self._out_dir / "graph.json")
+        ref, self._waiting_fingerprint = self._waiting_fingerprint, None
+        return cur != ref
+
+    # ── 挂载补齐（backfill）状态标记（与 hook 面同 schema v2，freshness 信封诚实）───
+
+    def _begin_state(self) -> None:
+        """A1a: 重建开始标记（仅空批次=挂载补齐写）——freshness 信封在补齐重建期间
+        诚实标注 rebuilding。graph_fingerprint = 重建前事实层指纹（与 hook 同构）。
+        落盘路径 = out_dir（与 serve 出口 active_graph_path 的 state 推导同目录）。
+        """
+        import rebuild_entry
+        from fts_cache import fingerprint
+        self._state_started = time.time()
+        f0 = fingerprint(self._out_dir / "graph.json")
+        payload = {
+            "schema": rebuild_entry._STATE_SCHEMA, "phase": "rebuilding",
+            "started": self._state_started, "project": str(self._root),
+            "graph_fingerprint": list(f0) if f0 else None,
+            "last_duration": rebuild_entry._read_prev_duration(self._root),
+        }
+        try:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            (self._out_dir / ".rebuild-state.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("watcher 状态文件写入失败（不阻塞重建）: %s", exc)
+
+    def _end_state(self, *, error: bool) -> None:
+        """A1a: 重建收尾标记（phase=complete/error）。schema 共字段与 hook 一致，
+        git_head 可缺省（watcher 非 git 触发面，省略字段语义合法）。"""
+        import rebuild_entry
+        payload = {
+            "schema": rebuild_entry._STATE_SCHEMA,
+            "phase": "error" if error else "complete",
+            "started": self._state_started,
+            "finished": time.time(),
+            "last_duration": round(time.time() - self._state_started, 1),
+            "project": str(self._root),
+        }
+        try:
+            (self._out_dir / ".rebuild-state.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("watcher 状态文件写入失败（不阻塞重建）: %s", exc)
+
     # ── pipeline（触发链全链路）──────────────────────────────────────────────
 
-    def _flush_batch(self, changed: list[Path], deleted: list[Path]) -> bool:
-        """批次分类 + 内联串行 pipeline。返回成功与否（失败由主循环退避/降级）。
+    def _flush_batch(self, changed: list[Path], deleted: list[Path]):
+        """批次分类 + 内联串行 pipeline。返回 True=成功 / False=失败（退避重试）
+        / _LOCK_BUSY=跨进程锁忙（restore + 退避，不计数不自杀）。
 
         全局信号量（registry 传入的 gate）在此获取：所有 watcher 的重建管线互斥
         串行（spec 并发与隔离）。等闸期间新事件继续并入各自防抖窗——_take_batch
         已清空本批、后续事件进下一批（observer 线程持续 _record；轮询在管线结束后
         用快照 diff 追平），不丢事件。gate=None（单机/单 watcher）零开销。
+
+        跨进程互斥（票 04）：pipeline 全程持有 rebuild_lock（mkdir 原子锁，与 hook
+        面 rebuild_entry 互斥）。短尝试语义——拿不到锁立即返回 _LOCK_BUSY（主循环
+        restore 批次待退避重试），门闸在 finally 释放，不持闸等锁；重试时指纹命中
+        （hook 已收敛）则跳过实际重建（不重复 build）。空批次（挂载补齐）写状态文件
+        标记 rebuilding/complete（freshness 信封诚实标注）。
         """
         gate = self._gate
         semantic_refresh = [
@@ -468,17 +608,37 @@ class ServeWatcher:
         if gate is not None:
             gate.acquire()
         try:
+            if not self._acquire_rebuild_lock():
+                # 锁忙：记录收敛参照（hook 重建前的状态文件 graph_fingerprint），
+                # restore + 退避由主循环统一做；门闸在 finally 释放，不持闸等锁。
+                logger.debug("rebuild lock busy on %s (stale takeover threshold %ss)",
+                             self._root, _LOCK_STALE_S)
+                self._capture_waiting_fingerprint()
+                return _LOCK_BUSY
             try:
-                self._run_pipeline(changed, deleted, semantic_refresh)
-            except Exception as exc:
-                print(f"[graphify serve watcher] rebuild failed: {exc}", file=sys.stderr)
-                return False
-            if self._on_complete is not None:
+                if self._converged_while_waiting():
+                    # hook 重建结果已收敛：跳过实际重建（不重复 build），批次视为成功。
+                    return True
+                backfill = not changed and not deleted
+                if backfill:
+                    self._begin_state()
                 try:
-                    self._on_complete()
+                    self._run_pipeline(changed, deleted, semantic_refresh)
                 except Exception as exc:
-                    logger.warning("on_pipeline_complete callback failed: %s", exc)
-            return True
+                    if backfill:
+                        self._end_state(error=True)
+                    print(f"[graphify serve watcher] rebuild failed: {exc}", file=sys.stderr)
+                    return False
+                if backfill:
+                    self._end_state(error=False)
+                if self._on_complete is not None:
+                    try:
+                        self._on_complete()
+                    except Exception as exc:
+                        logger.warning("on_pipeline_complete callback failed: %s", exc)
+                return True
+            finally:
+                self._release_rebuild_lock()
         finally:
             if gate is not None:
                 gate.release()
@@ -695,8 +855,9 @@ class WatcherRegistry:
     - (project_root, out_dir) 全部由调用方（serve.py 查询侧解析链）显式传入，不再
       从 graph_path 反推（out_dir 对齐约束，spec 路径解析）。
 
-    本票范围纪律：不含 LRU 容量逐出（票 03）、挂载补齐（票 03）、跨进程锁消费
-    （票 04）；stop_all 的按信号量持有序停机优化在票 04。
+    本票范围纪律：挂载补齐（票 04：仅惰性挂载入队一次）+ 跨进程锁消费（票 04：
+    pipeline 持 rebuild_lock 全程，watcher↔hook 互斥）已在此文件内；LRU 逐出重入的
+    补齐断言归票 05；stop_all 的按信号量持有序停机优化在票 05。
     """
 
     def __init__(
@@ -757,6 +918,14 @@ class WatcherRegistry:
             if pinned:
                 self._pinned_roots.add(root)
             watcher.start()
+            # 票 04：挂载即无条件补齐——仅惰性挂载（非 pinned）入队一次全量重建（不判定
+            # 陈旧；查询驱动的惰性挂载点修复挂载前的历史陈旧）。幂等保证 per 挂载周期
+            # 至多一次：alive 命中走上方早退不重建 watcher；dead 替换走本路径 = 新挂载
+            # 周期再补一次。补齐走全局信号量排队，不阻塞查询响应。默认项目 eager mount
+            # （pinned）不补齐——Task 10 语义：默认图由 SessionEnd/PreCompact hook 维护，
+            # 启动即补齐会让单项目用户每次 serve 启动触发分钟级全量重建（US3 零回归）。
+            if not pinned:
+                watcher._enqueue_backfill()
             print(f"[graphify serve] watching {watcher.project_root} "
                   f"({watcher.backend_name} backend); saves auto-rebuild the graph",
                   file=sys.stderr)
