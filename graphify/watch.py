@@ -387,7 +387,7 @@ def _relativize_source_files(payload: dict, root: Path, *, scope: Path | None = 
     for bucket in ("nodes", "edges", "hyperedges", "failed_refs"):
         # CUSTOM: failed_refs 的键是 file_path（knowledge-gaps sidecar 派生），上游
         # _PORTABLE_PATH_KEYS 只覆盖 source_file/definition_file——键集按 bucket 选择，
-        # 既保 fork 定制又不丢上游 #3366 的 definition_file 可移植化。
+        # 既保 fork 定制又不丢上游 #3223 的 definition_file 可移植化。
         keys = ("file_path",) if bucket == "failed_refs" else _PORTABLE_PATH_KEYS
         for item in payload.get(bucket, []):
             for key in keys:
