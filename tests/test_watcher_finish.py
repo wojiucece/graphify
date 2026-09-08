@@ -534,7 +534,7 @@ def test_watchdog_mode_self_disable_stops_observer(tmp_path, monkeypatch):
         (root / "a.py").write_text("x = 1\n", encoding="utf-8")
         assert _wait_for(lambda: not watcher.is_alive, timeout=40), "自禁用未发生"
         watcher.stop()  # 修复前：早退分支不碰 observer → 线程泄漏
-        assert not observer.is_alive, "observer 线程泄漏（自禁用后未停/join）"
+        assert not observer.is_alive(), "observer 线程泄漏（自禁用后未停/join）"
     finally:
         watcher.stop()
 
