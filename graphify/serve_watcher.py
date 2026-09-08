@@ -474,6 +474,15 @@ class ServeWatcher:
                         self._changed = set()
                         self._deleted = set()
                         self._pending = False
+                    elif self._pending:
+                        # 纯补齐空批次（backfill 入队后未及 flush 即停机）静默丢弃：与
+                        # "每挂载周期至多一次"承诺一致（挂载周期未跑完即停），重挂自愈。
+                        # debug 日志便于排障（非告警——丢失的是空批次标记，无事件）。
+                        self._pending = False
+                        logger.debug("[graphify serve watcher] pending-but-empty batch "
+                                     "(pure backfill) dropped at shutdown; consistent "
+                                     "with backfill-once-per-mount-cycle, self-heals "
+                                     "on re-mount")
                 if changed or deleted:  # 纯删除批次 changed==[] 也要 flush（铁律 1/2）
                     try:
                         # shutdown=True：final flush 的收敛跳过是停机态（线程即将退出），
@@ -490,7 +499,8 @@ class ServeWatcher:
                             print(f"[graphify serve watcher] final flush skipped: "
                                   f"rebuild lock still busy after {_FINAL_FLUSH_LOCK_RETRIES} "
                                   f"retries ({len(changed)} changed, {len(deleted)} deleted "
-                                  f"pending; hook 全量重建兜底)", file=sys.stderr)
+                                  f"pending; held by another rebuilder, "
+                                  f"full-rebuild fallback)", file=sys.stderr)
                     except Exception as exc:
                         print(f"[graphify serve watcher] final flush failed: {exc}",
                               file=sys.stderr)
@@ -989,6 +999,24 @@ class WatcherRegistry:
             if existing is not None and existing.is_alive:
                 self._watchers.move_to_end(root)
                 return existing
+            # FE1（Fix wave E）：绝对 GRAPHIFY_OUT 共享输出布局——不同 project 解析到同一
+            # graph.json（Path(project_path) / 绝对 GRAPHIFY_OUT 时 pathlib 丢弃左侧）。
+            # graph_path 已映射到另一 root 的 alive watcher 时复用，不挂第二个 watcher
+            # （否则多 watcher 各以自己的语料全量重建同一 graph.json，内容漂移；_by_graph
+            # last-write-wins 丢 LRU 联动）。pinned 默认 eager mount 是首个注册者，守卫
+            # root-agnostic 对称适用（默认 root 自身撞上则复用其已有 watcher）。复用保持
+            # 单注册者——_collect_cap_evictions 按 root 键迭代，无上限逐出异常。
+            if existing is None:
+                owner = self._by_graph.get(graph_path)
+                if owner is not None and owner.is_alive:
+                    owner_root = owner.project_root
+                    if owner_root != root:
+                        print(f"[graphify serve] project {root} resolves to graph.json "
+                              f"already watched for project {owner_root}; reusing existing "
+                              f"watcher (absolute GRAPHIFY_OUT shared-output layout)",
+                              file=sys.stderr)
+                    self._watchers.move_to_end(owner_root)
+                    return owner
             dead_stop = None
             if existing is not None:
                 # dead watcher：直接替换为全新实例（不经逐出路径，逐出是配额机制）。

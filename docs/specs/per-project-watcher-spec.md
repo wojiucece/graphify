@@ -83,7 +83,7 @@ graphify serve 的查询侧已经是 per-project 的：`_GraphContextCache` 维�
 - **上限**：独立环境变量 `GRAPHIFY_MAX_WATCHERS`，默认跟随生效的 ctx 上限（`GRAPHIFY_MAX_CONTEXTS` 含 env 覆盖的生效值，默认 8）——保证"每个缓存中的项目都可能有 watcher"是默认不变量；默认值待资源实测校准（watcher 是活线程 + Observer + OS 句柄，与纯内存 ctx 资源模型不同，同源数值是便利性起点非资源论证）。
 - **配额模型**：pinned 默认 watcher 不占 `GRAPHIFY_MAX_WATCHERS` 配额（与 ctx 缓存"pinned 默认图不占 GRAPHIFY_MAX_CONTEXTS 配额"的既有模型对称）——否则上限逐出为给新项目腾位时会停掉默认项目的 watcher，违反单项目零回归承诺。
 - **逐出序 = 使用序**：registry 条目在每次 `_select_graph` 命中时 touch；上限逐出停"最近最少使用"的 watcher（不是最早挂载的——ctx LRU 顺序与挂载顺序会分叉，按挂载序会误停活跃项目）。dead watcher 优先于 alive 被清（腾位时先扫 dead）。
-- **自禁用恢复**：注册表内标记 dead 不重试、无定时复活；LRU 逐出该 ctx 后客户端再查询 → 重挂 → 全新 watcher 从零计数（重入复活）。默认图 pinned 不被逐出，其自禁用行为与现状完全一致（死了直到重启），零回归。
+- **自禁用恢复**：注册表内标记 dead 不重试、无定时复活；LRU 逐出该 ctx 后客户端再查询 → 重挂 → 全新 watcher 从零计数（重入复活）。默认图 pinned 不被逐出，其自禁用行为与现状完全一致（死了直到重启），零回归。例外：**显式传 `project_path` = 默认根**会经 dead-replace 复活 pinned 默认 watcher（合法多项目用法，行为更优）；"死了直到重启"仅指默认查询（`project_path=None`）路径——惰性挂载只对非空 project_path 触发。
 - **停机**：先向全部 watcher 发停止信号，再依序 join（信号量持有者优先），每个沿用现有 join timeout，总预算按信号量排队深度计。修正了"逆挂载序串行 stop"的原设计——final flush 在 watcher 自身线程执行且需抢全局信号量，若默认项目（最早挂载、最可能 mid-build）持有信号量，逆序停机会让其他 watcher 的 flush 与进程退出赛跑，丢 pending 批次（违反铁律 2）。三挂点（stdio finally / http lifespan / atexit）调用形态零改动。
 
 ### 并发与隔离（grilling Q4、Q8）
@@ -104,6 +104,7 @@ graphify serve 的查询侧已经是 per-project 的：`_GraphContextCache` 维�
 ### serve.py 挂载预算
 
 - 架构票 04 的"serve.py 挂载 diff ≤25 行"约束继续成立：serve 侧改动限于五处触点——注册表构造、_select_graph 挂载点、缓存 on_evict 接线、停机串行化、graph_stats 喂点（逻辑收敛在 registry.status_summary()，serve 侧每处 1-3 行），逻辑全在 serve_watcher.py。
+- **预算口径（票 05 终审补记）**：25/25 是**五触点净新增特性行**口径（注册表构造 7 + _select_graph 挂载 3 + on_evict 接线 8 + 停机串行化 4 + server 属性接线 2 + graph_stats 喂点 1）。终审 `git diff` 的毛 `+` 计数更高（~28-51 raw）——差额是**非特性行**：`on_evict` 重构时 relocated 的 `return entry["G"]...` 行（移动非新增）、`_stop_graphify_watcher` docstring 变更（注释）、`_tool_graph_stats` 注解修正（既有函数签名，非新触点点）。毛计数仅供 diff 审计，预算约束以五触点口径为准。
 
 ## Testing Decisions
 
@@ -137,6 +138,7 @@ graphify serve 的查询侧已经是 per-project 的：`_GraphContextCache` 维�
 - **`mount_watcher` 退役删除**：ticket 02 已切换 registry.mount，serve.py 无生产调用方；`_WATCH_ENV_TRUE`（serve_watcher 内）随之删除。Task 10 三个直调 mount_watcher 的测试更新为 registry/serve 语义（on_complete 回调契约平移）。
 - **锁忙 stderr 日志节流**：`logger.debug` 提升为每段锁忙一条 `print`（`_lock_busy_logged` 过渡标记，成功复位）——满足"跨进程锁竞争单行日志"而不被 1s 重试刷屏。
 - **`stop_all` 置 `_stopped` 标记**：并发挂载竞态不变式显式化——"被 stop_all 停 或 由 atexit 覆盖"两者必居其一；挂载行为不变。
+- **on_evict 接线机制**：生产路径经 `ctx_cache._on_evict = self.evict_graph` 私有属性 poke（serve_watcher.py:974 附近）而非缓存构造参数 `on_evict=`（构造参数路径仅测试使用）——鸡生蛋约束：serve 先建 `_GraphContextCache` 后建 `WatcherRegistry`（registry 构造需要缓存做 invalidate 回调），故注册表在自身构造时反向挂接缓存属性；构造参数 `on_evict` 保留为默认 None 零行为变化。真实原因已在代码注释（构造顺序约束）。
 - **graph_stats 喂点实现**：`_tool_graph_stats` 返回 5 元组 `(text, found, scanned, None, {"watched_projects": registry.status_summary() if registry else []})`，经既有 `_apply_envelope` 的 extra_meta 并入 `_meta`——serve.py 单行（预算 25/25），正文不变、加性字段零破坏既有消费者；watch 关时 `registry is None` → `[]` 恒存在。
 
 ## Further Notes

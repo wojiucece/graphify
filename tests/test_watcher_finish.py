@@ -510,6 +510,39 @@ def test_dead_replace_stop_outside_lock_not_blocking_other_mounts(polling, tmp_p
         registry.stop_all()
 
 
+def test_shared_out_dir_guard_reuses_watcher(polling, tmp_path, monkeypatch, capsys):
+    """FE1：绝对 GRAPHIFY_OUT 共享输出布局——两 project 解析到同一 graph.json（serve
+    解析链 Path(project_path) / 绝对 GRAPHIFY_OUT 时 pathlib 丢弃左侧 → 同 out_dir）时，
+    mount 复用既有 watcher 不挂第二个：注册表合一、_by_graph 单条目、补齐只入队一次、
+    复用告警一行。registry 级直测（守卫即修复本体；out_dir 显式传共享绝对目录）。"""
+    import graphify.serve_watcher as W
+    proj_a = _mini_proj(tmp_path / "proj-a")
+    proj_b = _mini_proj(tmp_path / "proj-b")
+    shared_out = tmp_path / "shared-out"  # 绝对共享输出目录（模拟 GRAPHIFY_OUT 绝对覆盖）
+    enqueue_calls = {"n": 0}
+    real_enqueue = W.ServeWatcher._enqueue_backfill
+
+    def rec_enqueue(self):
+        enqueue_calls["n"] += 1
+        return real_enqueue(self)
+    monkeypatch.setattr(W.ServeWatcher, "_enqueue_backfill", rec_enqueue)
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    wa = registry.mount(proj_a, shared_out)   # 首个注册者（拥有 graph_path）
+    wb = registry.mount(proj_b, shared_out)   # 同 graph_path → 守卫复用，不挂第二个
+    try:
+        assert wb is wa, "共享 graph.json 应复用同一 watcher（未挂第二个）"
+        assert len(registry._watchers) == 1, \
+            f"注册表应只有 1 个 watcher: {list(registry._watchers)}"
+        assert len(registry._by_graph) == 1, "_by_graph 应只有 1 条"
+        assert enqueue_calls["n"] == 1, \
+            f"补齐应只入队一次（复用不重入队，避免对共享图二次全量重建）: {enqueue_calls}"
+        err = capsys.readouterr().err
+        assert "resolves to graph.json already watched" in err, f"复用告警缺失: {err!r}"
+        assert "backfill enqueued" in err, f"首挂补齐入队日志缺失: {err!r}"
+    finally:
+        registry.stop_all()
+
+
 def test_watchdog_mode_self_disable_stops_observer(tmp_path, monkeypatch):
     """真实 watchdog 后端回归：自禁用（auto-sync disabled）后 stop() 必须停/join
     observer（修复 observer 线程泄漏——polling fixture 掩盖的 bug：自禁用退出循环不
