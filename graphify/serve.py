@@ -116,11 +116,13 @@ def _max_server_contexts() -> int:
 class _GraphContextCache:
     """Thread-safe graph contexts: one pinned default plus an LRU of projects."""
 
-    def __init__(self, max_contexts: int):
+    def __init__(self, max_contexts: int, on_evict: "callable | None" = None):
         self._max_contexts = max_contexts
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._pinned: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # 票 03：LRU 容量逐出回调（默认 None 零行为变化；仅容量 popitem 触发，invalidate 不触发）
+        self._on_evict = on_evict
 
     def _load_entry(self, resolved_path: str, key: tuple[int, int]) -> dict:
         """Build one entry for an already-resolved path and known file key.
@@ -153,6 +155,7 @@ class _GraphContextCache:
         ``pinned=True`` is reserved for the server's configured default graph;
         it remains warm without consuming a project-cache slot.
         """
+        evicted: list[str] = []
         with self._lock:
             try:
                 stat_result = Path(resolved_path).stat()
@@ -171,8 +174,13 @@ class _GraphContextCache:
             if not pinned:
                 self._entries.move_to_end(resolved_path)
                 while len(self._entries) > self._max_contexts:
-                    self._entries.popitem(last=False)
-            return entry["G"], entry["communities"]
+                    evicted_key, _ = self._entries.popitem(last=False)
+                    evicted.append(evicted_key)
+        # 票 03：on_evict 在缓存锁外执行（锁内调 stop→join 会与 pipeline 完成回调抢锁死锁）
+        for evicted_key in evicted:
+            if self._on_evict is not None:
+                self._on_evict(evicted_key)
+        return entry["G"], entry["communities"]
 
     def get(self, resolved_path: str) -> dict | None:
         """Return the cached entry dict for an already-loaded path, else None.
@@ -2828,14 +2836,21 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
     _default_graph_path = str(Path(graph_path).resolve())
     _ctx_cache = _GraphContextCache(_max_server_contexts())
 
-    # === CUSTOM: 内置 watcher（Task 10）——默认关，--watch / GRAPHIFY_WATCH 显式开启 ===
+    # === CUSTOM: 内置 watcher 注册表（per-project-watcher）——默认关，--watch / GRAPHIFY_WATCH 开启 ===
     # 挂载点（架构票 04：serve.py 挂载 diff ≤ 25 行）；逻辑全在 serve_watcher.py。
+    # 默认项目 eager mount 走查询侧解析链：(project_root, out_dir) 同源（out_dir 对齐）。
     if watch is None:
         watch = os.environ.get("GRAPHIFY_WATCH", "").strip().lower() in _WATCH_ENV_TRUE
     if watch:
         from graphify import serve_watcher
-        _watcher = serve_watcher.mount_watcher(_default_graph_path, _ctx_cache, watch=True)
+        _registry = serve_watcher.WatcherRegistry(_ctx_cache)
+        _watcher = _registry.mount(
+            serve_watcher.default_project_root(_default_graph_path),
+            str(Path(_default_graph_path).parent),
+            pinned=True,  # 默认项目 watcher 不占 GRAPHIFY_MAX_WATCHERS 配额、永不被上限逐出
+        )
     else:
+        _registry = None
         _watcher = None
 
     def _load_ctx(path: str):
@@ -2876,6 +2891,13 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         path = _resolve_graph_path(project_path)
         G, communities = _load_ctx(path)
         active_graph_path = str(Path(path).resolve())
+        # 惰性挂载：首次成功加载某项目图时自动挂该项目 watcher（与查询侧"用到即加载"
+        # 对称）。(project_root, out_dir) 均来自查询侧解析链——out_dir = 查询目标的
+        # 父目录，GRAPHIFY_OUT 覆盖布局下监听目标与查询目标恒为同一 graph.json。
+        # project_path 为 None（默认图）不触发：默认项目启动时已 eager mount。
+        if _registry is not None and project_path:
+            _registry.mount(str(Path(project_path).resolve()),
+                            str(Path(path).resolve().parent))
 
     # NOTE: no decorators here — the handlers below are plain coroutines,
     # bound to the Server at the END of this function in a version-aware way:
@@ -3035,7 +3057,7 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         # CUSTOM: N1 found=结果非空（god 节点列表），scanned=全图节点数（扫描语义表）。
         return "\n".join(lines), bool(nodes), G.number_of_nodes()
 
-    def _tool_graph_stats(_: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+    def _tool_graph_stats(_: dict) -> tuple[str, bool, int, None, dict]:  # CUSTOM: N1 三元组→5 元组（末元 extra_meta）
         confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
         total = len(confs) or 1
         return (
@@ -3046,8 +3068,9 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
             f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
             f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
         # CUSTOM: N1 found=图非空（stats 反映图现状，空图即 absent+empty_graph），
-        # scanned=全图节点数（扫描语义表）。
-        ), G.number_of_nodes() > 0, G.number_of_nodes()
+        # scanned=全图节点数（扫描语义表）。5 元组末元 extra_meta 并入 _meta——graph_stats
+        # 喂点（票 05）：watched_projects 数组（project_root+backend+status）恒存在、空为 []。
+        ), G.number_of_nodes() > 0, G.number_of_nodes(), None, {"watched_projects": _registry.status_summary() if _registry else []}
 
     def _tool_shortest_path(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         # _shortest_path_text 保持 -> str（tests/test_serve.py 直接 import 测它，签名不可动）；
@@ -3477,14 +3500,22 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
     server._graphify_health_handler = _handle_health
     # === CUSTOM: /query and /health HTTP endpoints for prompt-hook end ===
 
-    # === CUSTOM: Task 10 内置 watcher——挂到 server 供 transport 生命周期 stop ===
+    # === CUSTOM: 内置 watcher 注册表——挂到 server 供 transport 生命周期 stop ===
+    # _graphify_watcher 保留为默认项目 watcher（Task 10 外部契约）；_graphify_registry
+    # 停机 stop_all（惰性挂载项目不泄漏）；_graphify_select_graph 测试直驱惰性挂载。
     server._graphify_watcher = _watcher
+    server._graphify_registry = _registry
+    server._graphify_select_graph = _select_graph
 
     return server
 
 
 def _stop_graphify_watcher(server) -> None:
-    """transport 退出时阻塞停止内置 watcher（Task 10 铁律 2：批次完成 + 原子落盘）."""
+    """transport 退出时阻塞停止全部内置 watcher（Task 10 铁律 2：批次完成 + 原子落盘）."""
+    registry = getattr(server, "_graphify_registry", None)
+    if registry is not None:
+        registry.stop_all()
+        return
     watcher = getattr(server, "_graphify_watcher", None)
     if watcher is not None:
         watcher.stop()

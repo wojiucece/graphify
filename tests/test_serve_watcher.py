@@ -86,12 +86,20 @@ def polling(monkeypatch):
 
 # === 默认关 / 挂载点（serve.py）================================================
 
-def test_build_server_watch_default_off(tmp_path):
-    """默认关：无 --watch/GRAPHIFY_WATCH 时 server 无 watcher，且 serve_watcher 不 import."""
+def test_build_server_watch_default_off(tmp_path, monkeypatch):
+    """默认关：无 --watch/GRAPHIFY_WATCH 时 server 无 watcher，且 serve_watcher 不 import.
+
+    隔离：同会话早前跑的 registry 测试会经函数内 ``import graphify.serve_watcher`` 预填充
+    sys.modules（污染本断言）。构建前把目标模块从 sys.modules 摘除——若 watch-off 构建真去
+    import serve_watcher，模块会重新出现，断言照常红；不 import 则维持缺失（monkeypatch 测试
+    后自动还原原模块对象，不破坏后续用例）。断言保护的意义不变：默认关的构建在运行期绝不加载
+    serve_watcher。
+    """
     import graphify.serve as S
     root = _mini_proj(tmp_path)
     import rebuild_entry
     rebuild_entry.rebuild(root)
+    monkeypatch.delitem(sys.modules, "graphify.serve_watcher", raising=False)
     server = S._build_server(str(root / "graphify-out" / "graph.json"))
     assert getattr(server, "_graphify_watcher", None) is None
     assert "graphify.serve_watcher" not in sys.modules, "默认关不该 import serve_watcher"
@@ -568,12 +576,11 @@ def test_graph_context_cache_invalidate_atomic_swap(tmp_path):
     assert G_hit is G1, "未变化的图应命中缓存"
 
 
-def test_mount_watcher_on_complete_invalidates_cache(tmp_path):
-    """mount_watcher 的 on_pipeline_complete 回调 = _GraphContextCache.invalidate。"""
+def test_registry_on_complete_invalidates_cache(tmp_path):
+    """registry.mount 的 on_pipeline_complete 回调 = _GraphContextCache.invalidate
+    （mount_watcher 退役后，registry.mount 是唯一挂载入口——回调契约平移）。"""
     import graphify.serve_watcher as W
     root = _mini_proj(tmp_path)
-    import rebuild_entry
-    rebuild_entry.rebuild(root)
 
     class FakeCache:
         def __init__(self):
@@ -583,31 +590,41 @@ def test_mount_watcher_on_complete_invalidates_cache(tmp_path):
             self.invalidated.append(path)
 
     fake = FakeCache()
-    watcher = W.mount_watcher(str(root / "graphify-out" / "graph.json"), fake, watch=True)
-    assert watcher is not None
+    registry = W.WatcherRegistry(fake, poll_interval=0.2)
+    watcher = registry.mount(root, root / "graphify-out")
     try:
         watcher._on_complete()
         assert fake.invalidated == [str((root / "graphify-out" / "graph.json").resolve())]
     finally:
-        watcher.stop()
+        registry.stop_all()
 
 
-def test_mount_watcher_disabled_returns_none(tmp_path, monkeypatch):
-    """未开启（watch=None + 无 env）→ mount_watcher 返回 None（零副作用）。"""
-    import graphify.serve_watcher as W
+def test_watch_off_returns_no_registry(tmp_path, monkeypatch):
+    """未开启（watch=None + 无 env）→ _build_server 不建 watcher 注册表（零副作用）。"""
+    import graphify.serve as S
+    import rebuild_entry
     monkeypatch.delenv("GRAPHIFY_WATCH", raising=False)
-    assert W.mount_watcher(str(tmp_path / "graphify-out" / "graph.json"), object()) is None
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    server = S._build_server(str(root / "graphify-out" / "graph.json"))
+    assert getattr(server, "_graphify_registry", None) is None
+    assert getattr(server, "_graphify_watcher", None) is None
 
 
-def test_mount_watcher_env_enables(tmp_path, monkeypatch):
-    """env GRAPHIFY_WATCH=1 → mount_watcher 开启。"""
-    import graphify.serve_watcher as W
+def test_watch_env_enables_registry(tmp_path, monkeypatch):
+    """env GRAPHIFY_WATCH=1 → _build_server 建 watcher 注册表并 eager mount 默认项目。"""
+    import graphify.serve as S
+    import rebuild_entry
     monkeypatch.setenv("GRAPHIFY_WATCH", "1")
-    watcher = W.mount_watcher(str(tmp_path / "graphify-out" / "graph.json"), object())
-    assert watcher is not None
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    server = S._build_server(str(root / "graphify-out" / "graph.json"))
+    registry = getattr(server, "_graphify_registry", None)
     try:
-        watcher.stop()
+        assert registry is not None, "GRAPHIFY_WATCH=1 未建注册表"
+        assert registry.get(root) is not None, "默认项目未 eager mount"
     finally:
+        registry.stop_all()
         monkeypatch.delenv("GRAPHIFY_WATCH", raising=False)
 
 
