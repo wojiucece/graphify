@@ -455,6 +455,61 @@ def test_self_disable_early_stop_stops_observer_deterministic(tmp_path):
     assert fake.join_calls == 1, "早退分支未 join observer（泄漏）"
 
 
+def test_dead_replace_stop_outside_lock_not_blocking_other_mounts(polling, tmp_path,
+                                                                  monkeypatch):
+    """FC1：dead-replace 的 stop 在注册表锁外——watchdog 模式自禁用 watcher（线程死但
+    observer 活，stop 阻塞于 observer join）的替换不得拖住其他项目 mount（锁内 stop 会
+    让并发 mount/status_summary 阻塞整个 join 时长）。慢 fake observer（join 0.5s）注入 +
+    并发第二个项目 mount 断言不延迟（既有 dead-replace 测试全跑 polling 模式 observer
+    None → _stop_observer no-op，看不到此组合）。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    proj_a = _mini_proj(tmp_path / "proj-a")
+    proj_b = _mini_proj(tmp_path / "proj-b")
+    rebuild_entry.rebuild(proj_a)
+    rebuild_entry.rebuild(proj_b)
+    monkeypatch.setattr(W, "_MAX_SYNC_FAILURE_RETRIES", 2)
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    wa = registry.mount(proj_a, proj_a / "graphify-out")
+
+    def boom(changed, deleted, sr):
+        raise RuntimeError("boom")
+    wa._run_pipeline = boom
+    time.sleep(0.6)  # 基线
+    (proj_a / "a.py").write_text("x = 1\n", encoding="utf-8")
+    assert _wait_for(lambda: not wa.is_alive, timeout=40), "proj-a 未自禁用"
+    # 注入慢 fake observer（模拟 watchdog 模式：线程死但 observer 活、join 耗时 0.5s）
+    join_started = threading.Event()
+
+    class SlowFakeObserver:
+        def stop(self):
+            pass
+
+        def join(self, timeout=None):
+            join_started.set()
+            time.sleep(0.5)
+    wa._observer = SlowFakeObserver()
+    # 触发 dead-replace（proj-a 同 root 重挂）——进入 stop 的 observer join 阶段
+    replace_done = threading.Event()
+
+    def do_replace():
+        registry.mount(proj_a, proj_a / "graphify-out")
+        replace_done.set()
+    replace_thread = threading.Thread(target=do_replace, daemon=True)
+    replace_thread.start()
+    assert join_started.wait(10), "dead-replace 未进入 observer join"
+    # 并发 mount 不同项目：若 stop 持注册表锁，此 mount 会被拖住 ~0.5s
+    t0 = time.time()
+    wb = registry.mount(proj_b, proj_b / "graphify-out")
+    elapsed = time.time() - t0
+    assert elapsed < 0.3, f"其他项目 mount 被 dead-replace stop 拖住: {elapsed:.2f}s（锁内 stop）"
+    replace_thread.join(10)
+    try:
+        assert replace_done.is_set(), "dead-replace 未完成"
+    finally:
+        registry.stop_all()
+
+
 def test_watchdog_mode_self_disable_stops_observer(tmp_path, monkeypatch):
     """真实 watchdog 后端回归：自禁用（auto-sync disabled）后 stop() 必须停/join
     observer（修复 observer 线程泄漏——polling fixture 掩盖的 bug：自禁用退出循环不

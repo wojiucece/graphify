@@ -989,18 +989,19 @@ class WatcherRegistry:
             if existing is not None and existing.is_alive:
                 self._watchers.move_to_end(root)
                 return existing
+            dead_stop = None
             if existing is not None:
                 # dead watcher：直接替换为全新实例（不经逐出路径，逐出是配额机制）。
-                # 持注册表锁 stop() 安全仅因：dead watcher 的 stop() 立即返回（_running 假 或
-                # dead 线程 join 即瞬）。钉死前置条件——若未来 _run_loop 重构使非存活 watcher
-                # 的 stop() 阻塞，此断言在测试（非 -O）下先红，防止持锁阻塞/死锁被静默放行。
+                # 先弹两索引、stop 移到锁外——该 watcher 已被注册表完全移除，锁外 stop 无需
+                # 任何协调即安全。票 05 observer 修复后，watchdog 模式自禁用 watcher 是
+                # "线程死但 observer 活"：stop() 会短暂阻塞于 observer stop+join（不再是
+                # "dead 立即返回"）——若锁内 stop，会拖住其他项目 mount/status_summary。
+                # assert 钉死线程已死（线程 liveness 判定仍成立；observer 死活不在此列）。
                 assert not existing.is_alive, \
-                    "dead-replace 前提：existing 已非存活（持锁 stop() 只对 dead watcher 无阻塞）"
+                    "dead-replace 前提：existing 已非存活（锁外 stop() 只对 dead watcher 无阻塞）"
                 self._watchers.pop(root, None)
                 self._by_graph.pop(_graph_path_of(str(existing._out_dir)), None)
-                existing.stop()
-                print(f"[graphify serve] replaced dead watcher for {root}; "
-                      f"remounting fresh instance (backfill re-enqueued)", file=sys.stderr)
+                dead_stop = existing
             watcher = self._make_watcher(root, out)
             self._watchers[root] = watcher
             self._by_graph[graph_path] = watcher
@@ -1019,6 +1020,12 @@ class WatcherRegistry:
                   f"({watcher.backend_name} backend); saves auto-rebuild the graph",
                   file=sys.stderr)
             victims = self._collect_cap_evictions()
+        # dead 替换在注册表锁外 stop（dead watcher 已从两索引移除、注册表不可达；watchdog
+        # 模式 observer join 可能短暂阻塞，但不占注册表锁——与其他项目 mount 无互斥）。
+        if dead_stop is not None:
+            dead_stop.stop()
+            print(f"[graphify serve] replaced dead watcher for {root}; "
+                  f"remounting fresh instance (backfill re-enqueued)", file=sys.stderr)
         # 上限逐出在注册表锁外 stop（join 期间 pipeline 完成回调不需要注册表锁，无锁环）。
         for victim in victims:
             print(f"[graphify serve] cap eviction: stopped {victim.project_root} "

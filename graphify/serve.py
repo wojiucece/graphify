@@ -3057,7 +3057,7 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         # CUSTOM: N1 found=结果非空（god 节点列表），scanned=全图节点数（扫描语义表）。
         return "\n".join(lines), bool(nodes), G.number_of_nodes()
 
-    def _tool_graph_stats(_: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
+    def _tool_graph_stats(_: dict) -> tuple[str, bool, int, None, dict]:  # CUSTOM: N1 三元组→5 元组（末元 extra_meta）
         confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
         total = len(confs) or 1
         return (

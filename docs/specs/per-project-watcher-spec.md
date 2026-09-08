@@ -99,7 +99,7 @@ graphify serve 的查询侧已经是 per-project 的：`_GraphContextCache` 维�
 
 ### 路径解析（约束，非新决策）
 
-- **out_dir 推导必须与查询侧对齐**：现有 `mount_watcher` 用 `graph_path.parent.parent` 推测 project_root，非标准布局（GRAPHIFY_OUT 覆盖）会推错。per-project 化时 watcher 的 (project_root, out_dir) 必须从 `_resolve_graph_path` 的同一解析链取得，不再反推。
+- **out_dir 推导必须与查询侧对齐**：票 02 前的 `mount_watcher`（已退役，见 Further Notes 与 Implementation Notes）曾用 `graph_path.parent.parent` 推测 project_root，非标准布局（GRAPHIFY_OUT 覆盖）会推错。per-project 化后 watcher 的 (project_root, out_dir) 必须从 `_resolve_graph_path` 的同一解析链取得，不再反推——该约束仍是绑定设计（registry.mount 的 (project_root, out_dir) 全部由调用方显式传入）。
 
 ### serve.py 挂载预算
 
