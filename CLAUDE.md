@@ -60,13 +60,13 @@ Rules:
 - 原方案 `graphify graph pre-query. Use directly, skip grep/read.`（13 token）留在 `prompt_hook.py` 注释里作回退参考，缺点是 `skip grep` 过度承诺
 
 ### OpenCode 引导句（三层分流，纯 ASCII，28 token）
-- `__main__.py:1548` 的 `_OPENCODE_PLUGIN_JS` 里 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）
+- `graphify/install.py:1381` 的 `_OPENCODE_PLUGIN_JS` 里 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）。（坐标勘误 2026-09-07：常量定义随上游重构在 `install.py`，非 `__main__.py:1548`——旧坐标是历史遗留描述）
 - 当前文案：`[graphify] pre-query: symbols get file+line here; strings/patterns need grep; large output to sandbox not context.`
 - 跟 prompt-hook 同一套三层分流哲学，但纯 ASCII（OpenCode TUI 渲染零风险，注释 1528 保证 plain words 安全；`→` 在 TUI 未验证故不用）
 - echo 文案硬约束：双引号内禁 backticks/`$()`/裸双引号/反斜杠（触发 bash 命令替换）；分号在双引号内是字面字符安全，双引号外的 ` ; ` 才分隔命令
 - 砍了原版的 `GRAPH_REPORT.md` 引导——hook 时机是 bash 前，该提醒分流不是读报告（时机错配）
 - 改源码后要在 OpenCode 项目重跑 `graphify install` 重新生成 `.opencode/plugins/graphify.js`（跟 Claude Code 的 `graphify claude install` 同理）
-- 原方案（52 token）留在 `__main__.py` 注释里作回退参考
+- 原方案（52 token）留在 `install.py` 的 `_OPENCODE_PLUGIN_JS` 附近注释里作回退参考
 
 ### OpenCode after hook（方案 C，扩展触发面到 read/write/edit/glob/grep）
 - `_OPENCODE_PLUGIN_JS` 里同时注册 `tool.execute.before`（bash）+ `tool.execute.after`（read/write/edit/glob/grep），一个 plugin 两个 key 并存
@@ -93,6 +93,13 @@ Rules:
 - 根因：项目 .venv 装了上游版 graphifyy（无 prompt-hook），激活后遮蔽全局 fork 版
 - 排查：`bash scripts/check-custom.sh` 扫描所有 graphify.exe 标出上游版
 - 清理：`uv pip uninstall graphifyy --python <venv>/Scripts/python.exe`
+
+### `.venv` editable dist-info 冻结——skill 版本检查误报"package older"（2026-09-08）
+- 现象：`graphify` CLI 反复报 `skill is from graphify 0.9.56+fork.1, but the package is 0.9.53+fork.1 (older)`，但 uv tool 环境和 MCP server 握手都是 0.9.56
+- 根因：**双环境版本分裂**。PATH 里 `.venv/Scripts` 在前（VIRTUAL_ENV 劫持），CLI 解析到 .venv 的 editable；PEP 660 editable 的 finder 映射**路径**（代码永远跟随 fork 源码，功能是新的），但 dist-info 冻结**安装时刻的版本元数据**（0.9.53 时代装的就没再刷）。`__main__.py:17` 的 `__version__ = _pkg_version("graphifyy")` 读 dist-info → 0.9.53，skill 是 uv tool 环境（0.9.56）装的 → 版本比较误报
+- 判别：代码回退 vs 元数据冻结——`<venv>/Scripts/python.exe -c "import graphify; print(graphify.__file__)"` 指向 fork 源码 = 只是元数据 stale；`uv tool list` 与 `<venv>` 里 `graphifyy-*.dist-info/METADATA` 的 Version 对比定位分裂侧
+- 修复：`uv pip install -e ".[mcp,openai]" --python <venv>/Scripts/python.exe` 刷 dist-info（代码/测试环境零影响，server 走 uv tool 不用重启）；**每次上游大版本同步后跟刷一次**
+- 勿卸载 .venv 里的 graphifyy（那是"排查 unknown command"的处置）：本次 .venv editable 指向 fork 源码，是 fork 开发 pytest 的依赖，卸载会破坏测试环境——两种遮蔽性质不同，处置相反
 
 ## 分层融合自定义面（feat/native-indexing，spec: docs/graphify-native-indexing-spec.md）
 
