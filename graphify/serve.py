@@ -342,6 +342,14 @@ _EXACT_MATCH_BONUS = 1000.0
 _PREFIX_MATCH_BONUS = 100.0
 _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
+# The extraction spec stores the WHY of a concept as a `rationale` attribute
+# on the node, not as a node of its own, so for a "why does X …" question that
+# prose is often the only place the question's words occur (#2293). Score it
+# as its own tier: below a label substring hit (the label still names the
+# thing), above a source-path hit, and — like the source tier — never counted
+# toward term coverage, so a long rationale adds recall without winning back
+# an exact-label tier it did not earn.
+_RATIONALE_MATCH_BONUS = 0.75
 
 
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
@@ -376,9 +384,27 @@ def _trigrams(text: str) -> set[str]:
     return {text[i:i + 3] for i in range(len(text) - 2)}
 
 
+def _node_rationale_text(data: dict) -> str:
+    """The node's `rationale` attribute normalized like a label (diacritics
+    folded, lower-cased) for substring matching. Semantic cleanup writes it as
+    one string (several sources joined with blank lines); an extractor may hand
+    over a list — join it. Missing or empty -> "" so callers can `if rationale`.
+    """
+    raw = data.get("rationale")
+    if not raw:
+        return ""
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(str(part) for part in raw if part)
+    return _strip_diacritics(str(raw)).lower()
+
+
 def _node_search_text(data: dict, nid: str) -> str:
     """Concatenate every field _score_nodes / _find_node match a query against, so
     one trigram index over this text is a complete candidate generator for both.
+
+    - `rationale` (normalized via `_node_rationale_text`) feeds _score_nodes'
+      rationale tier (#2293); appended last, and only when present, so every
+      other field position is unchanged.
 
     - `norm_label` and `source_file` feed _score_nodes' per-term substring tiers.
     - `label_tokens` (the space-joined token form) feeds _find_node's
@@ -410,6 +436,9 @@ def _node_search_text(data: dict, nid: str) -> str:
         nid_folded = _strip_diacritics(str(nid)).lower()
         if nid_folded != nid_text:
             fields += (nid_folded,)
+    rationale = _node_rationale_text(data)
+    if rationale:
+        fields += (rationale,)
     return "\x00".join(fields)
 
 
@@ -586,6 +615,7 @@ def _score_query(
         # driver".
         label_tokens = " ".join(_search_tokens(data.get("label") or ""))
         source = (data.get("source_file") or "").lower()
+        rationale = _node_rationale_text(data)
         # `nid_lower` is needed both by the full-query tier (`if joined`) and by
         # the per-token singleton tier (joined-singlet exact-match check). When
         # neither runs (`joined` empty AND not collecting seeds) skip the call;
@@ -645,6 +675,12 @@ def _score_query(
             if t in source:
                 source_value = _SOURCE_MATCH_BONUS * w
                 score += source_value
+            # Rationale tier (#2293): recall for "why" questions whose words
+            # live only in the attribute. Adds to the score, not to `matched`.
+            rationale_value = 0.0
+            if rationale and t in rationale:
+                rationale_value = _RATIONALE_MATCH_BONUS * w
+                score += rationale_value
             tiered += tier_value
             if collect_per_term_seeds and best_by_term is not None:
                 # Singleton score for [t] on this node, mirroring
@@ -663,7 +699,7 @@ def _score_query(
                     singleton = _PREFIX_MATCH_BONUS * 10 * w
                 else:
                     singleton = 0.0
-                singleton += tier_value + substr_value + source_value
+                singleton += tier_value + substr_value + source_value + rationale_value
                 if singleton > 0:
                     # Tie-break key mirrors the legacy sort+max(degree):
                     # (-singleton, -degree, label_len, nid) — the minimum
@@ -1250,6 +1286,49 @@ def _display_graph_path(graph_path: str) -> str:
         return str(graph_path)
 
 
+def _traversal_view(G: nx.Graph) -> nx.Graph:
+    """Undirected copy of `G` for BFS/DFS, with true direction kept per edge.
+
+    `_load_graph` forces `directed: True` so renderers can recover stored arc
+    order (#2309), and on a DiGraph `G.neighbors()` yields successors only. The
+    query traversals rely on `neighbors()`, so a seed with no outgoing edges — a
+    leaf function that is only ever called, imported and contained — expanded
+    to nothing: `query_graph` over MCP answered with the seed alone while the
+    CLI `query`, which loads the same file undirected, returned the callers,
+    the test and the neighbouring modules. Every other MCP tool was unaffected:
+    `get_neighbors` walks successors and predecessors explicitly, and
+    `shortest_path` builds its own graph from `_src`/`_tgt`.
+
+    Mirrors the CLI loader: traverse undirected, stash `_src`/`_tgt` on each
+    edge so `_subgraph_to_text` still renders caller->callee regardless of the
+    side the traversal reached the edge from. Markers already present on an
+    edge win, for the same reason as in the CLI (#2309). An undirected input is
+    returned as-is, so the CLI path is unchanged.
+
+    Mutual arcs `u->v` and `v->u` (mutual recursion, a circular import) fold
+    into one undirected edge on a plain `DiGraph` input, the later one winning
+    — the same fold the CLI loader performs when `json_graph.node_link_graph`
+    reads the undirected on-disk graph into an `nx.Graph`, which is what keeps
+    the two surfaces' output identical. The renderer shows one edge per pair
+    in any case. On a `MultiDiGraph` input the copy is a `MultiGraph` and the
+    stored keys are not carried over: a key is unique per unordered pair on an
+    undirected multigraph, so mutual arcs that happen to share a key would
+    fold there too; letting networkx assign the keys keeps both, and nothing
+    downstream reads the key.
+
+    A fresh copy per query rather than a cached one: `_filter_graph_by_context`
+    already copies per query when a filter applies, and the copy shares node
+    data dicts with `G`, so only the edge dicts are duplicated.
+    """
+    if not G.is_directed():
+        return G
+    H = nx.MultiGraph() if G.is_multigraph() else nx.Graph()
+    H.graph.update(G.graph)
+    H.add_nodes_from(G.nodes(data=True))
+    for u, v, d in G.edges(data=True):
+        H.add_edge(u, v, **{**d, "_src": d.get("_src", u), "_tgt": d.get("_tgt", v)})
+    return H
+
 def _query_graph_text(
     G: nx.Graph,
     question: str,
@@ -1285,7 +1364,7 @@ def _query_graph_text(
     if not start_nodes:
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
-    traversal_graph = _filter_graph_by_context(G, resolved_filters)
+    traversal_graph = _filter_graph_by_context(_traversal_view(G), resolved_filters)
     nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
@@ -3051,7 +3130,11 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
 
     def _tool_god_nodes(arguments: dict) -> tuple[str, bool, int]:  # CUSTOM: N1 三元组
         from graphify.analyze import god_nodes as _god_nodes
-        nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
+        _pct = arguments.get("exclude_hubs_percentile")
+        nodes = _god_nodes(
+            G, top_n=int(arguments.get("top_n", 10)),
+            exclude_hubs_percentile=float(_pct) if _pct is not None else None,
+        )
         lines = ["God nodes (most connected):"]
         lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
         # CUSTOM: N1 found=结果非空（god 节点列表），scanned=全图节点数（扫描语义表）。

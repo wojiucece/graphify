@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 from graphify.ids import normalize_id
 from graphify.extractors.models import LanguageConfig
@@ -818,6 +819,84 @@ def _swift_declaration_keyword(node) -> str | None:
         if not c.is_named and c.type in ("class", "struct", "enum", "extension", "actor"):
             return c.type
     return None
+
+def _python_pre_scan_underscore_collisions(root_node, source: bytes, stem: str) -> dict[str, set[str]]:
+    """Pre-scan a Python module for name-only differences that collapse to one node id.
+
+    ``ids.py:make_id`` strips leading/trailing underscores from every part before
+    normalizing, so ``_get_connection`` and ``get_connection`` mint the SAME id.
+    ``add_node`` then silently drops whichever declaration is walked second — no
+    warning, exit 0 — so a public method can be entirely absent from the graph
+    while its private-by-convention sibling (or a dunder, which strips the same
+    way: ``__x``/``__x__``/``x`` all collapse too) occupies the public name (#3302).
+
+    Returns ``{plain_nid: {raw names that would collide on it}}`` for every
+    module-level function and every direct method of a module-level class — the
+    two cases the id-minting code actually distinguishes via ``parent_class_nid``.
+    Deliberately does not recurse into nested classes or nested functions: this
+    keeps the scope key trivially exact (matching ``_make_id(stem, class_name)``,
+    which only holds because Python never populates ``namespace_stack``) rather
+    than replicating the corpus-wide id-computation rules for every nesting shape.
+    A collision entirely inside an unhandled nested scope is simply not caught
+    here — a strict miss, never a false positive, since the map is only ever
+    consulted for a nid this same scan actually computed.
+    """
+    groups: dict[str, set[str]] = {}
+
+    def _record(plain_nid: str, name: str) -> None:
+        groups.setdefault(plain_nid, set()).add(name)
+
+    for child in root_node.children:
+        if child.type == "function_definition":
+            name_node = child.child_by_field_name("name")
+            if name_node is not None:
+                name = _read_text(name_node, source)
+                if name:
+                    _record(_make_id(stem, name), name)
+        elif child.type == "class_definition":
+            class_name_node = child.child_by_field_name("name")
+            body = child.child_by_field_name("body")
+            if class_name_node is None or body is None:
+                continue
+            class_name = _read_text(class_name_node, source)
+            if not class_name:
+                continue
+            class_nid = _make_id(stem, class_name)
+            for member in body.children:
+                if member.type != "function_definition":
+                    continue
+                name_node = member.child_by_field_name("name")
+                if name_node is None:
+                    continue
+                name = _read_text(name_node, source)
+                if name:
+                    _record(_make_id(class_nid, name), name)
+
+    return {nid: names for nid, names in groups.items() if len(names) >= 2}
+
+
+def _python_underscore_salted_nid(plain_nid: str, name: str, groups: dict[str, set[str]]) -> str:
+    """Resolve a Python function/method's real node id against the collision map.
+
+    A name with no leading underscore at all is "public" per PEP 8 convention.
+    When a collision group has exactly one public member, that member keeps the
+    plain id — cross-file/documentation references overwhelmingly target the
+    public name, and keeping it stable means an incremental rebuild that adds or
+    removes a private-by-convention sibling re-points nothing. Every other
+    member of the group (including the public one when it is NOT unique, e.g.
+    `_x`/`__x` colliding with no public member at all) is salted, so the outcome
+    never depends on declaration order — mirrors the exported/unexported rule
+    the Go extractor uses for its own case-only collision (#2779).
+    """
+    names = groups.get(plain_nid)
+    if not names or len(names) < 2:
+        return plain_nid
+    public = [n for n in names if not n.startswith("_")]
+    if len(public) == 1 and name == public[0]:
+        return plain_nid
+    salt = hashlib.sha1(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
+    return _make_id(plain_nid, salt)
+
 
 def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
     """Pre-scan a Swift compilation unit and return (protocol_names, class_like_names)."""
@@ -3200,6 +3279,10 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
+    python_underscore_groups: dict[str, set[str]] = {}
+    if config.ts_module == "tree_sitter_python":
+        python_underscore_groups = _python_pre_scan_underscore_collisions(root, source, stem)
+
     def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
                  metadata: dict | None = None, col: int | None = None,
                  end_line: int | None = None, end_byte: int | None = None,
@@ -4513,10 +4596,18 @@ def _extract_generic(
                     )
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, sanitized_name)
+                if config.ts_module == "tree_sitter_python":
+                    func_nid = _python_underscore_salted_nid(
+                        func_nid, sanitized_name, python_underscore_groups
+                    )
                 add_node(func_nid, f".{func_name}()", line, **extra)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, sanitized_name)
+                if config.ts_module == "tree_sitter_python":
+                    func_nid = _python_underscore_salted_nid(
+                        func_nid, sanitized_name, python_underscore_groups
+                    )
                 add_node(func_nid, f"{func_name}()", line, **extra)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
@@ -5802,7 +5893,22 @@ def _extract_generic(
                         # Try reading the node directly (e.g. Java name field is the callee)
                         callee_name = _read_text(func_node, source)
 
-            if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
+            # _LANGUAGE_BUILTIN_GLOBALS is one union across every language, right for
+            # a BARE call (String(x) really would become a god node) but wrong for a
+            # MEMBER call: `open` is a Python builtin and `Set` a JavaScript one, so
+            # session.open() in Swift or _server.Set() in C# named after another
+            # language's builtin was silently discarded outright -- no same-file
+            # edge, but also no raw_calls entry, so cross-file resolution never even
+            # got a chance to try (#3381). A member call carries a receiver, so it
+            # is not the ambiguous case the union guards against; letting it through
+            # here while forcing tgt_nid = None below (same as the existing
+            # receiver-typed defers just past this comment) means it can only ever
+            # reach an edge through a guarded, receiver-typed resolver, never the
+            # unguarded bare-name path a real god node would need.
+            _builtin_member_call = is_member_call and callee_name in _LANGUAGE_BUILTIN_GLOBALS
+            if callee_name and (
+                callee_name not in _LANGUAGE_BUILTIN_GLOBALS or _builtin_member_call
+            ):
                 # Python member calls defer to receiver-based resolution unless the
                 # receiver is known to stay in the current class. Falling back to a
                 # bare method name for an unresolved/lowercase receiver (`d.get()` or
@@ -5831,7 +5937,7 @@ def _extract_generic(
                 _java_defer = (
                     config.ts_module == "tree_sitter_java" and is_member_call
                 )
-                if _python_defer or _java_defer or (
+                if _python_defer or _java_defer or _builtin_member_call or (
                     is_member_call
                     and member_receiver
                     and (
@@ -6265,9 +6371,23 @@ def _extract_generic(
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
     clean_edges = []
+    # Byte-identical duplicates collapse to one edge (#3251): a signature that
+    # annotates the same type twice (``def f(a: Path, b: Path)``) is ONE
+    # reference relationship at one location, but the per-occurrence emission
+    # loops above append it once per annotation — in every language block, since
+    # neither add_edge nor the raw appends de-duplicate. The copies carry zero
+    # information (build's dedup drops them anyway) and their only observable
+    # effect is tripping diagnose_extraction's exact_duplicate_edges health
+    # warning. Only edges whose ENTIRE payload is identical collapse; any
+    # differing field (source_location, context, metadata, …) keeps both.
+    _seen_edge_payloads: set[str] = set()
     for edge in edges:
         src, tgt = edge["source"], edge["target"]
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from", "re_exports")):
+            payload = json.dumps(edge, sort_keys=True, default=str)
+            if payload in _seen_edge_payloads:
+                continue
+            _seen_edge_payloads.add(payload)
             clean_edges.append(edge)
 
     # Ruby mixins were collected during the node walk (before raw_calls existed);

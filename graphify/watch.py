@@ -376,23 +376,34 @@ def _changed_path_candidates(raw: Path, *, change_root: Path, watch_root: Path) 
     return candidates
 
 
+# Every stored path that names a file in the scanned tree. ``definition_file``
+# is the implementation site recorded when a C/C++/ObjC declaration and its
+# definition merge into one node; it must stay repo-relative like its sibling
+# ``source_file`` so a graph built on one machine reads on another.
+_PORTABLE_PATH_KEYS = ("source_file", "definition_file")
+
+
 def _relativize_source_files(payload: dict, root: Path, *, scope: Path | None = None) -> None:
     for bucket in ("nodes", "edges", "hyperedges", "failed_refs"):
-        _field = "file_path" if bucket == "failed_refs" else "source_file"
+        # CUSTOM: failed_refs 的键是 file_path（knowledge-gaps sidecar 派生），上游
+        # _PORTABLE_PATH_KEYS 只覆盖 source_file/definition_file——键集按 bucket 选择，
+        # 既保 fork 定制又不丢上游 #3366 的 definition_file 可移植化。
+        keys = ("file_path",) if bucket == "failed_refs" else _PORTABLE_PATH_KEYS
         for item in payload.get(bucket, []):
-            source = item.get(_field)
-            if not source:
-                continue
-            source_path = Path(source)
-            if not source_path.is_absolute():
-                continue
-            try:
-                resolved = source_path.resolve()
-                if scope is not None and not _is_relative_to(resolved, scope):
+            for key in keys:
+                source = item.get(key)
+                if not source:
                     continue
-                item[_field] = resolved.relative_to(root).as_posix()
-            except ValueError:
-                continue
+                source_path = Path(source)
+                if not source_path.is_absolute():
+                    continue
+                try:
+                    resolved = source_path.resolve()
+                    if scope is not None and not _is_relative_to(resolved, scope):
+                        continue
+                    item[key] = resolved.relative_to(root).as_posix()
+                except ValueError:
+                    continue
 
 
 def _rebase_relative_source_files(payload: dict, source_root: Path, target_root: Path) -> None:
@@ -400,15 +411,18 @@ def _rebase_relative_source_files(payload: dict, source_root: Path, target_root:
     if source_root == target_root:
         return
     for bucket in ("nodes", "edges", "hyperedges", "failed_refs"):
-        _field = "file_path" if bucket == "failed_refs" else "source_file"
+        # CUSTOM: failed_refs 的键是 file_path（knowledge-gaps sidecar 派生），上游
+        # _PORTABLE_PATH_KEYS 只覆盖 source_file/definition_file——键集按 bucket 选择。
+        keys = ("file_path",) if bucket == "failed_refs" else _PORTABLE_PATH_KEYS
         for item in payload.get(bucket, []):
-            source = item.get(_field)
-            if not source or Path(source).is_absolute():
-                continue
-            try:
-                item[_field] = (source_root / source).relative_to(target_root).as_posix()
-            except ValueError:
-                continue
+            for key in keys:
+                source = item.get(key)
+                if not source or Path(source).is_absolute():
+                    continue
+                try:
+                    item[key] = (source_root / source).relative_to(target_root).as_posix()
+                except ValueError:
+                    continue
 
 
 class _StoredSourcePaths:
@@ -1864,10 +1878,16 @@ def _rebuild_code(
             # Dedupe parallel edges (the clustered path's DiGraph collapses them implicitly);
             # without it, --no-cluster + repeated `update` accumulate duplicates and edge
             # counts diverge across build modes (#1317).
-            from graphify.build import dedupe_edges as _dedupe_edges, dedupe_nodes as _dedupe_nodes
+            from graphify.build import (
+                dedupe_edges as _dedupe_edges,
+                dedupe_nodes as _dedupe_nodes,
+                disambiguate_file_labels_in_nodes as _disamb_labels,
+            )
+            raw_nodes = _dedupe_nodes(result.get("nodes", []))
+            _disamb_labels(raw_nodes)
             candidate_graph_data = {
                 **{k: v for k, v in result.items() if k not in ("edges", "nodes")},
-                "nodes": _dedupe_nodes(result.get("nodes", [])),
+                "nodes": raw_nodes,
                 "links": _dedupe_edges(result.get("edges", [])),
                 # Inherit the existing graph's directed flag (#2342) so
                 # `graphify update --no-cluster` can't silently drop it -
@@ -1936,11 +1956,6 @@ def _rebuild_code(
             except Exception:
                 pass
 
-            # clear stale needs_update flag if present
-            flag = out / "needs_update"
-            if flag.exists():
-                flag.unlink()
-
             if same_graph:
                 print("[graphify watch] No code-graph changes detected (--no-cluster); outputs left untouched.")
             else:
@@ -1993,9 +2008,6 @@ def _rebuild_code(
                     )
                 except Exception:
                     pass
-                flag = out / "needs_update"
-                if flag.exists():
-                    flag.unlink()
                 html_action = _reconcile_graph_html(out, existing_graph_data)
                 if html_action == "rendered":
                     print(
@@ -2184,11 +2196,6 @@ def _rebuild_code(
                     )
             except Exception as cf_err:
                 print(f"[graphify watch] callflow HTML update skipped: {cf_err}")
-
-        # clear stale needs_update flag if present
-        flag = out / "needs_update"
-        if flag.exists():
-            flag.unlink()
 
         if not no_change:
             print(f"[graphify watch] Rebuilt: {G.number_of_nodes()} nodes, "

@@ -1410,6 +1410,7 @@ def dispatch_command(cmd: str) -> None:
         from graphify.security import sanitize_label as _sanitize_label
         graph_path = _default_graph_path()
         top_n = 10
+        gn_exclude_hubs: float | None = None
         as_json = "--json" in sys.argv
         args = sys.argv[2:]
         i = 0
@@ -1434,6 +1435,20 @@ def dispatch_command(cmd: str) -> None:
                     print("error: --top must be an integer", file=sys.stderr)
                     sys.exit(1)
                 i += 1
+            elif args[i] == "--exclude-hubs" and i + 1 < len(args):
+                try:
+                    gn_exclude_hubs = float(args[i + 1])
+                except ValueError:
+                    print("error: --exclude-hubs must be a number (percentile 0-100)", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--exclude-hubs="):
+                try:
+                    gn_exclude_hubs = float(args[i].split("=", 1)[1])
+                except ValueError:
+                    print("error: --exclude-hubs must be a number (percentile 0-100)", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
             else:
                 i += 1
         gp = Path(graph_path).resolve()
@@ -1448,7 +1463,7 @@ def dispatch_command(cmd: str) -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
-        gods = _god_nodes(G, top_n=top_n)
+        gods = _god_nodes(G, top_n=top_n, exclude_hubs_percentile=gn_exclude_hubs)
         if as_json:
             print(json.dumps(gods, indent=2))
         else:
@@ -2111,7 +2126,7 @@ def dispatch_command(cmd: str) -> None:
             communities = remap_communities_to_previous(communities, previous_node_community)
         stages.mark("cluster")
         cohesion = score_all(G, communities)
-        gods = god_nodes(G)
+        gods = god_nodes(G, exclude_hubs_percentile=co_exclude_hubs)
         surprises = surprising_connections(G, communities)
         stages.mark("analyze")
         # Where outputs (GRAPH_REPORT.md, re-clustered graph.json, labels,
@@ -2720,6 +2735,12 @@ def dispatch_command(cmd: str) -> None:
         shared_links = _link_shared(merged)
         if shared_links:
             print(f"  linked {shared_links} type declaration(s) shared across repos")
+        # A member call whose receiver type lives in another repo was dropped at
+        # extraction; the caller node carries it and this finishes the edge (#3152).
+        from graphify.cross_repo_calls import link_cross_repo_member_calls as _link_calls
+        call_links = _link_calls(merged)
+        if call_links:
+            print(f"  resolved {call_links} member call(s) across repos")
         # Drop whatever compose left behind (the last input's list, possibly
         # with internal duplicates) so attach_hyperedges dedups the full
         # collection by id from a clean slate.
@@ -2954,6 +2975,8 @@ def dispatch_command(cmd: str) -> None:
             G = _jg.node_link_graph(_raw, edges="links")
         except TypeError:
             G = _jg.node_link_graph(_raw)
+        if isinstance(_raw.get("hyperedges"), list):
+            G.graph["hyperedges"] = _raw["hyperedges"]
 
         # Load optional analysis/labels
         communities: dict[int, list[str]] = {}
@@ -3129,6 +3152,9 @@ def dispatch_command(cmd: str) -> None:
                 else:
                     print(f"Added '{tag}' to global graph: +{result['nodes_added']} nodes, "
                           f"-{result['nodes_removed']} pruned. Global: {_global_path()}")
+                    if result.get("cross_repo_calls"):
+                        print(f"  resolved {result['cross_repo_calls']} "
+                              f"member call(s) across repos")
             except Exception as exc:
                 print(f"error: {exc}", file=sys.stderr); sys.exit(1)
         elif subcmd == "remove":
@@ -4416,7 +4442,9 @@ def dispatch_command(cmd: str) -> None:
         stages.mark("cluster")
         cohesion = _score_all(G, communities)
         try:
-            gods = _god_nodes(G)
+            # The percentile that suppressed hubs in cluster() above suppresses
+            # them in the ranking too (#3205).
+            gods = _god_nodes(G, exclude_hubs_percentile=cli_exclude_hubs)
         except Exception:
             gods = []
         try:

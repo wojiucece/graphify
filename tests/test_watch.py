@@ -163,6 +163,32 @@ def test_check_update_does_not_clear_flag(tmp_path):
     assert flag.exists()
 
 
+@pytest.mark.parametrize(
+    ("no_cluster", "change_topology"),
+    [(True, False), (False, False), (False, True)],
+    ids=["no-cluster", "unchanged-topology", "clustered-rebuild"],
+)
+def test_code_rebuild_preserves_semantic_update_flag(
+    tmp_path, no_cluster, change_topology
+):
+    """An AST-only rebuild cannot clear pending semantic work (#3294)."""
+    source = tmp_path / "app.py"
+    source.write_text("def before(): pass\n", encoding="utf-8")
+    assert _rebuild_code(
+        tmp_path, no_cluster=no_cluster, acquire_lock=False
+    ) is True
+
+    flag = tmp_path / "graphify-out" / "needs_update"
+    flag.write_text("docs/PRD.md\n", encoding="utf-8")
+    if change_topology:
+        source.write_text("def after(): pass\n", encoding="utf-8")
+
+    assert _rebuild_code(
+        tmp_path, no_cluster=no_cluster, acquire_lock=False
+    ) is True
+    assert flag.read_text(encoding="utf-8") == "docs/PRD.md\n"
+
+
 def test_watch_raises_without_watchdog(tmp_path, monkeypatch):
     import builtins
     real_import = builtins.__import__
@@ -633,6 +659,61 @@ def test_rebuild_honors_persisted_no_gitignore(tmp_path):
     graph = json.loads((corpus / "graphify-out" / "graph.json").read_text())
     sources = {Path(str(node.get("source_file", ""))).as_posix() for node in graph["nodes"]}
     assert any(source.endswith("generated/gen.py") for source in sources)
+
+
+def test_no_cluster_rebuild_disambiguates_colliding_file_labels(tmp_path):
+    """The raw update path keeps the same display labels as a fresh extract.
+
+    File nodes with the same basename need directory-qualified labels (#2032),
+    including after an incremental no-cluster rebuild.
+    """
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    (corpus / "pkg_a").mkdir(parents=True)
+    (corpus / "pkg_b").mkdir()
+    (corpus / "pkg_a" / "errors.ts").write_text(
+        "export class AlphaError {}\n", encoding="utf-8"
+    )
+    (corpus / "pkg_b" / "errors.ts").write_text(
+        "export class BetaError {}\n", encoding="utf-8"
+    )
+    entry = corpus / "entry.ts"
+    entry.write_text(
+        'import { AlphaError } from "./pkg_a/errors.js";\n'
+        'import { BetaError } from "./pkg_b/errors.js";\n'
+        "export const errors = [AlphaError, BetaError];\n",
+        encoding="utf-8",
+    )
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    labels = {
+        node["label"]
+        for node in graph["nodes"]
+        if node.get("id") in {"pkg_a_errors", "pkg_b_errors"}
+    }
+    assert labels == {"pkg_a/errors.ts", "pkg_b/errors.ts"}
+
+    entry.write_text(
+        entry.read_text(encoding="utf-8") + "export const count = errors.length;\n",
+        encoding="utf-8",
+    )
+    assert _rebuild_code(
+        corpus,
+        changed_paths=[entry],
+        no_cluster=True,
+        acquire_lock=False,
+    ) is True
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    labels = {
+        node["label"]
+        for node in graph["nodes"]
+        if node.get("id") in {"pkg_a_errors", "pkg_b_errors"}
+    }
+    assert labels == {"pkg_a/errors.ts", "pkg_b/errors.ts"}
 
 
 def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
@@ -4203,3 +4284,62 @@ def test_markdown_reconcile_does_not_suffix_match_top_level_target(tmp_path):
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
     links = json.loads(graph_path.read_text(encoding="utf-8"))["links"]
     assert not any(edge.get("relation") == "references" for edge in links)
+
+
+# --- portable paths: definition_file travels with source_file --------------
+
+def test_relativize_source_files_relativizes_definition_file(tmp_path):
+    """`definition_file` (the implementation site recorded when a C/C++/ObjC
+    decl/def pair merges) names a file in the scanned tree exactly like
+    `source_file`, so it must be relativized too. Left absolute, the graph
+    carries the build machine's paths and cannot be read on another checkout."""
+    from graphify.watch import _relativize_source_files
+
+    root = tmp_path.resolve()
+    payload = {"nodes": [{
+        "id": "foo_bar",
+        "source_file": str(root / "src" / "Foo.h"),
+        "definition_file": str(root / "src" / "Foo.cpp"),
+    }]}
+    _relativize_source_files(payload, root)
+    node = payload["nodes"][0]
+    assert node["source_file"] == "src/Foo.h"
+    assert node["definition_file"] == "src/Foo.cpp"
+
+
+def test_relativize_source_files_leaves_an_outside_definition_file_alone(tmp_path):
+    """The scope guard applies to the new key as well: a path outside the
+    watched tree is left as-is rather than being forced under the root."""
+    from graphify.watch import _relativize_source_files
+
+    root = (tmp_path / "repo").resolve()
+    (root).mkdir()
+    outside = (tmp_path / "elsewhere" / "Foo.cpp").resolve()
+    payload = {"nodes": [{
+        "id": "foo_bar",
+        "source_file": str(root / "Foo.h"),
+        "definition_file": str(outside),
+    }]}
+    _relativize_source_files(payload, root, scope=root)
+    node = payload["nodes"][0]
+    assert node["source_file"] == "Foo.h"
+    assert node["definition_file"] == str(outside)
+
+
+def test_rebase_relative_source_files_rebases_definition_file(tmp_path):
+    """Cache-root-relative rebasing moves both keys, so a decl/def node built
+    under a cache root keeps a definition site that resolves from the project
+    root instead of pointing one directory level off."""
+    from graphify.watch import _rebase_relative_source_files
+
+    source_root = tmp_path / "cache" / "pkg"
+    target_root = tmp_path / "cache"
+    payload = {"nodes": [{
+        "id": "foo_bar",
+        "source_file": "src/Foo.h",
+        "definition_file": "src/Foo.cpp",
+    }]}
+    _rebase_relative_source_files(payload, source_root, target_root)
+    node = payload["nodes"][0]
+    assert node["source_file"] == "pkg/src/Foo.h"
+    assert node["definition_file"] == "pkg/src/Foo.cpp"
