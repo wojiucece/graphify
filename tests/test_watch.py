@@ -732,6 +732,8 @@ def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="CUSTOM: Windows 无法 rmdir 进程自身 cwd（WinError 32）——上游 POSIX-only 测试，提 PR 后移除")
 def test_rebuild_code_deleted_cwd_without_repo_root_returns_false(tmp_path, monkeypatch, capsys):
     """Detached hooks can inherit a CWD that no longer exists.
 
@@ -756,6 +758,8 @@ def test_rebuild_code_deleted_cwd_without_repo_root_returns_false(tmp_path, monk
     assert "current working directory no longer exists" in out
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="CUSTOM: Windows 无法 rmdir 进程自身 cwd（WinError 32）——上游 POSIX-only 测试，提 PR 后移除")
 def test_rebuild_code_deleted_cwd_uses_graphify_repo_root(tmp_path, monkeypatch):
     """GRAPHIFY_REPO_ROOT lets detached hook rebuilds recover from a deleted CWD."""
     from graphify.watch import _rebuild_code
