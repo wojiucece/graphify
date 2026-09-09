@@ -1,5 +1,20 @@
 set -euo pipefail
 FAILS=0
+# --skip-global：PATH/版本类全局环境项（graphify.exe 扫描 + PATH 解析版本）降级为
+# warning 不计数——本机这些项恒 exit 1（历轮评审有记录），fail-on-✗ 守护对脚本自动化
+# 失效；仓库内存在性/注入类硬检查不受影响（上游 merge 丢文件仍必须告警）。
+SKIP_GLOBAL=0
+if [ "${1:-}" = "--skip-global" ]; then
+    SKIP_GLOBAL=1
+fi
+# 全局环境项计数（--skip-global 下不计数，恢复 exit 0 自动化守护语义）
+global_fail() {
+    if [ "$SKIP_GLOBAL" = "1" ]; then
+        echo "  (--skip-global: 环境项不计数)"
+        return 0
+    fi
+    FAILS=$((FAILS+1))
+}
 echo "=== 你的自定义改动（CUSTOM 标记）==="
 git grep -l "CUSTOM:" || echo "(无标记改动)"
 echo ""
@@ -31,7 +46,11 @@ echo "=== 新增文件存在性检查 ==="
 # per-project-watcher spec（全部五票的需求/决策/风险登记文档）：docs/specs/per-project-watcher-spec.md——上游 merge 丢弃时守护必须告警
 # serve-memory spec（R-E evict/R3 idle 自愈/R1 补齐门控三项内存优化的需求/决策/验收文档）：docs/specs/serve-memory-spec.md——上游 merge 丢弃时守护必须告警
 # serve-memory Task 01（R-E evict-before-reload）：tests/test_serve_evict_reload.py 验收 1-4 测试（峰值/逐出红线/并发/失败自愈）——上游 merge 丢弃时守护必须告警
-for f in graphify/prompt_hook.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh scripts/run_analysis.py scripts/split_semantic_seed.py scripts/rebuild_entry.py scripts/fts_cache.py scripts/symbol_utils.py graphify/serve_watcher.py graphify/rebuild_lock.py benchmarks/efficiency_benchmark.py tests/test_rebuild_state.py tests/test_response_envelope.py tests/test_redaction.py tests/test_session_snapshot.py tests/test_cache_gc.py tests/test_ranked_context.py tests/test_symbol_source.py tests/test_dispatch_trace.py tests/test_git_symbols.py tests/test_hotspots.py tests/test_structure_queries.py tests/test_schema_budget.py tests/test_efficiency_benchmark.py tests/test_resolved_by_and_gap_collector.py tests/test_fts_cache.py tests/test_get_node_fts.py tests/test_failed_refs_persistence.py tests/test_rebuild_entry.py tests/test_run_analysis.py tests/test_graph_diff_sync.py tests/test_serve_watcher.py tests/test_rebuild_lock.py tests/test_watcher_registry.py tests/test_mount_backfill_lock.py tests/test_watcher_finish.py tests/test_serve_evict_reload.py docs/specs/per-project-watcher-spec.md docs/specs/serve-memory-spec.md tests/fixtures/mini-graph.json tests/fixtures/resolved_by/python/pkg/__init__.py tests/fixtures/resolved_by/python/pkg/callee.py tests/fixtures/resolved_by/python/pkg/caller.py tests/fixtures/resolved_by/python/pkg/orphan.py tests/fixtures/resolved_by/python/pkg/class_def.py tests/fixtures/resolved_by/python/pkg/class_use.py tests/fixtures/resolved_by/typescript/repo.ts tests/fixtures/resolved_by/typescript/use.ts tests/test_extraction_contract.py tests/fixtures/sample_native_fields.py tests/test_extraction_contract_languages.py tests/test_extraction_docstring.py tests/fixtures/sample_docstrings.py tests/fixtures/sample_docstrings.ts tests/fixtures/sample_docstrings.js; do
+# serve-memory Task 02（R3 idle 自杀 + 自愈闭环）：graphify/serve_idle.py idle 监视器
+# （ASGI middleware + daemon timer + uvicorn 包装）+ scripts/ensure-graphify-server.sh 共享
+# 拉起脚本（sessionstart/prompt_hook 自愈单一事实源）+ tests/test_serve_idle.py 验收 5 +
+# tests/test_prompt_hook_ensure_server.py 验收 6/失败分支回归网——上游 merge 丢弃时守护必须告警
+for f in graphify/prompt_hook.py graphify/serve_idle.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/ensure-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh scripts/run_analysis.py scripts/split_semantic_seed.py scripts/rebuild_entry.py scripts/fts_cache.py scripts/symbol_utils.py graphify/serve_watcher.py graphify/rebuild_lock.py benchmarks/efficiency_benchmark.py tests/test_rebuild_state.py tests/test_response_envelope.py tests/test_redaction.py tests/test_session_snapshot.py tests/test_cache_gc.py tests/test_ranked_context.py tests/test_symbol_source.py tests/test_dispatch_trace.py tests/test_git_symbols.py tests/test_hotspots.py tests/test_structure_queries.py tests/test_schema_budget.py tests/test_efficiency_benchmark.py tests/test_resolved_by_and_gap_collector.py tests/test_fts_cache.py tests/test_get_node_fts.py tests/test_failed_refs_persistence.py tests/test_rebuild_entry.py tests/test_run_analysis.py tests/test_graph_diff_sync.py tests/test_serve_watcher.py tests/test_rebuild_lock.py tests/test_watcher_registry.py tests/test_mount_backfill_lock.py tests/test_watcher_finish.py tests/test_serve_evict_reload.py tests/test_serve_idle.py tests/test_prompt_hook_ensure_server.py docs/specs/per-project-watcher-spec.md docs/specs/serve-memory-spec.md tests/fixtures/mini-graph.json tests/fixtures/resolved_by/python/pkg/__init__.py tests/fixtures/resolved_by/python/pkg/callee.py tests/fixtures/resolved_by/python/pkg/caller.py tests/fixtures/resolved_by/python/pkg/orphan.py tests/fixtures/resolved_by/python/pkg/class_def.py tests/fixtures/resolved_by/python/pkg/class_use.py tests/fixtures/resolved_by/typescript/repo.ts tests/fixtures/resolved_by/typescript/use.ts tests/test_extraction_contract.py tests/fixtures/sample_native_fields.py tests/test_extraction_contract_languages.py tests/test_extraction_docstring.py tests/fixtures/sample_docstrings.py tests/fixtures/sample_docstrings.ts tests/fixtures/sample_docstrings.js; do
     if [ -f "$f" ]; then
         echo "✓ $f"
     else
@@ -108,13 +127,13 @@ while IFS= read -r f; do
                     echo "  重装 fork: uv tool install --editable D:/code/graphify_fork --force"
                     ;;
             esac
-            FAILS=$((FAILS+1))
+            global_fail
             ;;
     esac
 done < <(find /d -maxdepth 6 -name "graphify.exe" 2>/dev/null)
 if [ "$GRAPHIFY_FOUND" = "0" ]; then
     echo "✗ 未找到任何 graphify.exe（可能未安装）"
-    FAILS=$((FAILS+1))
+    global_fail
 fi
 
 # 全局命令版本（PATH 解析到的）
@@ -123,7 +142,7 @@ case "$global_ver" in
     *+fork*) echo "✓ 全局 graphify（PATH 解析）-> $global_ver" ;;
     *)
         echo "✗ 全局 graphify（PATH 解析）-> $global_ver（上游版！重装: uv tool install --editable D:/code/graphify_fork --force）"
-        FAILS=$((FAILS+1))
+        global_fail
         ;;
 esac
 
