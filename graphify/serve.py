@@ -2987,15 +2987,11 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         path = _resolve_graph_path(project_path)
         # R-E 闭包侧预释放（双引用点·闭包侧）：在 _load_ctx 前释放闭包对旧图的引用——
         # cache 侧 load() 已同步释放 entry 引用，双引用点缺一不可（任一点残留都让旧图
-        # 在重载期间继续驻留）。失败恢复旧图：当次请求仍报错（corrupt 期间每查重试每查
-        # 报错，与今日一致），但闭包恢复陈旧但完整的旧图，进程内后续路径不会撞上 G=None。
-        old = G, communities
+        # 在重载期间继续驻留）。失败时 G 停留 None：G 消费者——工具 handler（:3468）/
+        # resources（:3410）//query（:3579）——全部在 _select_graph 成功后读闭包 G，
+        # 失败即 500/isError，无路径读 None 中间态（corrupt 期间每查报错，与今日一致）。
         G, communities = None, {}
-        try:
-            G, communities = _load_ctx(path)
-        except Exception:
-            G, communities = old
-            raise
+        G, communities = _load_ctx(path)
         active_graph_path = str(Path(path).resolve())
         # 惰性挂载：首次成功加载某项目图时自动挂该项目 watcher（与查询侧"用到即加载"
         # 对称）。(project_root, out_dir) 均来自查询侧解析链——out_dir = 查询目标的

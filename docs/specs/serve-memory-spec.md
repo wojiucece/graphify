@@ -46,11 +46,11 @@ spec-source: V4（三轮 grill 裁决 + 用户三项补充发现定稿）→ V4.
 
 - **双引用点（缺一不可）**：
   1. **cache 侧**：`_GraphContextCache.load()`（serve.py:149-183）key 失配且 entry 存在 → 先 `entry["G"] = None; entry["communities"] = None` 再 `_load_entry()`，完成后整体替换。**不 pop、不触发 on_evict、保持 LRU 位**（刷新≠容量逐出）；加载本在锁内，无新增竞态
-  2. **闭包侧**：`_select_graph` 在 `_load_ctx` 前 `G, communities = None, {}`；**失败恢复旧图**（`except: G, communities = old; raise`）——当次请求服务陈旧但完整的旧图，freshness 信封标注
+  2. **闭包侧**：`_select_graph` 在 `_load_ctx` 前 `G, communities = None, {}`。**失败 G 停留 None**（不可观测论证：G 消费者——工具 handler / resources / /query——全部在 `_select_graph` 成功后读闭包 G，失败即 500/isError，无路径读 None 中间态；corrupt 期间每查报错，与今日行为一致）。**I1 勘误（2026-09-09 review）**：删除原"失败恢复旧图（`except: G, communities = old; raise`）——当次请求服务陈旧但完整的旧图"——`old = G, communities` 全程强引用旧图，闭包 G 与 cache entry["G"] 是同一对象，`entry["G"]=None` 在闭包路径释放不掉任何东西，生产 /query 峰值削减被完全抵消；且"当次请求服务旧图"不成立（raise 后 500，旧图实际不被服务）
 - **失败路径裁决（grill Q1）**：cache 侧重载失败 → **pop entry**。置空 entry 若原样留存（G=None + 旧 key），下次 stat 同 key 缓存命中返回 (None, None) 崩溃；pop 语义 = "缓存只持有确认新鲜的图"，corrupt 期间每查重试每查报错——与今日行为一致（今日 key 恒失配同样从不服务旧图）
-- **/query 阻塞窗口（预期行为，非 bug）**：重建后首次 /query 在 `_select_graph` 处拿锁阻塞 2-4s（锁内 json 解析），完成后返回正常完整结果——HTTP 感知为"这次慢"，**不降级本地回退**。G=None 中间态被锁互斥完全屏蔽：load() 全程持锁（stat→置空→加载→替换原子），get() 同锁（serve.py:193），时序上 load 先于 get → get 必见重载完成后的新 entry。corrupt 场景走 handler 的 except → 500 → prompt-hook 本地回退（serve.py:3557 既有错误路径，非本窗口）。**并发测试断言"阻塞 ≤2-4s 后正常返回"，不是降级——不得为制造 None 可见窗口把置空移出锁外（那才引入真竞态）**
+- **/query 阻塞窗口（预期行为，非 bug）**：重建后首次 /query 在 `_select_graph` 处拿锁阻塞 2-4s（锁内 json 解析），完成后返回正常完整结果——HTTP 感知为"这次慢"，**不降级本地回退**。G=None 中间态被锁互斥完全屏蔽：load() 全程持锁（stat→置空→加载→替换原子），get() 同锁（serve.py:202），时序上 load 先于 get → get 必见重载完成后的新 entry。corrupt 场景走 handler 的 except → 500 → prompt-hook 本地回退（serve.py:3585 既有错误路径，非本窗口）。**并发测试断言"阻塞 ≤2-4s 后正常返回"，不是降级——不得为制造 None 可见窗口把置空移出锁外（那才引入真竞态）**。**M4 注记（I1 修复随带）**：默认图 corrupt pop 后，无 project_path 的 /query 走 `_ctx_cache.get()` → 404 "no graph loaded"（非静默服务旧图）——方向更安全（有 project_path 则 `_select_graph` → 500）；自愈后恢复
 - **归属**：~15 行留在 serve.py——load() 行为修补，与票 03 on_evict 接线同待遇（分层惯例的上游行为修补例外）
-- **G 消费者审计**：已核实工具 handler（serve.py:3441）/ resources（:3383）/ /query（:3552）全部先过 `_select_graph`；实施时逐路径复核确认
+- **G 消费者审计**：已核实工具 handler（serve.py:3468）/ resources（:3410）/ /query（:3579）全部先过 `_select_graph`；实施时逐路径复核确认
 
 ### R3：idle 自杀 + 自愈闭环
 

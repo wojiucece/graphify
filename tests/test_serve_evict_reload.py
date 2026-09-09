@@ -229,12 +229,13 @@ def test_reload_refresh_does_not_evict_watcher(polling, fast_watch, tmp_path):
 
 # === 验收 3：并发 /query 在重载窗口内阻塞后正常返回 ===
 
-def test_concurrent_query_during_reload_blocks_then_returns(tmp_path):
-    """验收 3：重载窗口内并发 /query 阻塞后正常返回，无 404/500 或空结果。
+def test_query_during_reload_returns_normally_after_reload_window(tmp_path):
+    """验收 3：重载窗口内到达的 /query 全部正常返回，无 404/500 或空结果。
 
-    大图（n=4500）使重载 JSON 解析窗口可观（数百 ms）。变更文件后并发发 5 个 /query：
-    首个触发重载（持缓存锁），其余在 _select_graph 处拿锁阻塞（spec"阻塞窗口"预期
-    行为，非降级），完成后全部返回正常完整结果。
+    局限说明（不谎称真并发）：starlette TestClient 经 anyio portal 把 5 个线程的 /query
+    串行化到单一事件循环——首个查询触发重载（持缓存锁 + 锁内 json 解析，数百 ms），
+    其余查询在事件循环/传输层排队（阻塞窗口，spec 预期行为非降级），重载完成后全部
+    返回。本测试验证"重载窗口内到达的查询都正常返回"，不强于实际激发行为。
     """
     pytest.importorskip("mcp")
     pytest.importorskip("starlette")
@@ -295,12 +296,14 @@ def test_reload_failure_pops_cache_no_none_hit_and_self_heals(tmp_path):
     assert cache.get(graph_path) is not None
 
 
-def test_select_graph_restores_old_graph_on_failure(tmp_path):
-    """验收 4（闭包侧）：_select_graph 重载失败恢复旧图——闭包 G 恢复为旧图对象
-    （非 None 中间态），进程内后续路径不会撞上 G=None；修复后下查自愈。
+def test_select_graph_leaves_G_none_on_failure_and_self_heals(tmp_path):
+    """验收 4（闭包侧，I1 修订）：_select_graph 重载失败 G 停留 None——G 消费者全部在
+    _select_graph 成功后读闭包 G（失败即 500/isError），无路径读 None 中间态；修复后
+    下查自愈。
 
-    white-box：经 __closure__ 定位 G cell（_graph_cell 按 nx.Graph 类型识别）。
-    该行为无 HTTP/工具可观测出口（_select_graph 失败即 500/isError），故直读闭包态。
+    white-box：经 __closure__ 定位 G cell（_graph_cell 按 nx.Graph 类型识别）。G cell
+    引用在失败前取得（此时持 nx.Graph），失败后同一 cell 应为 None。
+    原"失败恢复旧图"已按 I1 删除——old 恢复强引用旧图会抵消闭包路径峰值削减。
     """
     import graphify.serve as S
     root = _mini_proj(tmp_path)
@@ -312,15 +315,105 @@ def test_select_graph_restores_old_graph_on_failure(tmp_path):
     gcell = _graph_cell(server._graphify_select_graph)
     old_g = gcell.cell_contents
     assert old_g is not None and "alpha" in old_g.nodes()
-    # 破坏 graph.json → 重载失败 → 闭包恢复旧图
+    # 破坏 graph.json → 重载失败 → 闭包 G 停留 None（不恢复旧图）
     Path(graph_path).write_text("{not valid json", encoding="utf-8")
     with pytest.raises(RuntimeError):
         server._graphify_select_graph(str(root))
-    assert gcell.cell_contents is old_g, "重载失败后闭包 G 应恢复旧图对象（非 None 中间态）"
+    assert gcell.cell_contents is None, "重载失败后闭包 G 应停留 None（I1：不恢复旧图）"
     # 修复 → 下查自愈
     _write_graph(graph_path, ["alpha", "beta", "gamma"])
     server._graphify_select_graph(str(root))
     assert "gamma" in gcell.cell_contents.nodes(), "修复后下查应自愈（闭包 G 更新为新图）"
+
+
+def test_select_graph_reload_frees_old_graph(polling, fast_watch, tmp_path):
+    """I1 回归网（本应抓到 I1 的测试）：闭包路径重载必须真实释放旧图——经 _select_graph
+    驱动重载，_load_entry 进行中旧图 weakref 已死。闭包 G 与 cache entry["G"] 同一对象，
+    双释放缺一不可；曾经的 old 恢复会强引用旧图使本探针抓到旧图存活（生产峰值削减被抵消）。"""
+    import weakref
+    import graphify.serve as S
+    root = _mini_proj(tmp_path)
+    graph_path = root / "graphify-out" / "graph.json"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_big_graph(graph_path, 2000)
+    server = S._build_server(str(graph_path), watch=True)
+    registry = server._graphify_registry
+    try:
+        server._graphify_select_graph(str(root))        # 加载旧图（闭包路径）
+        gcell = _graph_cell(server._graphify_select_graph)
+        old_ref = weakref.ref(gcell.cell_contents)
+        assert old_ref() is not None, "前置：旧图对象存活"
+        observed: dict[str, bool] = {}
+        _orig = registry._ctx_cache._load_entry
+
+        def _probe(path, key):
+            observed["old_alive_during_load"] = old_ref() is not None
+            return _orig(path, key)
+
+        registry._ctx_cache._load_entry = _probe
+        _write_big_graph(graph_path, 2500)              # key 变化
+        server._graphify_select_graph(str(root))        # 闭包路径重载
+        assert observed.get("old_alive_during_load") is False, \
+            "闭包路径重载期间旧图仍存活（I1：old 恢复强引用抵消峰值削减）"
+    finally:
+        registry.stop_all()
+
+
+def test_cache_lock_blocks_get_during_reload_never_nulled(tmp_path):
+    """M1：锁内红线回归网——重载（load 持锁：置空→加载→替换原子）期间，并发 get()
+    阻塞至重载完成，返回重载后有效 entry（永不见 G=None 中间态）。若把置空移出锁外，
+    并发 get() 会在空窗内直接拿到 nulled entry——本探针抓此回归。"""
+    import threading
+    import time as _time
+    from graphify.serve import _GraphContextCache
+    cache = _GraphContextCache(8)
+    graph_path = str(tmp_path / "graph.json")
+    _write_big_graph(Path(graph_path), 2000)
+    cache.load(graph_path)
+    _write_big_graph(Path(graph_path), 2500)            # key 变化 → 重载
+    entered = threading.Event()
+    proceed = threading.Event()
+    get_started = threading.Event()
+    _orig = cache._load_entry
+
+    def _stall_load_entry(path, key):
+        entered.set()
+        proceed.wait(timeout=30)                        # 卡住重载 → get() 必在重载窗口内发起
+        return _orig(path, key)
+
+    cache._load_entry = _stall_load_entry
+    load_results = []
+
+    def _do_load():
+        try:
+            cache.load(graph_path)
+            load_results.append("ok")
+        except Exception as e:  # pragma: no cover
+            load_results.append(f"err:{e}")
+
+    lt = threading.Thread(target=_do_load)
+    lt.start()
+    assert entered.wait(timeout=10), "重载未进入 _load_entry（卡点失效）"
+    get_results = []
+
+    def _do_get():
+        get_started.set()
+        t0 = _time.perf_counter()
+        entry = cache.get(graph_path)
+        get_results.append((_time.perf_counter() - t0, entry))
+
+    gt = threading.Thread(target=_do_get)
+    gt.start()
+    get_started.wait(timeout=10)
+    _time.sleep(0.2)                                    # 让 get() 进入锁阻塞
+    proceed.set()                                       # 放行重载
+    lt.join(timeout=30)
+    gt.join(timeout=30)
+    assert load_results == ["ok"], f"重载失败：{load_results}"
+    elapsed, entry = get_results[0]
+    assert entry is not None and entry["G"] is not None, \
+        f"并发 get() 不应见 nulled entry，got {entry}"
+    assert elapsed >= 0.2, f"get() 应阻塞至重载完成（锁互斥），elapsed={elapsed:.3f}s"
 
 
 def test_query_during_corrupt_graph_errors_then_self_heals(tmp_path):
