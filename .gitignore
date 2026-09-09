@@ -49,3 +49,6 @@ graphify-complete-plan-*.md
 方案审核报告.md
 # 本地项目级 OpenCode hook（graphify install opencode 生成的 .opencode/plugins/graphify.js + opencode.json，不进 fork 仓库）
 .opencode/
+# 本地工具临时目录（superpowers 插件缓存 / 调试 scratch 残骸，不进仓库）
+.scratch/
+.superpowers/
