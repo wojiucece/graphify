@@ -237,6 +237,38 @@ def test_gate_phase_error_forces_rebuild(polling, tmp_path):
         "phase=rebuilding 状态应判陈旧（无条件重建）"
 
 
+# === Minor 3（用户终审）：门控扫描限流 semaphore 并发上界 ========================
+
+def test_scan_semaphore_limits_concurrency():
+    """Minor 3（用户终审）：_BACKFILL_SCAN_SEM 并发限流——同时运行扫描线程数 ≤ 容量
+    （默认 3，GRAPHIFY_SCAN_SEM 旋钮可调）——Major 1 评审 Major B 的守护测试，防限流器
+    被悄悄删掉。N > 容量并发 acquire，驻留采样窗口内 max_running 必须 ≤ 容量。"""
+    import graphify.serve_watcher as W
+    import threading
+    cap = W._BACKFILL_SCAN_SEM_CAP
+    n_threads = cap + 5
+    lock = threading.Lock()
+    state = {"running": 0, "max": 0}
+
+    def worker():
+        W._BACKFILL_SCAN_SEM.acquire()
+        with lock:
+            state["running"] += 1
+            state["max"] = max(state["max"], state["running"])
+        time.sleep(0.05)  # 采样窗口：所有已 acquire 线程同时驻留此段
+        with lock:
+            state["running"] -= 1
+        W._BACKFILL_SCAN_SEM.release()
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert 1 <= state["max"] <= cap, \
+        f"扫描并发 {state['max']} 超出容量 {cap}（限流器失效或被删）"
+
+
 # === mixed batch 不门控（显式跳过防误用）========================================
 
 def test_gate_mixed_batch_not_gated(polling, tmp_path):

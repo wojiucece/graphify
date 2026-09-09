@@ -14,7 +14,10 @@ spec: docs/specs/serve-memory-spec.md §Testing 验收 9（:106）+ US1/US5（:2
   所有挂载图均新鲜（刚 rebuild），补齐批次必须真实发生（flush ≥ 1）且门控全部跳过
   （pipeline == 0）。
 
-测量口径注记：阈值本身与 OS 无关；跨平台一致按"进程 RSS 上近似"口径。
+测量口径注记（用户 Minor 1，口径差异声明）：win32 WorkingSet64 = **当前值**；posix
+ru_maxrss = **进程峰值**（含生成语料 + rebuild 峰值，一般 > 当前值）——两平台口径不同属
+**声明的已知限制**（不统一：峰值口径更严格，阈值超限属安全侧告警；Linux CI 上 250/400MB
+阈值有峰值 flake 风险，如偶发超限先查是否峰值口径所致）。
 """
 import os
 import subprocess

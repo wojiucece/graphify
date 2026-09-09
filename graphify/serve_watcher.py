@@ -94,12 +94,20 @@ _BACKFILL_SCAN_MAX_FILES = 200000
 # 不回归）；<< touch/NTP 级未来戳（秒级，恒被剪）。剪后自愈：墙钟越过未来值后下轮重建拿
 # 干净参照，粘性打破。回退路径 captured_at 是过去值天然安全，无需钳。
 _MTIME_CLAMP_TOLERANCE_S = 1.0
-# Major 1 评审（用户 Major B）：门控扫描限流 semaphore——重建闸不管扫描串行后（Major 1
-# 把扫描移出闸），N 项目并发挂载 = N 并发全树扫描（CPU/IO 叠加 → 单扫变慢 → 撞 2s 上界
-# → 退化无条件重建，门控收益丢失）。独立于重建闸的模块级 semaphore（容量 3）只约束扫描：
-# 2-4 项目无感，项目多时防退化；扫描线程内持到扫描真正完成（超时未回收的线程也占位，
-# 真并发上界成立），被限流等待计入 2s join 上界 → 退无条件（安全侧）。
-_BACKFILL_SCAN_SEM = threading.BoundedSemaphore(3)
+# Major 1 评审（用户 Major B）+ Minor 2：门控扫描限流 semaphore——重建闸不管扫描串行后
+# （Major 1 把扫描移出闸），N 项目并发挂载 = N 并发全树扫描（CPU/IO 叠加 → 单扫变慢 → 撞
+# 2s 上界 → 退化无条件重建，门控收益丢失）。独立于重建闸的模块级 semaphore 只约束扫描：
+# 2-4 项目无感，项目多时防退化；扫描线程内持到扫描真正完成（超时未回收的线程也占位，真
+# 并发上界成立），被限流等待计入 2s join 上界 → 退无条件（安全侧）。
+# 容量 = GRAPHIFY_SCAN_SEM 环境旋钮（默认 3；<=0/畸形回退 3——防 0 容量死锁 = 无扫描能过
+# → 门控恒退化无条件）。
+try:
+    _BACKFILL_SCAN_SEM_CAP = int(os.environ.get("GRAPHIFY_SCAN_SEM", "3"))
+except (TypeError, ValueError):
+    _BACKFILL_SCAN_SEM_CAP = 3
+if _BACKFILL_SCAN_SEM_CAP <= 0:
+    _BACKFILL_SCAN_SEM_CAP = 3
+_BACKFILL_SCAN_SEM = threading.BoundedSemaphore(_BACKFILL_SCAN_SEM_CAP)
 
 
 def _default_max_watchers() -> int:
@@ -794,8 +802,9 @@ class ServeWatcher:
             "phase": "error" if error else "complete",
             "started": self._state_started,
             "finished": time.time(),
-            # Minor 1（用户终审）：last_duration 继承语义——取 max(本轮, 上轮)，防 serve.py
-            # stale_index 阈值被增量重建塌回 floor（仿 _begin_state 的 _read_prev_duration 先例）。
+            # Minor 1/4（用户终审）：last_duration = 单调不减 high-water mark——取 max(本轮,
+            # _read_prev_duration 上轮)，stale_index 阈值只增不减属保守方向（防长重建阈值被
+            # 增量重建塌回 floor；消费点 serve.py:1746 同注释声明设计意图）。
             "last_duration": max(round(time.time() - self._state_started, 1),
                                  rebuild_entry._read_prev_duration(self._root)),
             "project": str(self._root),
@@ -850,8 +859,9 @@ class ServeWatcher:
             "phase": "complete",
             "started": started,
             "finished": time.time(),
-            # Minor 1（用户终审）：last_duration 继承语义——取 max(本轮, 上轮)，防 serve.py
-            # stale_index 阈值被增量重建塌回 floor（仿 _begin_state 的 _read_prev_duration 先例）。
+            # Minor 1/4（用户终审）：last_duration = 单调不减 high-water mark——取 max(本轮,
+            # _read_prev_duration 上轮)，stale_index 阈值只增不减属保守方向（防长重建阈值被
+            # 增量重建塌回 floor；消费点 serve.py:1746 同注释声明设计意图）。
             "last_duration": max(round(time.time() - started, 1),
                                  rebuild_entry._read_prev_duration(self._root)),
             "project": str(self._root),

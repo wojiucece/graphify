@@ -35,7 +35,7 @@ Rules:
 ### 版本号约定
 - `pyproject.toml` version 必须带 `+fork.N` 后缀（PEP 440 local version，区分上游 graphifyy）
 - 上游升 0.9.8 时本地改 `0.9.8+fork.N`，不要去掉 `+fork`
-- `uv.lock` 里 graphifyy version 带 `+fork.N`（uv 新版 local version 已进 lock，lock:1092 可见
+- `uv.lock` 里 graphifyy version 带 `+fork.N`（uv 新版 local version 已进 lock，lock:1093 可见
   `0.9.56+fork.1`）——与 pyproject 同步即可，非"不进 lock"的旧表述（reviewer Minor 5 勘误）
 
 ### Hook 配置

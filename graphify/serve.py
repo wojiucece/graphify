@@ -1743,6 +1743,11 @@ def _derive_freshness(state_path):
         # _tool_get_changed_symbols / rebuild_entry._read_prev_git_head 同防护）。
         return "fresh"
     if d.get("phase") == "rebuilding":
+        # Minor 4（用户终审）：last_duration 为**单调不减 high-water mark**（写侧
+        # _end_state/_write_source_count 取 max(本轮, _read_prev_duration 上轮)）——stale_index
+        # 阈值只增不减属保守方向（防长重建阈值被增量重建塌回 floor，使超时效逃生 2x 项恒为 0
+        # 的设计静默失效）；若改"本轮真实时长"语义需动状态 schema + _read_prev_duration 继承链
+        #（旧状态文件字段兼容），成本>收益，故以注释声明设计意图。
         limit = max(2 * float(d.get("last_duration", 0)), _REBUILD_STALE_FLOOR_S)
         if time.time() - float(d.get("started", 0)) > limit:
             print(f"[serve] 状态文件超时效（{limit:.0f}s），判 stale_index", file=sys.stderr)
