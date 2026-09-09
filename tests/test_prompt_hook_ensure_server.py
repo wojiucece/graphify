@@ -293,8 +293,9 @@ def test_self_heal_prompt_after_server_death(tmp_path, monkeypatch):
     次条 prompt 恢复 HTTP（真实结果，非本地哨兵）。
 
     环境守卫：git-bash / curl / graphify-mcp 任一不可用则 skip（脚本自愈是 POSIX 语义，
-    无 git-bash 的 Windows 环境无法实证）。venv Scripts 前置 PATH，保证拉起的 server 是
-    worktree 源码（editable）。
+    无 git-bash 的 Windows 环境无法实证）。venv Scripts 前置 PATH 到 pytest 进程 env
+    （monkeypatch，_ensure_server 内部 Popen 继承 os.environ 即命中）→ 保证自愈拉起的是
+    worktree 源码（editable），非全局 uv tool 的 graphify-mcp（后者指向主检出）。
     """
     pytest.importorskip("mcp")
     import time
@@ -325,12 +326,15 @@ def test_self_heal_prompt_after_server_death(tmp_path, monkeypatch):
     port = _free_port()
     # I2（评审）：只设 GRAPHIFY_MCP_PORT——ensure 脚本以它为单一事实源（探活+拉起同端口），
     # 不再设 GRAPHIFY_SERVE_PORT（曾与 MCP_PORT 分裂致自愈环静默断裂，E2E 同值曾掩盖之）。
-    env = dict(os.environ,
-               PATH=venv_bin + os.pathsep + os.environ.get("PATH", ""),
-               GRAPHIFY_MCP_PORT=str(port),
-               GRAPHIFY_SERVE_LAUNCH_MARKER=str(tmp_path / "launch.marker"))
+    # venv Scripts 前置 PATH 到 pytest 进程 env（monkeypatch）——_ensure_server 内部 Popen
+    # 不带 env= 继承 os.environ，此处设置即命中 worktree editable 的 graphify-mcp；仅传初始
+    # server Popen 的 env= 的话自愈拉起的是全局 uv tool 的 graphify-mcp（指向主检出），
+    # 无全局安装的 CI 必挂（生产行为不变：prompt_hook 进程 env 本就是该用的 env）。
+    monkeypatch.setenv("PATH", venv_bin + os.pathsep + os.environ.get("PATH", ""))
     monkeypatch.setenv("GRAPHIFY_MCP_PORT", str(port))
     monkeypatch.setenv("GRAPHIFY_SERVE_LAUNCH_MARKER", str(tmp_path / "launch.marker"))
+    env = dict(os.environ, GRAPHIFY_MCP_PORT=str(port),
+               GRAPHIFY_SERVE_LAUNCH_MARKER=str(tmp_path / "launch.marker"))
     # 本地回退哨兵：区分"本地"与"HTTP 恢复"
     monkeypatch.setattr(ph, "_query_locally", lambda prompt, graph_path: "LOCAL-FALLBACK")
     monkeypatch.setenv("GRAPHIFY_ALLOW_HTTP_MCP", "1")

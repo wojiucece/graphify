@@ -112,12 +112,16 @@ def _finish_state(root: Path, lock: Path, started: float, error: bool = False,
 
 def _git_head(root: Path) -> str | None:
     """C3：rev-parse HEAD 全 hash；git 不在 PATH/非 git 仓库/失败 -> None（省略字段语义）.
-    R5-1：subprocess 直调（无 shell 管道）；CREATE_NO_WINDOW 防 Windows 弹窗（F5 同款）."""
+    R5-1：subprocess 直调（无 shell 管道）；CREATE_NO_WINDOW 防 Windows 弹窗（F5 同款）.
+    Major A（用户终审）：timeout=5——本函数现被 serve_watcher._write_source_count 在
+    _run_pipeline 末尾调用（持 rebuild_lock + 全局 gate 的高频路径），git 挂住（网络盘/慢
+    FS）→ watcher 永久阻塞 → 全局闸和锁全持有 → 跨项目死锁无看门狗。except 捕
+    subprocess.SubprocessError（TimeoutExpired 是其子类），超时自然走 None 省略语义。"""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           creationflags=flags)
+                           creationflags=flags, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
