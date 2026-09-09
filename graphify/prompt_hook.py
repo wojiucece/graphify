@@ -13,6 +13,7 @@ v3 核查备注：
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -112,6 +113,50 @@ def _safe_load_graph(graph_path: str):
         return None
 
 
+# ── 自愈：ensure-server（R3，serve-memory）────────────────────────────────
+
+def _default_ensure_script() -> str | None:
+    """定位共享脚本 scripts/ensure-graphify-server.sh（fork 仓库根，graphify/ 上一级）。
+
+    可用 GRAPHIFY_ENSURE_SERVER_SCRIPT 覆盖（自定义部署）。定位失败返回 None（静默跳过，
+    hook 绝不因自愈卡 prompt）。
+    """
+    override = os.environ.get("GRAPHIFY_ENSURE_SERVER_SCRIPT", "").strip()
+    if override:
+        return override
+    try:
+        import graphify
+        candidate = str(Path(graphify.__file__).resolve().parent.parent
+                        / "scripts" / "ensure-graphify-server.sh")
+    except Exception:
+        return None
+    return candidate
+
+
+def _ensure_server(cwd: str) -> None:
+    """非阻塞拉起 graphify HTTP server（R3 自愈闭环）。
+
+    调共享脚本 scripts/ensure-graphify-server.sh（与 sessionstart 同一事实源）。脚本内
+    先探活（/health 通了直接退出）再防抖（launch-marker <30s 新鲜跳过拉起），故本函数可
+    每 prompt 触发而不产生拉起风暴——验收 6"ensure-server 恰一次"的背书。非阻塞：Popen
+    不 wait（nohup 后台进程），失败静默（脚本缺失/Popen 异常一律不抛——hook 永不因此
+    卡 prompt）。复活 default 漂移裁决（spec :66）：拉起者 cwd 成为 pinned default
+    （prompt-hook 恒传 project_root，default 几乎无消费方，接受漂移）。
+    """
+    script = _default_ensure_script()
+    if not script or not os.path.exists(script):
+        return
+    try:
+        subprocess.Popen(
+            ["bash", script, cwd],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 # ── 查询策略 ────────────────────────────────────────────────────
 
 def _query_via_http(prompt: str, project_path: str) -> str | None:
@@ -142,7 +187,11 @@ def _query_via_http(prompt: str, project_path: str) -> str | None:
                 body = json.loads(resp.read().decode("utf-8"))
                 return body.get("result")
     except (URLError, ConnectionError, OSError, json.JSONDecodeError, ValueError):
-        pass
+        # R3 自愈（失败分支）：非阻塞拉起 server（脚本内探活+防抖保证恰一次语义）。
+        # 本条走 _query_locally 回退（_query_graph 在 result None 时自动落本地），
+        # 下一条 prompt 恢复 HTTP（server 拉起后毫秒级响应）。仅连接级失败触发——
+        # 非 200 状态（server 活着）不在本 except，不误拉起。
+        _ensure_server(project_path)
     return None
 
 
