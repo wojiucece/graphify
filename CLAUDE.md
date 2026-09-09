@@ -12,7 +12,7 @@ Rules:
 
 ### 通用（fork 专属环境 quirks）
 - **graphify AST 盲区**：嵌在 Python 字符串里的 JS/JSON 代码不被二次解析（如 `_OPENCODE_PLUGIN_JS` 里的 JS 符号 `GraphifyPlugin`/`tool.execute.before` 不进图谱）；任意字符串字面量内容 graphify 也不索引——查"字符串内容/字符串内嵌代码"要回退 read/grep，graphify 只管符号定位
-- **check-custom.sh 路径**：脚本不 cd 到 fork 目录，必须 `cd D:/code/graphify_fork && bash scripts/check-custom.sh` 跑（相对路径 `graphify/__main__.py` 在 `D:/code` 下找不到，会误报全部缺失）
+- **check-custom.sh 路径**：脚本不 cd 到 fork 目录，必须 `cd D:/code/graphify_fork && bash scripts/check-custom.sh` 跑（相对路径检查清单里 `graphify/prompt_hook.py` 等文件在 `D:/code` 下找不到，会误报全部缺失）
 
 ### 升级上游
 - **用 merge 策略**（非 rebase）：`git fetch upstream` -> `git merge upstream/v8 --no-edit`。保留 fork 定制提交 hash，可逆（`git reset --hard <备份tag>` 回退），fork 维护惯例
@@ -44,14 +44,14 @@ Rules:
 - 三个生命周期脚本命名统一：`sessionstart-graphify-server.sh` / `sessionend-graphify-update.sh` / `precompact-graphify-update.sh`
 - 改 hook 后跑 `bash scripts/check-custom.sh` 验证（双向检查：PreToolUse 该禁用 + UserPromptSubmit 该启用）
 
-### Backend 锁定（AstronCodingPlan）
-- `~/.graphify/providers.json` 配了 custom provider `AstronCodingPlan`（讯飞星火 MaaS，OpenAI 兼容 API，`env_key: apiKey`）
-- `apiKey` 环境变量设了 + 不设其他标准 key → `detect_backend()` 自动选 AstronCodingPlan，不漂移
-- 建图谱：`graphify extract . --backend AstronCodingPlan`（调 LLM，有费用）
+### Backend 锁定（ArkCodingPlan）
+- `~/.graphify/providers.json` 配了 custom provider `ArkCodingPlan`（火山方舟 Ark，OpenAI 兼容 API，`default_model: deepseek-v4-flash`，`env_key: apiKey`）
+- `apiKey` 环境变量设了 + 不设其他标准 key → `detect_backend()` 自动选 ArkCodingPlan，不漂移
+- 建图谱：`graphify extract . --backend ArkCodingPlan`（调 LLM，有费用）
 - 查图谱（query/path/explain/prompt-hook）不调 LLM，纯词法 + 图遍历
 
 ### prompt-hook 引导句（三层分流，26 token）
-- `prompt_hook.py:249` 的 note 是 fork 核心，每次 UserPromptSubmit 注入
+- `prompt_hook.py:252` 的 note 是 fork 核心，每次 UserPromptSubmit 注入
 - 当前文案：`graphify pre-query: symbols→file+line here; strings/patterns→grep; large output→sandbox not context.`
 - 三层分流对应完整分工链：符号定位→graphify（给 file+line）/ 字符串模式→grep（graphify 不索引任意字符串）/ 大输出→sandbox 不进 context（context-mode 兜底）
 - 写 `sandbox` 不写 `ctx_execute`——解耦，靠 SessionStart 注入的工具栈让模型自己关联，context-mode 卸载/改名 nudge 不过时
@@ -60,9 +60,9 @@ Rules:
 - 原方案 `graphify graph pre-query. Use directly, skip grep/read.`（13 token）留在 `prompt_hook.py` 注释里作回退参考，缺点是 `skip grep` 过度承诺
 
 ### OpenCode 引导句（三层分流，纯 ASCII，28 token）
-- `graphify/install.py:1381` 的 `_OPENCODE_PLUGIN_JS` 里 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）。（坐标勘误 2026-09-07：常量定义随上游重构在 `install.py`，非 `__main__.py:1548`——旧坐标是历史遗留描述）
+- `graphify/install.py:1381` 的 `_OPENCODE_PLUGIN_JS` 里 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）
 - 当前文案：`[graphify] pre-query: symbols get file+line here; strings/patterns need grep; large output to sandbox not context.`
-- 跟 prompt-hook 同一套三层分流哲学，但纯 ASCII（OpenCode TUI 渲染零风险，注释 1528 保证 plain words 安全；`→` 在 TUI 未验证故不用）
+- 跟 prompt-hook 同一套三层分流哲学，但纯 ASCII（OpenCode TUI 渲染零风险，纯 ASCII 字符集本身保证；`→` 在 TUI 未验证故不用）
 - echo 文案硬约束：双引号内禁 backticks/`$()`/裸双引号/反斜杠（触发 bash 命令替换）；分号在双引号内是字面字符安全，双引号外的 ` ; ` 才分隔命令
 - 砍了原版的 `GRAPH_REPORT.md` 引导——hook 时机是 bash 前，该提醒分流不是读报告（时机错配）
 - 改源码后要在 OpenCode 项目重跑 `graphify install` 重新生成 `.opencode/plugins/graphify.js`（跟 Claude Code 的 `graphify claude install` 同理）
@@ -81,7 +81,7 @@ Rules:
 - **check-custom.sh 守护**：检查 before + after 都存在 + after 用 run 非 try + fail-open guard 存在（rebase 丢失 after 时告警，非 bash 工具会静默不提醒）
 
 ### graphify vs context-mode 分工框架（判断 PreToolUse 是否重启用）
-- **graphify 解决"去哪找"（定位阶段）**：query/explain/path 返回子图，AST 提取的符号节点带 `loc=L<行>` 精确行号（`extract.py:1796`），文件级节点 `loc=L1` 是占位非真行号
+- **graphify 解决"去哪找"（定位阶段）**：query/explain/path 返回子图，AST 提取的符号节点带 `loc=L<行>` 精确行号（存储键 `source_location`，`extract.py:520` 赋值，serve 展示为 `loc=`），文件级节点 `loc=L1` 是占位非真行号
 - **context-mode 解决"怎么读"（提取阶段）**：大输出走 sandbox（ctx_execute/ctx_batch_execute），字节不进上下文
 - **Read 场景：接力关系**——graphify 给行号 → Read offset 小段 → 输出小不触发 context-mode；graphify 的 `loc=` 越准，context-mode 越少被触发
 - **grep 场景：竞争关系**——grep 的定位+提取是同一动作，两个 hook 抢主导权；graphify 只覆盖 A 类（符号查找），B/C/D 类（字符串/模式/验证）无能为力；`loc=` 行号优势在 grep 用不上（grep 要匹配行不是符号定义行）
@@ -116,10 +116,12 @@ adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
   mkdir 原子锁 + stale 接管；状态文件 schema v2，指纹 = graph.json (mtime_ns, size)）
 - run_analysis.py -- analysis-only 编排器（graph.json 直读；cluster/analyze/report/wiki +
   knowledge-gaps sidecar 从 graph.json failed_refs 派生；不写图）
-- split_semantic_seed.py -- 旧图 semantic 种子拆分（rebuild_entry.py:377 引用默认种子路径
-  <out>/semantic-seed.json）
+- split_semantic_seed.py -- 旧图 semantic 种子拆分（默认种子路径 <out>/semantic-seed.json 的
+  发现点在 rebuild_entry.py:275 `_merge_seed`）
 - graphify/serve_watcher.py -- serve 内置 watcher（默认关，--watch / GRAPHIFY_WATCH 显式
   开启；防抖/退避常量移植 codegraph 算法；watchdog 软依赖降级 mtime 轮询）
+- graphify/rebuild_lock.py -- 跨进程重建互斥（mkdir 原子锁 + stale 接管；rebuild_entry 与
+  serve_watcher flush 共用）
 
 上游补丁（最小 diff，提 PR 后若被接受则移除）：
 - graphify/analyze.py:63 _is_file_node 加 kind='file' 短路
@@ -133,6 +135,7 @@ Phase 3 拓扑切换（三触发面单入口；.codegraph 判别已退役恒 Fal
 - 4 契约入口（build_from_json/cluster/report.generate/export.to_json）签名未变即可
 - analyze.py 若上游改 _is_file_node，重放补丁（3 行 kind 短路）
 - watch.py 若上游改自定义防抖区，重放 _trigger_rebuild 路由
-- check-custom.sh 已登记全部新增文件（fts_cache/rebuild_entry/run_analysis/split_semantic_seed/
-  serve_watcher/cache_gc/symbol_utils + 对应 tests），升级后跑一遍确认无假阳性
+- check-custom.sh 已登记新增文件（fts_cache/rebuild_entry/run_analysis/split_semantic_seed/
+  serve_watcher/rebuild_lock/symbol_utils 模块直接登记；cache_gc.py 模块未入 for 列表，经
+  tests/test_cache_gc.py 间接登记 + 对应 tests），升级后跑一遍确认无假阳性
 - 上游重构搬文件时防丢：fts_cache.py / serve_watcher.py 与 .fts-index.db 生成链路逐文件核对
