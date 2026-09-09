@@ -39,10 +39,8 @@ fi
 cd "$cwd" || exit 0
 [ ! -f "graphify-out/graph.json" ] && exit 0          # 无 graph.json 则跳过
 
-# 先探活：通了直接退出（不重复拉起，幂等）
-curl -s --max-time 2 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1 && exit 0
-
-# launch-marker 防抖：<30s 内拉过则跳过（覆盖启动中/并发复活两竞态）
+# launch-marker 防抖：<30s 内拉过则跳过（5s 级短路——真死场景省每条 prompt 的 2s 探活；
+# 行为等价：marker 新鲜时旧序也因 marker 检查退出，仅省一次探活开销）
 now=$(date +%s)
 if [ -f "$MARKER" ]; then
     last=$(cat "$MARKER" 2>/dev/null || echo 0)
@@ -50,6 +48,8 @@ if [ -f "$MARKER" ]; then
         exit 0
     fi
 fi
+# 探活：通了直接退出（不重复拉起，幂等；marker 过期 + 存活 → 探活退出，不覆写 marker）
+curl -s --max-time 2 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1 && exit 0
 echo "$now" > "$MARKER"
 
 # v3 修订：用 nohup + disown 创建独立进程（不随 hook 退出被清理）

@@ -35,7 +35,8 @@ Rules:
 ### 版本号约定
 - `pyproject.toml` version 必须带 `+fork.N` 后缀（PEP 440 local version，区分上游 graphifyy）
 - 上游升 0.9.8 时本地改 `0.9.8+fork.N`，不要去掉 `+fork`
-- `uv.lock` 里 graphifyy version 不带 `+fork`（local version 不进 lock，正常现象），接受上游版本即可
+- `uv.lock` 里 graphifyy version 带 `+fork.N`（uv 新版 local version 已进 lock，lock:1092 可见
+  `0.9.56+fork.1`）——与 pyproject 同步即可，非"不进 lock"的旧表述（reviewer Minor 5 勘误）
 
 ### Hook 配置
 - `_install_claude_hook`（graphify/install.py，0.9.13 从 __main__.py 迁入）的 PreToolUse 注入已注释--与 context-mode 的 Read/Bash hook 冲突，勿恢复。上游 0.9.20 #1986 把 PreToolUse 触发面扩到 `Bash|Grep`，双重触发更严重，禁用理由增强
@@ -122,6 +123,20 @@ adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
   开启；防抖/退避常量移植 codegraph 算法；watchdog 软依赖降级 mtime 轮询）
 - graphify/rebuild_lock.py -- 跨进程重建互斥（mkdir 原子锁 + stale 接管；rebuild_entry 与
   serve_watcher flush 共用）
+- graphify/serve_idle.py -- serve idle 自杀（--idle-timeout 无流量优雅退出 + 停机协议；
+  IdleTimeoutMonitor daemon + IdleTimeoutMiddleware ASGI，仅 http transport + idle 启用时
+  import；lifespan.startup 续命使 idle 时钟从 server 就绪起算）
+- scripts/ensure-graphify-server.sh -- ensure server 自愈闭环共享脚本（sessionstart +
+  prompt_hook 单一事实源；端口单一事实源 GRAPHIFY_MCP_PORT，GRAPHIFY_SERVE_PORT 已删）
+
+### serve 运行时旋钮（R3/R1，用户缺口 2 登记）
+- `--idle-timeout <秒>` / 环境 `GRAPHIFY_IDLE_TIMEOUT`：serve idle 自杀阈值（无 HTTP 流量
+  超时优雅退出 + 停机协议 final flush）；`GRAPHIFY_IDLE_POLL_INTERVAL` 为监视器轮询旋钮
+  （默认 60s，测试 0.1）
+- `GRAPHIFY_BACKFILL=always`：R1 门控逃生口——恢复挂载即无条件补齐（回滚旋钮；默认门控
+  跳过新鲜重挂零重建）
+- `ensure-graphify-server.sh`：自愈闭环共享脚本（sessionstart/prompt_hook 单一事实源），
+  端口单一事实源 `GRAPHIFY_MCP_PORT`（默认 8765）
 
 上游补丁（最小 diff，提 PR 后若被接受则移除）：
 - graphify/analyze.py:63 _is_file_node 加 kind='file' 短路

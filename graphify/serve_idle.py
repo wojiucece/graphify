@@ -115,4 +115,10 @@ def run_http(app, *, host: str, port: int, idle_timeout: float = 0.0,
         # app 外包 middleware（最外层，覆盖 /mcp /query /health 全部 HTTP 请求续命）
         server.config.app = IdleTimeoutMiddleware(app, monitor)
         monitor.start()
-    server.run()
+    try:
+        server.run()
+    finally:
+        # Minor 6（用户终审）：进程内 daemon 监视器泄漏清理——server.run() 返回/异常后
+        # 置 _stop（daemon 线程随进程退出自然消亡，但进程内复用本函数时须显式停）。
+        if idle_on:
+            monitor._stop.set()

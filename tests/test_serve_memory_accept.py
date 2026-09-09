@@ -4,16 +4,17 @@ spec: docs/specs/serve-memory-spec.md §Testing 验收 9（:106）+ US1/US5（:2
 
 测量策略（自定，稳定性优先）：
 - 子进程 server（RSS 归零隔离 pytest 自身驻留，进程面可测量）。
-- RSS = Windows Working Set（Get-Process WorkingSet64，bytes）——含共享页，是 RSS 的
-  上近似；psutil 不可用时退化 PowerShell 解析（本机无 psutil）。
+- RSS 测量 OS 分支（用户缺口 1）：win32=PowerShell Get-Process WorkingSet64（现状，
+  含共享页上近似）；posix=resource.getrusage(RUSAGE_SELF).ru_maxrss（Linux=KB /
+  macOS=bytes，进程峰值上近似）——消除验收 9 CI 空跑。
 - 阈值留裕量：合成语料（数百文件/上千节点）实测 RSS ~80MB，250MB/400MB 门槛远高于
   真实工作集——本验收是粗粒度回归守卫（抓灾难级内存 bug：重载不逐出、查询泄漏翻倍），
-  精确水位验证归部署后 Get-Process 探针观察（spec Further Notes 部署条目）。
-- 新鲜重挂零重建：子进程内打点 ServeWatcher._run_pipeline 调用计数——所有挂载图均
-  新鲜（刚 rebuild），门控必须全部跳过（计数 == 0）。
+  精确水位验证归部署后 RSS 探针观察（spec Further Notes 部署条目）。
+- 新鲜重挂零重建：子进程内打点 ServeWatcher._run_pipeline/_flush_batch 调用计数——
+  所有挂载图均新鲜（刚 rebuild），补齐批次必须真实发生（flush ≥ 1）且门控全部跳过
+  （pipeline == 0）。
 
-测量口径注记：本机 Windows + 无 psutil → Get-Process WorkingSet64（探针内解析）；
-CI/其他 OS 若任务失败先查探针 RSS 解析路径（PowerShell 退化分支），阈值本身与 OS 无关。
+测量口径注记：阈值本身与 OS 无关；跨平台一致按"进程 RSS 上近似"口径。
 """
 import os
 import subprocess
@@ -75,16 +76,22 @@ for _ in range(3):
     server._graphify_select_graph(str(root))
 
 import subprocess as sp
-r = sp.run(['powershell', '-NoProfile', '-Command',
-            f'(Get-Process -Id {os.getpid()}).WorkingSet64'],
-           capture_output=True, text=True).stdout.strip()
-print('RSS_MB', round(int(float(r)) / 1024 / 1024, 1))
+# RSS 测量 OS 分支（用户缺口 1：消除验收 9 CI 空跑）——win32=PowerShell WorkingSet64
+# （现状），posix=resource.getrusage ru_maxrss（Linux=KB / macOS=bytes，峰值上近似）
+if sys.platform == 'win32':
+    r = sp.run(['powershell', '-NoProfile', '-Command',
+                f'(Get-Process -Id {os.getpid()}).WorkingSet64'],
+               capture_output=True, text=True).stdout.strip()
+    rss_mb = round(int(float(r)) / 1024 / 1024, 1)
+else:
+    import resource as _res
+    _r = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+    rss_mb = round(_r / 1024 / 1024, 1) if sys.platform == 'darwin' else round(_r / 1024, 1)
+print('RSS_MB', rss_mb)
 print('PROBE_DONE')
 """
 
 
-@pytest.mark.skipif(sys.platform != "win32",
-                    reason="RSS 探针用 PowerShell Get-Process（Windows 专用）")
 def test_memory_single_project_rss_limit(tmp_path):
     """验收 9（单项目）：查询若干轮 + 一次写盘重载后 RSS ≤ 250MB。"""
     root = tmp_path / "proj"
@@ -160,18 +167,24 @@ while COUNTER['flush'] < 1 and _t.time() < _deadline:
     _t.sleep(0.2)
 
 import subprocess as sp
-r = sp.run(['powershell', '-NoProfile', '-Command',
-            f'(Get-Process -Id {os.getpid()}).WorkingSet64'],
-           capture_output=True, text=True).stdout.strip()
-print('RSS_MB', round(int(float(r)) / 1024 / 1024, 1))
+# RSS 测量 OS 分支（用户缺口 1：消除验收 9 CI 空跑）——win32=PowerShell WorkingSet64
+# （现状），posix=resource.getrusage ru_maxrss（Linux=KB / macOS=bytes，峰值上近似）
+if sys.platform == 'win32':
+    r = sp.run(['powershell', '-NoProfile', '-Command',
+                f'(Get-Process -Id {os.getpid()}).WorkingSet64'],
+               capture_output=True, text=True).stdout.strip()
+    rss_mb = round(int(float(r)) / 1024 / 1024, 1)
+else:
+    import resource as _res
+    _r = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+    rss_mb = round(_r / 1024 / 1024, 1) if sys.platform == 'darwin' else round(_r / 1024, 1)
+print('RSS_MB', rss_mb)
 print('PIPELINE_COUNT', COUNTER['pipeline'])
 print('FLUSH_COUNT', COUNTER['flush'])
 print('PROBE_DONE')
 """
 
 
-@pytest.mark.skipif(sys.platform != "win32",
-                    reason="RSS 探针用 PowerShell Get-Process（Windows 专用）")
 def test_memory_multi_project_rotation(tmp_path):
     """验收 9（多项目）：5 轮换后 RSS ≤ 400MB 且新鲜重挂零重建（flush ≥ 1 + pipeline == 0）。"""
     root = tmp_path / "multi"

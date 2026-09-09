@@ -450,25 +450,29 @@ def test_gate_skip_path_zero_gate_acquisition(polling, fast_watch, tmp_path):
     跨项目场景：A 项目新鲜挂载（最终跳过）不得占用全局信号量（所有 watcher 重建管线互斥），
     B 项目真实编辑可获闸——消除"项目 A 白占闸 2s（_BACKFILL_SCAN_MAX_S），项目 B 真实
     编辑排队"的跨项目串行。本测断言跳过路径的 _flush_batch 从未 acquire 全局闸（零调用）。
-    闸前扫描判跳过 → 清 pending（_take_batch 已完成）直接返回，不触碰 gate。"""
+    闸前扫描判跳过 → 清 pending（_take_batch 已完成）直接返回，不触碰 gate。
+
+    Major A（评审）：计数闸装在 registry.mount() **之前**——替换 registry._sem，
+    _make_watcher 构造 watcher 时即以计数闸为 gate，首个 flush 必经它计数（构造保证，
+    非时序运气：装后替换会留下"首次 flush 先于替换"的假绿窗口）。"""
     import graphify.serve_watcher as W
     import rebuild_entry
     root = _mini_proj(tmp_path)
     rebuild_entry.rebuild(root)
     registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
-    w, stats = _mount_and_count(registry, root, root / "graphify-out")
-    # 挂载后、首个 flush（poll_interval=0.2s）前替换 gate 为计数闸：fresh 跳过路径不得触碰
+    # 计数闸装在 mount 之前：替换 registry._sem（_make_watcher 构造时即用它）
     acquires = {"n": 0}
-    real_gate = w._gate
+    real_sem = registry._sem
 
     class _CountingGate:
         def acquire(self):
             acquires["n"] += 1
-            return real_gate.acquire()
+            return real_sem.acquire()
 
         def release(self):
-            return real_gate.release()
-    w._gate = _CountingGate()
+            return real_sem.release()
+    registry._sem = _CountingGate()
+    w, stats = _mount_and_count(registry, root, root / "graphify-out")
     try:
         assert _wait_for(lambda: stats["flush"] >= 1, timeout=15), "纯补齐批次未 flush"
         time.sleep(0.8)  # 跨多个轮询周期，排除迟到批次

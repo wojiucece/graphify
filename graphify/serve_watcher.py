@@ -94,6 +94,12 @@ _BACKFILL_SCAN_MAX_FILES = 200000
 # 不回归）；<< touch/NTP 级未来戳（秒级，恒被剪）。剪后自愈：墙钟越过未来值后下轮重建拿
 # 干净参照，粘性打破。回退路径 captured_at 是过去值天然安全，无需钳。
 _MTIME_CLAMP_TOLERANCE_S = 1.0
+# Major 1 评审（用户 Major B）：门控扫描限流 semaphore——重建闸不管扫描串行后（Major 1
+# 把扫描移出闸），N 项目并发挂载 = N 并发全树扫描（CPU/IO 叠加 → 单扫变慢 → 撞 2s 上界
+# → 退化无条件重建，门控收益丢失）。独立于重建闸的模块级 semaphore（容量 3）只约束扫描：
+# 2-4 项目无感，项目多时防退化；扫描线程内持到扫描真正完成（超时未回收的线程也占位，
+# 真并发上界成立），被限流等待计入 2s join 上界 → 退无条件（安全侧）。
+_BACKFILL_SCAN_SEM = threading.BoundedSemaphore(3)
 
 
 def _default_max_watchers() -> int:
@@ -209,16 +215,23 @@ def _backfill_gate(root: Path, out_dir: Path) -> "tuple[bool, dict]":
 
     def _scan() -> None:
         try:
-            # M5（reviewer）：collect_files 惰性 import（函数内）避免 serve_watcher 顶层
-            # 加载 8000+ 行 graphify.extract（--watch 关闭零 import 既有回归锁 + 冷启动
-            # 成本）。残余风险：进程首次门控扫描若 import+扫描 > 2s 上界 → 退无条件 →
-            # 新鲜首挂重建一次（安全侧冗余）。评估不移顶层：extract 顶层 import 破坏惰性
-            # 加载哲学，且 serve 侧 extract 通常在首次门控前已被 rebuild_entry/查询预热；
-            # 代价是一次安全侧冗余重建，方向正确。
-            from graphify.extract import collect_files
-            files = collect_files(root, root=root)
-            result["count"] = len(files)
-            result["max_mtime"] = max((f.stat().st_mtime for f in files), default=0.0)
+            # Major 1 评审（Major B）：扫描限流——并发全树扫描上限 _BACKFILL_SCAN_SEM
+            #（容量 3，独立于重建闸）；在扫描线程内持到真正完成，超时未回收线程也占位
+            #（真并发上界成立）。被限流等待计入 2s join 上界 → 退无条件（安全侧）。
+            _BACKFILL_SCAN_SEM.acquire()
+            try:
+                # M5（reviewer）：collect_files 惰性 import（函数内）避免 serve_watcher 顶层
+                # 加载 8000+ 行 graphify.extract（--watch 关闭零 import 既有回归锁 + 冷启动
+                # 成本）。残余风险：进程首次门控扫描若 import+扫描 > 2s 上界 → 退无条件 →
+                # 新鲜首挂重建一次（安全侧冗余）。评估不移顶层：extract 顶层 import 破坏惰性
+                # 加载哲学，且 serve 侧 extract 通常在首次门控前已被 rebuild_entry/查询预热；
+                # 代价是一次安全侧冗余重建，方向正确。
+                from graphify.extract import collect_files
+                files = collect_files(root, root=root)
+                result["count"] = len(files)
+                result["max_mtime"] = max((f.stat().st_mtime for f in files), default=0.0)
+            finally:
+                _BACKFILL_SCAN_SEM.release()
         except Exception:
             result["error"] = True
 
@@ -781,7 +794,10 @@ class ServeWatcher:
             "phase": "error" if error else "complete",
             "started": self._state_started,
             "finished": time.time(),
-            "last_duration": round(time.time() - self._state_started, 1),
+            # Minor 1（用户终审）：last_duration 继承语义——取 max(本轮, 上轮)，防 serve.py
+            # stale_index 阈值被增量重建塌回 floor（仿 _begin_state 的 _read_prev_duration 先例）。
+            "last_duration": max(round(time.time() - self._state_started, 1),
+                                 rebuild_entry._read_prev_duration(self._root)),
             "project": str(self._root),
         }
         try:
@@ -834,15 +850,29 @@ class ServeWatcher:
             "phase": "complete",
             "started": started,
             "finished": time.time(),
-            "last_duration": round(time.time() - started, 1),
+            # Minor 1（用户终审）：last_duration 继承语义——取 max(本轮, 上轮)，防 serve.py
+            # stale_index 阈值被增量重建塌回 floor（仿 _begin_state 的 _read_prev_duration 先例）。
+            "last_duration": max(round(time.time() - started, 1),
+                                 rebuild_entry._read_prev_duration(self._root)),
             "project": str(self._root),
         }
+        if n is None:
+            # Minor 3（用户终审）：区分"从未记过"与"记过又丢了"——预取快照失败放弃记 count
+            # （门控读不到 source_count 退化为无条件，安全侧），warning 使该路径可排障（非
+            # 静默）；正常完成后的 count 是记过再被覆盖（M6 已删覆盖路径，不应发生）。
+            logger.warning("watcher 状态文件 source_count/source_max_mtime 未记（预取快照失败，"
+                           "门控退化为无条件；正常管线不应出现）", exc_info=False)
         if n is not None:
             payload["source_count"] = n
         if max_mtime is not None:
             # R1 stat-to-stat 参照（与 rebuild_entry._collect_source_count 同口径双写）：
             # 门控比较当前语料 max mtime <= 本值（未变文件两次 stat 严格相等，无墙钟量化）。
             payload["source_max_mtime"] = max_mtime
+        gh = rebuild_entry._git_head(self._root)
+        if gh is not None:
+            # reviewer Minor 3：watcher 重建后 C3 变更摘要锚点不丢（git_head 与 rebuild_entry
+            # 侧同构；非 git 环境/失败省略，schema 只增不改可缺省）。
+            payload["git_head"] = gh
         try:
             rebuild_entry._write_state(self._root, _lock_path(self._root), payload)
         except Exception:
@@ -885,15 +915,18 @@ class ServeWatcher:
         # changed/deleted）先跑 _backfill_gate（有界扫描，最高 2s），判跳过则零闸占用直接
         # 返回（清 pending 由 _take_batch 已完成；额外收益：新鲜跳过完全不碰全局闸，消除
         # "项目 A 新鲜挂载白占闸 2s，项目 B 真实编辑排队"的跨项目串行）。mixed batch 不门控
-        # （补齐+编辑并入同批次直接重建，防吞编辑）。_gate_evidence 供取锁后廉价校验。
-        _gate_evidence: dict = {}
+        # （补齐+编辑并入同批次直接重建，防吞编辑）。_backfill_evidence 供取锁后廉价校验。
+        # 评审 Minor（最坏总扫描成本）：闸前 2s + 锁内重扫至多 2s（后者仅在 evidence 失效
+        # 的并发重建/编辑窗口触发），但全局闸占用上界仍 2s（只有锁内重扫才持闸）。
+        _backfill_evidence: dict = {}
         if backfill and not changed and not deleted:
-            _gate_decision, _gate_evidence = _backfill_gate(self._root, self._out_dir)
-            if not _gate_decision:
+            _backfill_should_run, _backfill_evidence = _backfill_gate(self._root, self._out_dir)
+            if not _backfill_should_run:
                 logger.debug("[graphify serve watcher] backfill gated for %s: "
                              "graph fresh (corpus mtime/count match); "
                              "skipping rebuild (zero-rebuild on fresh re-mount)", self._root)
                 self._backfill_cycle = False  # 消费周期标志（跳过路径，零闸占用）
+                self._lock_busy_logged = False  # 评审 Minor：跳过路径复位锁忙日志标记（纯日志语义）
                 return True
         if gate is not None:
             gate.acquire()
@@ -939,8 +972,8 @@ class ServeWatcher:
                 # 陈旧，不吞编辑）。corpus count/max_mtime 无法廉价重 stat（需整树重扫），由
                 # _evidence_still_valid 的 state/graph mtime + 本重扫兜底覆盖。mixed batch
                 # 不门控（补齐+编辑并入同批次直接重建，防吞编辑）。
-                if backfill and not changed and not deleted and _gate_evidence \
-                        and not _evidence_still_valid(_gate_evidence, self._out_dir):
+                if backfill and not changed and not deleted and _backfill_evidence \
+                        and not _evidence_still_valid(_backfill_evidence, self._out_dir):
                     if not _backfill_gate(self._root, self._out_dir)[0]:
                         logger.debug("[graphify serve watcher] backfill gated (post-lock "
                                      "re-scan) for %s: graph fresh; skipping rebuild",
