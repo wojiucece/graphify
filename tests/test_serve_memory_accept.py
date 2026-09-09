@@ -21,6 +21,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _WORKTREE = Path(__file__).resolve().parent.parent
 
 # 250 文件合成语料 → ~1250 节点 / ~700KB graph / 实测 RSS ~80MB（单项目验收用）
@@ -81,6 +83,8 @@ print('PROBE_DONE')
 """
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="RSS 探针用 PowerShell Get-Process（Windows 专用）")
 def test_memory_single_project_rss_limit(tmp_path):
     """验收 9（单项目）：查询若干轮 + 一次写盘重载后 RSS ≤ 250MB。"""
     root = tmp_path / "proj"
@@ -125,13 +129,21 @@ for name in ('a', 'b', 'c'):
     rebuild_entry.rebuild(p)   # 全部新鲜（source_count + started 写入状态文件）
     projs.append(p)
 
-# 打点 _run_pipeline：所有挂载图均新鲜 → 门控必须全部跳过（零重建）
-COUNTER = {'n': 0}
-_orig = W.ServeWatcher._run_pipeline
-def _counting(self, changed, deleted, semantic_refresh):
-    COUNTER['n'] += 1
-    return _orig(self, changed, deleted, semantic_refresh)
-W.ServeWatcher._run_pipeline = _counting
+# 打点 _flush_batch + _run_pipeline：所有挂载图均新鲜 → 补齐批次必须真实发生（flush ≥ 1）
+# 且被门控全部跳过（pipeline == 0）——只数 pipeline 的话，watcher 线程未及 flush 时
+# pipeline==0 平凡成立（reviewer M4：零重建断言偏弱，补 flush 计数证明批次真实处理过）。
+import time as _t
+COUNTER = {'flush': 0, 'pipeline': 0}
+_orig_flush = W.ServeWatcher._flush_batch
+_orig_pipe = W.ServeWatcher._run_pipeline
+def _count_flush(self, changed, deleted, **kw):
+    COUNTER['flush'] += 1
+    return _orig_flush(self, changed, deleted, **kw)
+def _count_pipe(self, changed, deleted, semantic_refresh):
+    COUNTER['pipeline'] += 1
+    return _orig_pipe(self, changed, deleted, semantic_refresh)
+W.ServeWatcher._flush_batch = _count_flush
+W.ServeWatcher._run_pipeline = _count_pipe
 
 # max_contexts=2：第 3 项目查询逐出 LRU → 重挂 = 新挂载周期（新鲜仍零重建）
 os.environ['GRAPHIFY_MAX_CONTEXTS'] = '2'
@@ -142,19 +154,26 @@ for _ in range(rounds):
         server._graphify_select_graph(str(p))
 # 重挂验证：轮换后再次查询 a = 重挂 + 补齐入队 → 门控跳过（零重建）
 server._graphify_select_graph(str(projs[0]))
+# 等补齐批次真实发生（flush ≥ 1）：避免 watcher 线程未及 flush 时 pipeline==0 平凡成立
+_deadline = _t.time() + 30
+while COUNTER['flush'] < 1 and _t.time() < _deadline:
+    _t.sleep(0.2)
 
 import subprocess as sp
 r = sp.run(['powershell', '-NoProfile', '-Command',
             f'(Get-Process -Id {os.getpid()}).WorkingSet64'],
            capture_output=True, text=True).stdout.strip()
 print('RSS_MB', round(int(float(r)) / 1024 / 1024, 1))
-print('PIPELINE_COUNT', COUNTER['n'])
+print('PIPELINE_COUNT', COUNTER['pipeline'])
+print('FLUSH_COUNT', COUNTER['flush'])
 print('PROBE_DONE')
 """
 
 
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="RSS 探针用 PowerShell Get-Process（Windows 专用）")
 def test_memory_multi_project_rotation(tmp_path):
-    """验收 9（多项目）：5 轮换后 RSS ≤ 400MB 且新鲜重挂零重建（pipeline 计数 == 0）。"""
+    """验收 9（多项目）：5 轮换后 RSS ≤ 400MB 且新鲜重挂零重建（flush ≥ 1 + pipeline == 0）。"""
     root = tmp_path / "multi"
     payload = _MULTI_PROBE
     env = {"GRAPHIFY_MAX_CONTEXTS": "2"}
@@ -163,12 +182,17 @@ def test_memory_multi_project_rotation(tmp_path):
     assert "PROBE_DONE" in stdout, f"探针未完成; stdout:\n{stdout[-2000:]}"
     rss = None
     pipelines = None
+    flushes = None
     for line in stdout.splitlines():
         if line.startswith("RSS_MB"):
             rss = float(line.split()[1])
         if line.startswith("PIPELINE_COUNT"):
             pipelines = int(line.split()[1])
-    assert rss is not None and pipelines is not None, f"探针输出缺失; stdout:\n{stdout[-2000:]}"
+        if line.startswith("FLUSH_COUNT"):
+            flushes = int(line.split()[1])
+    assert rss is not None and pipelines is not None and flushes is not None, \
+        f"探针输出缺失; stdout:\n{stdout[-2000:]}"
     assert rss > 0, f"RSS 测量失败（-1）; stderr:\n{stderr[-2000:]}"
     assert rss <= 400, f"多项目 5 轮换后 RSS {rss}MB > 400MB（水位未受控）"
+    assert flushes >= 1, f"补齐批次未真实发生（flush={flushes}，pipeline==0 平凡成立）"
     assert pipelines == 0, f"新鲜重挂触发了 {pipelines} 次重建（门控未生效，零重建违背）"

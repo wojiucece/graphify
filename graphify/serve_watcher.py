@@ -190,6 +190,12 @@ def _should_backfill(root: Path, out_dir: Path) -> bool:
 
     def _scan() -> None:
         try:
+            # M5（reviewer）：collect_files 惰性 import（函数内）避免 serve_watcher 顶层
+            # 加载 8000+ 行 graphify.extract（--watch 关闭零 import 既有回归锁 + 冷启动
+            # 成本）。残余风险：进程首次门控扫描若 import+扫描 > 2s 上界 → 退无条件 →
+            # 新鲜首挂重建一次（安全侧冗余）。评估不移顶层：extract 顶层 import 破坏惰性
+            # 加载哲学，且 serve 侧 extract 通常在首次门控前已被 rebuild_entry/查询预热；
+            # 代价是一次安全侧冗余重建，方向正确。
             from graphify.extract import collect_files
             files = collect_files(root, root=root)
             result["count"] = len(files)
@@ -760,8 +766,10 @@ class ServeWatcher:
 
         ``snapshot`` 为 ``_run_pipeline`` 在 extract **之前**预取的 (count, max_mtime)
         （stat-to-stat 参照须早于图内容捕获点——FB2/停机收敛的 mid-rebuild 编辑必须在
-        参照值之后，门控才判陈旧；见 _run_pipeline 注记）。None/预取失败 → 回退扫描一次
-        （兜底，不应发生）。
+        参照值之后，门控才判陈旧；见 _run_pipeline 注记）。None（预取失败）→ **放弃记
+        count/参照**（不事后重扫）——post-extract 参照违反"快照早于图内容捕获点"不变量
+        （mid-rebuild 编辑被吸进参照 → 门控误判新鲜吞掉丢失编辑）；不记则门控读不到
+        source_count 退化为无条件（全面安全侧退化哲学，与门控失败路径一致）。
 
         complete 载荷取代 ``_end_state(error=False)`` 的角色（后者不携带 source_count，
         若保留在成功路径会把刚写入的 count 覆盖丢失）。扫描失败 → 不记 count（门控
@@ -769,8 +777,6 @@ class ServeWatcher:
         """
         import rebuild_entry
         n, max_mtime = snapshot if snapshot is not None else (None, None)
-        if n is None:
-            n, max_mtime = self._collect_corpus_snapshot()
         started = self._state_started or time.time()
         payload = {
             "schema": rebuild_entry._STATE_SCHEMA,
