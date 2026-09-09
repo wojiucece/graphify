@@ -125,8 +125,13 @@ def _graph_path_of(out_dir: str) -> str:
     return str((Path(out_dir) / "graph.json").resolve())
 
 
-def _should_backfill(root: Path, out_dir: Path) -> bool:
-    """R1 补齐门控：纯补齐批次是否执行重建（True=重建 / False=跳过）。
+def _backfill_gate(root: Path, out_dir: Path) -> "tuple[bool, dict]":
+    """R1 补齐门控判定 + 扫描证据（Major 1：闸前扫描，锁内廉价校验）。
+
+    返回 ``(True=重建 / False=跳过, evidence)``。evidence 记录判定输入的 stat 快照
+    （state/graph mtime + 语料 count/max_mtime），供 ``_flush_batch`` 取锁后廉价校验
+    （判定是否仍有效；不一致 → 锁内重扫至多一次）。语义与 `_should_backfill` 完全一致
+    （后者是本函数的 bool 薄封装，测试/既有调用点用）。
 
     双条件覆盖三类陈旧（spec §R1 红线 2）：
         max(语料 mtime) ≤ 捕获参照 AND collect_files 计数 == 状态文件 source_count
@@ -150,22 +155,26 @@ def _should_backfill(root: Path, out_dir: Path) -> bool:
 
     逃生口（红线 8）：``GRAPHIFY_BACKFILL=always`` → True（恢复无条件补齐回退旋钮）。
 
-    门控位置（红线 1）：本函数只在 watcher 线程的 flush 处理内调用（纯补齐批次），
-    不在 mount 路径——挂载仍无条件入队（廉价标志位，查询路径零新增延迟）。
+    门控位置（红线 1 + Major 1）：本函数在 watcher 线程 flush 处理内、**gate.acquire()
+    之前**调用（纯补齐批次）——挂载仍无条件入队（廉价标志位，查询路径零新增延迟）；
+    跳过路径零全局闸占用（Major 1，用户终审：消除"项目 A 新鲜挂载白占闸 2s，项目 B
+    真实编辑排队"的跨项目串行）。
     """
     if os.environ.get("GRAPHIFY_BACKFILL", "").strip().lower() == "always":
-        return True
+        return True, {}
     # 状态文件 source_count（schema v2，rebuild_entry 与 _run_pipeline 双写路径各记一次）。
+    state_path = out_dir / ".rebuild-state.json"
     try:
-        state = json.loads((out_dir / ".rebuild-state.json").read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return True  # 无状态/损坏 → 不可判定 → 无条件（安全侧）
+        return True, {}  # 无状态/损坏 → 不可判定 → 无条件（安全侧）
     if not isinstance(state, dict) or not isinstance(state.get("source_count"), int):
-        return True  # 无 source_count（旧状态/未迁移）→ 无条件（安全侧）
+        return True, {}  # 无 source_count（旧状态/未迁移）→ 无条件（安全侧）
     try:
         graph_mtime = (out_dir / "graph.json").stat().st_mtime
+        state_mtime = state_path.stat().st_mtime
     except OSError:
-        return True  # 无图 → 陈旧（需重建出图）
+        return True, {}  # 无图/状态 → 陈旧（需重建出图）
     # 捕获参照：**优先 state 的 source_max_mtime**（重建时与语料同一 ``stat()`` 源记录的
     # max mtime，stat-to-stat 精确相等比较）——消除 Windows 时钟量化误报：``time.time()``
     # 与文件 mtime 非同一时钟源，仅以 started 作参照时，新鲜项目（文件写后立即重建）的
@@ -211,9 +220,41 @@ def _should_backfill(root: Path, out_dir: Path) -> bool:
     t.start()
     t.join(_BACKFILL_SCAN_MAX_S)
     if t.is_alive() or result.get("error") or result.get("count", 0) > _BACKFILL_SCAN_MAX_FILES:
-        return True  # 超时/异常/超限 → 无条件（安全侧失败，退化为无条件）
+        return True, {}  # 超时/异常/超限 → 无条件（安全侧失败，退化为无条件）
     fresh = result["max_mtime"] <= ref_max_mtime and result["count"] == state["source_count"]
-    return not fresh
+    evidence = {
+        "state_mtime": state_mtime,
+        "graph_mtime": graph_mtime,
+        "corpus_max_mtime": result["max_mtime"],
+        "corpus_count": result["count"],
+    }
+    return (not fresh), evidence
+
+
+def _should_backfill(root: Path, out_dir: Path) -> bool:
+    """R1 补齐门控（bool 薄封装，测试/既有调用点用）——True=重建 / False=跳过。
+
+    判定语义、证据与红线注释见 ``_backfill_gate``。Major 1 起调用方（``_flush_batch``）
+    在 gate.acquire() 之前调本族，跳过路径零全局闸占用。
+    """
+    decision, _ = _backfill_gate(root, out_dir)
+    return decision
+
+
+def _evidence_still_valid(evidence: dict, out_dir: Path) -> bool:
+    """Major 1：锁内廉价 stat 校验——state/graph mtime 与闸前扫描一致 → 判定仍有效。
+
+    语料 count/max_mtime 无法廉价重 stat（需整树重扫），故只校验 state/graph 两 mtime；
+    不一致时调用方锁内重扫至多一次兜底（安全侧，只可能多判陈旧不吞编辑）。
+    """
+    try:
+        if evidence.get("state_mtime") != (out_dir / ".rebuild-state.json").stat().st_mtime:
+            return False
+        if evidence.get("graph_mtime") != (out_dir / "graph.json").stat().st_mtime:
+            return False
+    except OSError:
+        return False
+    return True
 
 
 if _FSHandler is not None:  # pragma: no cover - 依赖 watchdog 是否安装
@@ -834,6 +875,20 @@ class ServeWatcher:
         ]
         # 票 05：周期标志在锁忙早退前捕获（不消费）——重试时 merged batch 仍标注 rebuilding。
         backfill = self._backfill_cycle
+        # Major 1（用户终审）：门控扫描**先于 gate.acquire()**——纯补齐批次（backfill + 空
+        # changed/deleted）先跑 _backfill_gate（有界扫描，最高 2s），判跳过则零闸占用直接
+        # 返回（清 pending 由 _take_batch 已完成；额外收益：新鲜跳过完全不碰全局闸，消除
+        # "项目 A 新鲜挂载白占闸 2s，项目 B 真实编辑排队"的跨项目串行）。mixed batch 不门控
+        # （补齐+编辑并入同批次直接重建，防吞编辑）。_gate_evidence 供取锁后廉价校验。
+        _gate_evidence: dict = {}
+        if backfill and not changed and not deleted:
+            _gate_decision, _gate_evidence = _backfill_gate(self._root, self._out_dir)
+            if not _gate_decision:
+                logger.debug("[graphify serve watcher] backfill gated for %s: "
+                             "graph fresh (corpus mtime/count match); "
+                             "skipping rebuild (zero-rebuild on fresh re-mount)", self._root)
+                self._backfill_cycle = False  # 消费周期标志（跳过路径，零闸占用）
+                return True
         if gate is not None:
             gate.acquire()
             self._holding_gate = True
@@ -872,17 +927,19 @@ class ServeWatcher:
                               f"restoring {len(changed)} changed / {len(deleted)} deleted "
                               f"for re-build (avoid dropping late edits)", file=sys.stderr)
                     return True
-                # R1 补齐门控（serve-memory 票 03）：**纯补齐批次**（backfill 标志 + 空
-                # changed/deleted）先跑 _should_backfill——图新鲜（mtime+count 双条件）则
-                # 跳过 pipeline（清 pending 由 _take_batch 已完成，debug 日志一行）。门控
-                # 在 watcher 线程的 flush 内执行，不在 mount 路径（挂载零阻塞，spec 红线 1）。
-                # **mixed batch 不门控**：补齐 + 挂载后编辑并入同批次时直接重建（编辑必然
-                # 使语料变旧、门控也会放行；显式跳过防实现者误将门控套到混合批次吞掉编辑）。
-                if backfill and not changed and not deleted and not _should_backfill(self._root, self._out_dir):
-                    logger.debug("[graphify serve watcher] backfill gated for %s: "
-                                 "graph fresh (corpus mtime/count match); "
-                                 "skipping rebuild (zero-rebuild on fresh re-mount)", self._root)
-                    return True
+                # Major 1：取锁后廉价 stat 校验——判定输入（state/graph mtime）与闸前扫描
+                # 一致 → 直接用闸前判定（执行）；不一致（扫描/取锁期间有人重建/编辑）→ 锁内
+                # 重扫至多一次（仍有 2s 上界），重扫判跳过则取消本次重建（安全侧：只可能多判
+                # 陈旧，不吞编辑）。corpus count/max_mtime 无法廉价重 stat（需整树重扫），由
+                # _evidence_still_valid 的 state/graph mtime + 本重扫兜底覆盖。mixed batch
+                # 不门控（补齐+编辑并入同批次直接重建，防吞编辑）。
+                if backfill and not changed and not deleted and _gate_evidence \
+                        and not _evidence_still_valid(_gate_evidence, self._out_dir):
+                    if not _backfill_gate(self._root, self._out_dir)[0]:
+                        logger.debug("[graphify serve watcher] backfill gated (post-lock "
+                                     "re-scan) for %s: graph fresh; skipping rebuild",
+                                     self._root)
+                        return True
                 # 票 05：backfill 判定用周期标志（merged batch 非空也标注 rebuilding）。
                 if backfill:
                     self._begin_state()

@@ -414,3 +414,39 @@ def test_gate_clamp_tolerance_boundary(polling, tmp_path):
     stB = json.loads((rootB / "graphify-out" / ".rebuild-state.json").read_text())
     assert stB["source_max_mtime"] >= futureB - 1e-6, \
         f"+0.5s 容差内时钟偏差被误剪: {stB['source_max_mtime']}"
+
+
+# === Major 1（用户终审）：门控扫描先于全局闸——跳过路径零闸占用 ===================
+
+def test_gate_skip_path_zero_gate_acquisition(polling, fast_watch, tmp_path):
+    """Major 1（用户终审）：门控扫描先于 gate.acquire()——新鲜重挂跳过路径**零全局闸占用**。
+
+    跨项目场景：A 项目新鲜挂载（最终跳过）不得占用全局信号量（所有 watcher 重建管线互斥），
+    B 项目真实编辑可获闸——消除"项目 A 白占闸 2s（_BACKFILL_SCAN_MAX_S），项目 B 真实
+    编辑排队"的跨项目串行。本测断言跳过路径的 _flush_batch 从未 acquire 全局闸（零调用）。
+    闸前扫描判跳过 → 清 pending（_take_batch 已完成）直接返回，不触碰 gate。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    w, stats = _mount_and_count(registry, root, root / "graphify-out")
+    # 挂载后、首个 flush（poll_interval=0.2s）前替换 gate 为计数闸：fresh 跳过路径不得触碰
+    acquires = {"n": 0}
+    real_gate = w._gate
+
+    class _CountingGate:
+        def acquire(self):
+            acquires["n"] += 1
+            return real_gate.acquire()
+
+        def release(self):
+            return real_gate.release()
+    w._gate = _CountingGate()
+    try:
+        assert _wait_for(lambda: stats["flush"] >= 1, timeout=15), "纯补齐批次未 flush"
+        time.sleep(0.8)  # 跨多个轮询周期，排除迟到批次
+        assert stats["pipeline"] == 0, f"新鲜重挂触发了重建: {stats}"
+        assert acquires["n"] == 0, f"跳过路径触碰全局闸 {acquires['n']} 次（应零闸占用）"
+    finally:
+        registry.stop_all()
