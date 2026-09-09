@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -47,15 +48,20 @@ class _Resp:
 
 
 def _install_fake_urlopen(monkeypatch, sequence):
-    """把 prompt_hook.urlopen 换成脚本化序列（依次返回 _Resp 或抛 URLError）。"""
+    """把 prompt_hook.urlopen 换成脚本化序列（依次返回 _Resp 或抛异常）。
+
+    item 支持三态：异常实例（如 HTTPError(url,500,...)——原样 raise）、异常类
+    （如 URLError——raise item("boom")）、正常响应（返回 item）。
+    """
     import graphify.prompt_hook as ph
-    from urllib.error import URLError
     state = {"n": 0}
 
     def fake_urlopen(req, timeout=None):
         i = state["n"]
         state["n"] += 1
         item = sequence[min(i, len(sequence) - 1)]
+        if isinstance(item, BaseException):
+            raise item
         if isinstance(item, type) and issubclass(item, Exception):
             raise item("boom")
         return item
@@ -100,22 +106,27 @@ def test_http_success_does_not_trigger_ensure(monkeypatch):
 
 
 def test_http_non200_no_ensure_but_local_fallback(monkeypatch):
-    """HTTP 200 之外（如 500/404，server 活着）不触发 ensure——拉起只响应连接级失败。"""
+    """HTTP 4xx/5xx：真实 urllib 抛 HTTPError（URLError 子类）——server 活着只是报错，
+    不触发 ensure（自愈只响应连接级失败）；URLError（连接拒绝）路径才拉起恰一次。"""
     import graphify.prompt_hook as ph
-
-    class _Resp500(_Resp):
-        def __init__(self):
-            self.status = 500
-            self._body = b'{"error": "boom"}'
-
+    from urllib.error import HTTPError, URLError
     ensure_calls = []
     monkeypatch.setattr(ph, "_ensure_server", lambda cwd: ensure_calls.append(cwd))
     monkeypatch.setattr(ph, "_query_locally", lambda prompt, graph_path: "LOCAL-RESULT")
-    _install_fake_urlopen(monkeypatch, [_Resp500()])
+    http_error = HTTPError("http://127.0.0.1:8765/query", 500,
+                           "Internal Server Error", None, None)
+    _install_fake_urlopen(monkeypatch, [http_error, _Resp("HTTP-RESULT")])
     plan = _plan()
     monkeypatch.setenv("GRAPHIFY_ALLOW_HTTP_MCP", "1")
+    # 4xx/5xx（HTTPError）→ 本地回退 + 不拉起
     assert ph._query_graph(plan, "q?") == "LOCAL-RESULT"
-    assert ensure_calls == [], "HTTP 非连接失败（server 活着）不应触发 ensure-server"
+    assert ensure_calls == [], "HTTPError（server 活着报错）不应触发 ensure-server"
+    # 连接级失败（URLError 子类）路径：上一条之外的独立断言——恰一次拉起 + 下条恢复 HTTP
+    _install_fake_urlopen(monkeypatch, [URLError("connection refused"), _Resp("HTTP-RESULT")])
+    assert ph._query_graph(plan, "q?") == "LOCAL-RESULT"
+    assert ensure_calls == [plan["project_root"]], "连接拒绝（URLError）应触发 ensure 恰一次"
+    assert ph._query_graph(plan, "q?") == "HTTP-RESULT"
+    assert ensure_calls == [plan["project_root"]], "HTTP 恢复后不应再调 ensure-server"
 
 
 # === _ensure_server 非阻塞 + 静默 ===
@@ -151,8 +162,8 @@ def test_default_ensure_script_points_to_repo_scripts():
     """_default_ensure_script 指向 fork 仓库 scripts/ensure-graphify-server.sh（存在）。"""
     from graphify import prompt_hook as ph
     script = ph._default_ensure_script()
-    assert script and script.endswith(("scripts", "ensure-graphify-server.sh")), \
-        f"应指向 scripts/ensure-graphify-server.sh，got {script!r}"
+    assert script and script.endswith("ensure-graphify-server.sh"), \
+        f"应指向 .../scripts/ensure-graphify-server.sh，got {script!r}"
     assert Path(script).exists()
 
 
@@ -178,6 +189,48 @@ def test_sessionstart_delegates_to_ensure_script():
     assert script.exists()
     text = script.read_text(encoding="utf-8")
     assert "ensure-graphify-server.sh" in text, "sessionstart 应委托共享脚本（单一事实源）"
+
+
+def test_ensure_script_uses_mcp_port_for_probe_and_launch(tmp_path):
+    """I2（评审）防再分裂：仅设 GRAPHIFY_MCP_PORT（非默认）→ 脚本探活 + 拉起同端口。
+
+    假 curl/graphify-mcp 前置 PATH 记录实参——自愈环闭环目标端口 = prompt_hook 查询端口
+    （GRAPHIFY_MCP_PORT）。防止将来把端口 env 改回分裂（曾 SERVE_PORT 与 MCP_PORT 双轨）。
+    """
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "scripts" / "ensure-graphify-server.sh"
+    root = tmp_path / "proj"
+    (root / "graphify-out").mkdir(parents=True)
+    (root / "graphify-out" / "graph.json").write_text("{}", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl_log = tmp_path / "curl.log"
+    mcp_log = tmp_path / "mcp.log"
+    (bin_dir / "curl").write_text(
+        f"#!/bin/bash\necho \"$@\" >> {curl_log.as_posix()}\nexit 7\n", encoding="utf-8")
+    (bin_dir / "graphify-mcp").write_text(
+        f"#!/bin/bash\necho \"$@\" >> {mcp_log.as_posix()}\n", encoding="utf-8")
+    for name in ("curl", "graphify-mcp"):
+        os.chmod(bin_dir / name, 0o755)
+    env = dict(os.environ,
+               PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+               GRAPHIFY_MCP_PORT="9999",
+               GRAPHIFY_SERVE_LAUNCH_MARKER=str(tmp_path / "launch.marker"))
+    subprocess.run(["bash", str(script), str(root)], env=env, check=True, timeout=30)
+    curl_calls = curl_log.read_text(encoding="utf-8").splitlines()
+    # nohup 拉起是异步（& + disown）：轮询等待 fake graphify-mcp 的实参落盘
+    deadline = time.time() + 10
+    while time.time() < deadline and not mcp_log.exists():
+        time.sleep(0.1)
+    if not mcp_log.exists():
+        serve_log = Path("/tmp/graphify-serve.log")
+        diag = serve_log.read_text(encoding="utf-8", errors="replace") if serve_log.exists() else "(无 log)"
+        raise AssertionError(f"fake graphify-mcp 未被执行；/tmp/graphify-serve.log={diag}")
+    mcp_calls = mcp_log.read_text(encoding="utf-8").splitlines()
+    assert any("127.0.0.1:9999/health" in c for c in curl_calls), \
+        f"探活应指向 GRAPHIFY_MCP_PORT=9999，got {curl_calls}"
+    assert any("--port" in c and "9999" in c for c in mcp_calls), \
+        f"拉起应落在 GRAPHIFY_MCP_PORT=9999，got {mcp_calls}"
 
 
 # === 验收 6（E2E 实测）：server 死后首条本地回退 + ensure 恰一次；次条恢复 HTTP ===
@@ -270,13 +323,13 @@ def test_self_heal_prompt_after_server_death(tmp_path, monkeypatch):
     }), encoding="utf-8")
 
     port = _free_port()
+    # I2（评审）：只设 GRAPHIFY_MCP_PORT——ensure 脚本以它为单一事实源（探活+拉起同端口），
+    # 不再设 GRAPHIFY_SERVE_PORT（曾与 MCP_PORT 分裂致自愈环静默断裂，E2E 同值曾掩盖之）。
     env = dict(os.environ,
                PATH=venv_bin + os.pathsep + os.environ.get("PATH", ""),
                GRAPHIFY_MCP_PORT=str(port),
-               GRAPHIFY_SERVE_PORT=str(port),
                GRAPHIFY_SERVE_LAUNCH_MARKER=str(tmp_path / "launch.marker"))
     monkeypatch.setenv("GRAPHIFY_MCP_PORT", str(port))
-    monkeypatch.setenv("GRAPHIFY_SERVE_PORT", str(port))
     monkeypatch.setenv("GRAPHIFY_SERVE_LAUNCH_MARKER", str(tmp_path / "launch.marker"))
     # 本地回退哨兵：区分"本地"与"HTTP 恢复"
     monkeypatch.setattr(ph, "_query_locally", lambda prompt, graph_path: "LOCAL-FALLBACK")

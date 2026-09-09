@@ -15,6 +15,10 @@
 # 重复 prompt 重复拉起）与双 prompt 并发复活。curl 加 --max-time 上限（防挂死
 # server 卡 prompt）。
 #
+# 端口单一事实源：prompt_hook 连 GRAPHIFY_MCP_PORT（默认 8765）——ensure 拉起必须落在
+# 同一端口，否则自愈环断裂（prompt 查 8765 / server 起 9000）。旧 GRAPHIFY_SERVE_PORT
+# 已废弃（曾与 MCP_PORT 分裂致自愈静默失效）：保留为兼容回退，MCP_PORT 恒优先。
+#
 # 复活 default 漂移裁决（spec serve-memory §R3）：拉起者 cwd 成为 pinned default——
 # prompt-hook 恒传 project_root，default 几乎无消费方，接受漂移。
 #
@@ -23,7 +27,7 @@
 # health-check + nohup 启动为单一事实源（启动行为不变），prompt_hook 自愈复用同一脚本。
 # 上游变动检查: 若 graphify 改 CLI 命令名或 /health 端点消失，需更新此脚本。
 
-PORT="${GRAPHIFY_SERVE_PORT:-8765}"
+PORT="${GRAPHIFY_MCP_PORT:-${GRAPHIFY_SERVE_PORT:-8765}}"
 MARKER="${GRAPHIFY_SERVE_LAUNCH_MARKER:-/tmp/graphify-serve.launch}"
 
 cwd="${1:-}"

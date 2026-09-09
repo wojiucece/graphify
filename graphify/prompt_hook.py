@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 
 # ── 结构性问题检测 ──────────────────────────────────────────────
@@ -186,12 +186,19 @@ def _query_via_http(prompt: str, project_path: str) -> str | None:
             if resp.status == 200:
                 body = json.loads(resp.read().decode("utf-8"))
                 return body.get("result")
-    except (URLError, ConnectionError, OSError, json.JSONDecodeError, ValueError):
-        # R3 自愈（失败分支）：非阻塞拉起 server（脚本内探活+防抖保证恰一次语义）。
-        # 本条走 _query_locally 回退（_query_graph 在 result None 时自动落本地），
-        # 下一条 prompt 恢复 HTTP（server 拉起后毫秒级响应）。仅连接级失败触发——
-        # 非 200 状态（server 活着）不在本 except，不误拉起。
+    except HTTPError:
+        # 真实 urllib：4xx/5xx 抛 HTTPError（URLError 子类）——server 活着只是报错，
+        # 不误拉起（自愈只响应连接级失败）。注意必须排在 URLError 之前（子类优先）。
+        return None
+    except (URLError, ConnectionError, OSError):
+        # R3 自愈（失败分支）：连接级失败（拒绝/超时/重置）——非阻塞拉起 server
+        # （脚本内探活+防抖保证恰一次语义）。本条走 _query_locally 回退
+        # （_query_graph 在 result None 时自动落本地），下一条 prompt 恢复 HTTP。
         _ensure_server(project_path)
+        return None
+    except ValueError:
+        # 200 但 body 非 JSON（如代理/网关返回 HTML）——server 活着，不拉起。
+        return None
     return None
 
 
