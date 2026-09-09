@@ -168,8 +168,14 @@ def _backfill_gate(root: Path, out_dir: Path) -> "tuple[bool, dict]":
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return True, {}  # 无状态/损坏 → 不可判定 → 无条件（安全侧）
-    if not isinstance(state, dict) or not isinstance(state.get("source_count"), int):
-        return True, {}  # 无 source_count（旧状态/未迁移）→ 无条件（安全侧）
+    if not isinstance(state, dict) or state.get("phase") != "complete" \
+            or not isinstance(state.get("source_count"), int):
+        # I1（final review，reviewer 沙盒复现）：phase != complete（error=失败重建 /
+        # rebuilding=进行中）→ 状态的 source_count 可能比 graph.json 新（失败重建 finally
+        # 写 error + 新 count、图停留旧图）→ 双匹配判 fresh 会幽灵节点永久残留；单点覆盖
+        # error+rebuilding 两种载荷 → 无条件重建。无 source_count（旧状态/未迁移）同样
+        # 无条件（安全侧）。
+        return True, {}
     try:
         graph_mtime = (out_dir / "graph.json").stat().st_mtime
         state_mtime = state_path.stat().st_mtime

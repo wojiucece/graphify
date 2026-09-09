@@ -211,6 +211,32 @@ def test_gate_scan_timeout_falls_back_unconditional(polling, fast_watch, tmp_pat
         registry.stop_all()
 
 
+# === I1（final review）：phase != complete 无条件重建（防幽灵节点永久残留）==========
+
+def test_gate_phase_error_forces_rebuild(polling, tmp_path):
+    """I1（final review，reviewer 沙盒复现）：phase:error 状态文件（失败重建 shrink-guard
+    拒绝 → finally 写 phase:error + 新 source_count，graph.json 停留旧图）→ 门控双匹配
+    判 fresh 会幽灵节点永久残留。修：读侧 phase != complete → 无条件重建（单点覆盖
+    error+rebuilding 两种载荷）。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    out = root / "graphify-out"
+    state_path = out / ".rebuild-state.json"
+    # 构造 phase:error 状态（模拟失败重建后 finally 写的新 count + error 载荷，图停留旧图）
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    st["phase"] = "error"
+    state_path.write_text(json.dumps(st))
+    assert W._should_backfill(root, out) is True, \
+        "phase=error 状态应判陈旧（无条件重建，防幽灵节点）"
+    # rebuilding 载荷同判（进行中重建 → 状态 count 不可信）
+    st["phase"] = "rebuilding"
+    state_path.write_text(json.dumps(st))
+    assert W._should_backfill(root, out) is True, \
+        "phase=rebuilding 状态应判陈旧（无条件重建）"
+
+
 # === mixed batch 不门控（显式跳过防误用）========================================
 
 def test_gate_mixed_batch_not_gated(polling, tmp_path):
