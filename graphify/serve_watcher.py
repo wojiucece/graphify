@@ -83,6 +83,10 @@ _LOCK_BUSY = object()         # 跨进程锁忙 sentinel（_flush_batch 返回�
 _LOCK_BUSY_BACKOFF = 1.0      # 锁忙退避（hook 分钟级重建窗口下 attempt 是廉价 stat+读状态，1s 足够）
 _FINAL_FLUSH_LOCK_RETRIES = 3  # 停机 final flush 锁忙有界重试（铁律 2：stop 前批次落盘；
                                # 最多 ~3s 额外停机延迟，有界不放纵无界等待）
+# R1 补齐门控（serve-memory 票 03）：纯补齐批次的扫描上界。>上界 或 文件数超限 →
+# 回退无条件重建（watcher 线程语境下防大仓 flush 停滞的卫生约束；spec §R1 红线 6）。
+_BACKFILL_SCAN_MAX_S = 2.0
+_BACKFILL_SCAN_MAX_FILES = 200000
 
 
 def _default_max_watchers() -> int:
@@ -112,6 +116,87 @@ def _max_watchers_limit() -> int:
 def _graph_path_of(out_dir: str) -> str:
     """out_dir → graph.json 绝对路径（registry 反向索引键，与查询侧解析链同源）。"""
     return str((Path(out_dir) / "graph.json").resolve())
+
+
+def _should_backfill(root: Path, out_dir: Path) -> bool:
+    """R1 补齐门控：纯补齐批次是否执行重建（True=重建 / False=跳过）。
+
+    双条件覆盖三类陈旧（spec §R1 红线 2）：
+        max(语料 mtime) ≤ 捕获参照 AND collect_files 计数 == 状态文件 source_count
+      → False（图新鲜，跳过 pipeline）；否则 True（陈旧/不可判定 → 照常重建）。
+
+    捕获参照优先取状态文件 ``source_max_mtime``（重建/管线在 extract **之前**与 count
+    同一次 collect_files 扫描记录的语料 max mtime，stat-to-stat 精确比较）——旧状态文件
+    （无该字段）回退 ``min(graph.json mtime, started)``（spec §R1 I3 勘误口径）。
+    stat-to-stat 修正了 I3 字面口径的时钟量化盲区：time.time() 与文件 mtime 非同一时钟源，
+    新鲜项目偶发 ±238ns 超前误判陈旧；且快照早于图内容捕获点（extract），mid-rebuild
+    编辑才在参照之后被判陈旧（详见函数体注释）。
+
+    数据源裁决（红线 3）：graph-derived（G 内 distinct source_file）被实测否决
+    （942 ≠ collect 口径，恒不等恒触发）；state-file int 是唯一可行源。
+
+    漂移安全方向（红线 5）：收集规则分叉 → 计数恒不等 → 恒触发 → 退化无条件
+    （安全侧失败，不静默漏）。扫描上界（红线 6）：>2s 或文件数超限 → True。
+
+    职责边界（红线 7）：门控只管 graph-behind-corpus；FTS-behind-graph 由既有
+    ensure_fts 惰性重建覆盖，本函数不涉。
+
+    逃生口（红线 8）：``GRAPHIFY_BACKFILL=always`` → True（恢复无条件补齐回退旋钮）。
+
+    门控位置（红线 1）：本函数只在 watcher 线程的 flush 处理内调用（纯补齐批次），
+    不在 mount 路径——挂载仍无条件入队（廉价标志位，查询路径零新增延迟）。
+    """
+    if os.environ.get("GRAPHIFY_BACKFILL", "").strip().lower() == "always":
+        return True
+    # 状态文件 source_count（schema v2，rebuild_entry 与 _run_pipeline 双写路径各记一次）。
+    try:
+        state = json.loads((out_dir / ".rebuild-state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True  # 无状态/损坏 → 不可判定 → 无条件（安全侧）
+    if not isinstance(state, dict) or not isinstance(state.get("source_count"), int):
+        return True  # 无 source_count（旧状态/未迁移）→ 无条件（安全侧）
+    try:
+        graph_mtime = (out_dir / "graph.json").stat().st_mtime
+    except OSError:
+        return True  # 无图 → 陈旧（需重建出图）
+    # 捕获参照：**优先 state 的 source_max_mtime**（重建时与语料同一 ``stat()`` 源记录的
+    # max mtime，stat-to-stat 精确相等比较）——消除 Windows 时钟量化误报：``time.time()``
+    # 与文件 mtime 非同一时钟源，仅以 started 作参照时，新鲜项目（文件写后立即重建）的
+    # 语料 mtime 偶发比 started 超前 ~238ns（±2.384e-07 一个时钟 tick），门控误判陈旧触发
+    # 冗余重建（票 03 顺序依赖 flake 根因：test_gate_fresh_mount_skips_rebuild 组合跑偶发
+    # pipeline=1）。stat-to-stat 下未变文件的 mtime 两次读取严格相等，无一侧时钟误差。
+    # 旧状态文件无该字段 → 回退 captured_at = min(graph.json mtime, 状态文件 started)——
+    # 修正纯 graph_mtime 的 mid-rebuild-edit 盲区：编辑落在 extract 与落盘之间（FB2 停机
+    # 收敛场景）时 graph 落盘晚于编辑，纯 graph_mtime 判"新鲜"会漏掉该编辑；started 是
+    # extract 捕获起点，min 取两者更早者 → 该场景 max(语料 mtime) > captured_at → 判陈旧
+    # （安全侧）。source_max_mtime 天然覆盖该场景：mid-rebuild 编辑使文件 mtime 前进超出
+    # 记录值 → 判陈旧。
+    started = state.get("started")
+    if not isinstance(started, (int, float)):
+        started = graph_mtime  # 旧状态无 started → 回退 graph_mtime（spec 字面口径）
+    captured_at = min(graph_mtime, started)
+    ref_max_mtime = state.get("source_max_mtime")
+    if not isinstance(ref_max_mtime, (int, float)):
+        ref_max_mtime = captured_at  # 旧状态无 source_max_mtime → 回退 captured_at
+    # 有界扫描：daemon 线程 + join 上界（超时/异常/超限 → 无条件，安全侧失败）。
+    result: dict = {}
+
+    def _scan() -> None:
+        try:
+            from graphify.extract import collect_files
+            files = collect_files(root, root=root)
+            result["count"] = len(files)
+            result["max_mtime"] = max((f.stat().st_mtime for f in files), default=0.0)
+        except Exception:
+            result["error"] = True
+
+    t = threading.Thread(target=_scan, daemon=True, name="graphify-backfill-gate-scan")
+    t.start()
+    t.join(_BACKFILL_SCAN_MAX_S)
+    if t.is_alive() or result.get("error") or result.get("count", 0) > _BACKFILL_SCAN_MAX_FILES:
+        return True  # 超时/异常/超限 → 无条件（安全侧失败，退化为无条件）
+    fresh = result["max_mtime"] <= ref_max_mtime and result["count"] == state["source_count"]
+    return not fresh
 
 
 if _FSHandler is not None:  # pragma: no cover - 依赖 watchdog 是否安装
@@ -641,6 +726,60 @@ class ServeWatcher:
         except OSError as exc:
             logger.warning("watcher 状态文件写入失败（不阻塞重建）: %s", exc)
 
+    def _collect_corpus_snapshot(self) -> "tuple[int | None, float | None]":
+        """R1 语料快照 (count, max_mtime)——统一调 ``extract.collect_files``（与
+        rebuild_entry._collect_source_count 同口径双写）。在 ``_run_pipeline`` 的 extract
+        之前调用（stat-to-stat 参照须早于图内容捕获点，见 _run_pipeline 注记）；调用方把
+        快照传给 ``_write_source_count``。扫描失败 -> (None, None)（门控退化为无条件，安全侧）。"""
+        from graphify.extract import collect_files
+        try:
+            files = collect_files(self._root, root=self._root)
+            return len(files), max((f.stat().st_mtime for f in files), default=0.0)
+        except Exception:
+            return None, None
+
+    def _write_source_count(self, snapshot: "tuple[int | None, float | None] | None" = None) -> None:
+        """R1 双写路径（watcher 侧）：状态文件 source_count + source_max_mtime 刷新 +
+        complete 标记。
+
+        计数统一调 ``extract.collect_files``（与 rebuild_entry 侧同口径，零新面）。
+        本方法在 ``_run_pipeline`` 末尾调用——**锁 owner 约束（实施红线）**：pipeline
+        全程在 ``_flush_batch`` 的 rebuild_lock 作用域内（acquire → finally 释放），
+        ``_write_state`` 读锁 pid 判 owner，锁外调用会静默丢 count（spec §R1 红线 4）。
+
+        ``snapshot`` 为 ``_run_pipeline`` 在 extract **之前**预取的 (count, max_mtime)
+        （stat-to-stat 参照须早于图内容捕获点——FB2/停机收敛的 mid-rebuild 编辑必须在
+        参照值之后，门控才判陈旧；见 _run_pipeline 注记）。None/预取失败 → 回退扫描一次
+        （兜底，不应发生）。
+
+        complete 载荷取代 ``_end_state(error=False)`` 的角色（后者不携带 source_count，
+        若保留在成功路径会把刚写入的 count 覆盖丢失）。扫描失败 → 不记 count（门控
+        退化为无条件，安全侧失败）；状态写失败绝不影响重建管线。
+        """
+        import rebuild_entry
+        n, max_mtime = snapshot if snapshot is not None else (None, None)
+        if n is None:
+            n, max_mtime = self._collect_corpus_snapshot()
+        started = self._state_started or time.time()
+        payload = {
+            "schema": rebuild_entry._STATE_SCHEMA,
+            "phase": "complete",
+            "started": started,
+            "finished": time.time(),
+            "last_duration": round(time.time() - started, 1),
+            "project": str(self._root),
+        }
+        if n is not None:
+            payload["source_count"] = n
+        if max_mtime is not None:
+            # R1 stat-to-stat 参照（与 rebuild_entry._collect_source_count 同口径双写）：
+            # 门控比较当前语料 max mtime <= 本值（未变文件两次 stat 严格相等，无墙钟量化）。
+            payload["source_max_mtime"] = max_mtime
+        try:
+            rebuild_entry._write_state(self._root, _lock_path(self._root), payload)
+        except Exception:
+            logger.warning("watcher 状态文件 source_count 写入失败（不阻塞重建）", exc_info=True)
+
     # ── pipeline（触发链全链路）──────────────────────────────────────────────
 
     def _flush_batch(self, changed: list[Path], deleted: list[Path], *,
@@ -712,6 +851,17 @@ class ServeWatcher:
                               f"restoring {len(changed)} changed / {len(deleted)} deleted "
                               f"for re-build (avoid dropping late edits)", file=sys.stderr)
                     return True
+                # R1 补齐门控（serve-memory 票 03）：**纯补齐批次**（backfill 标志 + 空
+                # changed/deleted）先跑 _should_backfill——图新鲜（mtime+count 双条件）则
+                # 跳过 pipeline（清 pending 由 _take_batch 已完成，debug 日志一行）。门控
+                # 在 watcher 线程的 flush 内执行，不在 mount 路径（挂载零阻塞，spec 红线 1）。
+                # **mixed batch 不门控**：补齐 + 挂载后编辑并入同批次时直接重建（编辑必然
+                # 使语料变旧、门控也会放行；显式跳过防实现者误将门控套到混合批次吞掉编辑）。
+                if backfill and not changed and not deleted and not _should_backfill(self._root, self._out_dir):
+                    logger.debug("[graphify serve watcher] backfill gated for %s: "
+                                 "graph fresh (corpus mtime/count match); "
+                                 "skipping rebuild (zero-rebuild on fresh re-mount)", self._root)
+                    return True
                 # 票 05：backfill 判定用周期标志（merged batch 非空也标注 rebuilding）。
                 if backfill:
                     self._begin_state()
@@ -722,8 +872,9 @@ class ServeWatcher:
                         self._end_state(error=True)
                     print(f"[graphify serve watcher] rebuild failed: {exc}", file=sys.stderr)
                     return False
-                if backfill:
-                    self._end_state(error=False)
+                # R1：_run_pipeline 末尾的 _write_source_count 已写 complete + source_count
+                # 载荷（双写路径第 2 点，锁内）——_end_state(error=False) 的角色被吸收，不再
+                # 单独调用（否则其无 count 的 complete 载荷会覆盖刚写入的 source_count）。
                 if self._on_complete is not None:
                     try:
                         self._on_complete()
@@ -759,6 +910,20 @@ class ServeWatcher:
         out.mkdir(parents=True, exist_ok=True)
         print(f"[graphify serve watcher] {len(changed)} file(s) changed, "
               f"{len(deleted)} deleted; rebuilding...", file=sys.stderr)
+        # R1 门控数据源：普通批次（非 backfill）无 _begin_state，此处记 extract 捕获起点
+        # 参照——_write_source_count 的 started 用它（门控 min(graph_mtime, started) 的
+        # started 侧）。每次 pipeline 都刷新（非"if 0 才设"——否则首批后 started 停留旧值，
+        # 后续编辑批次的 started 过期 → 门控判陈旧 → 冗余重建）。backfill 批次由 _begin_state
+        # 已设，此处覆盖为略晚时间点（微秒差，envelope 字段一致性无影响）。
+        self._state_started = time.time()
+        # R1 双写路径（watcher 侧）预取语料快照：**早于 extract** 记录 (count, max_mtime)。
+        # stat-to-stat 参照必须早于图内容捕获点（extract）：mid-rebuild 编辑（FB2/停机收敛）
+        # 落在 extract 后使 max_mtime 前进超出预取值 → 门控判陈旧；若 extract 后扫描会把
+        # 编辑 mtime 记入参照 → 门控误判新鲜吞掉丢失编辑（与 rebuild_entry 侧同理由）。
+        # fresh-mount 下未变文件 mtime 两次 stat 严格相等（消除 I3 墙钟参照的 Windows
+        # 时钟 ±238ns 量化误报——test_gate_fresh_mount_skips_rebuild 组合跑偶发 pipeline=1
+        # 的 flake 根因）。快照传给 _write_source_count 落状态文件（锁内双写）。
+        _snapshot = self._collect_corpus_snapshot()
         # 1) extract 增量（per-file cache 使重跑廉价；删除文件不在 detect 语料 -> 天然缺席）
         extraction = rebuild_entry._extract_with_retry(root)
         # 2) 剔除 pending 删除集（兜底：缓存/种子残留的亡灵石，铁律 1）
@@ -789,8 +954,13 @@ class ServeWatcher:
         communities = cluster(G)
         # 6) 事实层原子落盘。删除批次合法缩量 -> force=True 绕 shrink-guard（#479）；
         #    纯修改批次保留 force=False（与 rebuild_entry.rebuild 同语义的保护）。
+        #    R1（票 03）：**纯补齐空批次** = 全量收敛到当前语料（含挂载前删除——US7 无
+        #    幽灵节点），授权缩量绕 shrink-guard。门控已判定语料 ≠ 图（count/mtime），
+        #    缩量是语料实况的真实反映（seed 已由 _merge_seed 合入，不会丢语义面）。
+        pure_backfill = not changed and not deleted
         ok = to_json(G, communities, str(out / "graph.json"),
-                     force=bool(deleted), built_at_commit=None, community_labels={})
+                     force=bool(deleted) or pure_backfill,
+                     built_at_commit=None, community_labels={})
         if not ok:
             raise RuntimeError(f"shrink-guard 拒绝写入 {out / 'graph.json'}（见 stderr 详情）")
         # 7) FTS 重投影（05 接口，原子替换）。Windows 上并发只读连接（serve 查询）
@@ -806,6 +976,11 @@ class ServeWatcher:
         # 8) 失效已删文件的 extract cache 条目（卫生；防缓存无限增长/意外复活）
         if deleted:
             self._invalidate_extract_cache(deleted)
+        # 9) R1 双写路径（watcher 侧，spec 红线 4）：状态文件 source_count +
+        #    source_max_mtime 刷新 + complete 标记（用 extract 前预取的快照）。锁 owner
+        #    约束：_write_state 读锁 pid 判 owner（锁外调用静默丢 count）；本方法在
+        #    _flush_batch 的 rebuild_lock 作用域内（pipeline 全程持锁），写入必然生效。
+        self._write_source_count(_snapshot)
 
     # ── 删除语义实现（铁律 1）────────────────────────────────────────────────
 

@@ -55,16 +55,46 @@ def _write_state(root: Path, lock: Path, payload: dict) -> None:
         _log(f"状态文件写入失败（不阻塞 rebuild）: {e}")
 
 
-def _finish_state(root: Path, lock: Path, started: float, error: bool = False) -> None:
+def _collect_source_count(root: Path) -> "tuple[int | None, float | None]":
+    """R1 门控数据源（serve-memory 票 03）：语料 (source_count, 捕获时语料 max mtime)。
+
+    计数统一调 ``extract.collect_files``（发现规则本体，与 serve_watcher._write_source_count
+    同口径，双写路径一致）。返回 ``(count, max_mtime)``——max_mtime 是重建实际捕获语料的
+    ``stat().st_mtime`` 上界，门控 stat-to-stat 比较用它（消除 Windows 时钟量化误报：
+    ``time.time()`` 与文件 mtime 非同一时钟源，仅以 started 作参照时新鲜项目会偶发
+    ±238ns 误判陈旧触发冗余重建，见 serve_watcher._should_backfill docstring）。
+    扫描异常 -> (None, None)（不记——门控读不到 count 退化为无条件，安全侧失败）。
+    graph-derived（G 内 distinct source_file）被实测否决（942 ≠ collect 口径，恒不等恒
+    触发），state-file int 是唯一可行源（spec §R1 红线 3）。"""
+    try:
+        from graphify.extract import collect_files
+        files = collect_files(root, root=root)
+        return len(files), max((f.stat().st_mtime for f in files), default=0.0)
+    except Exception:
+        return None, None
+
+
+def _finish_state(root: Path, lock: Path, started: float, error: bool = False,
+                  source_count: "int | None" = None,
+                  source_max_mtime: "float | None" = None) -> None:
     """与锁清理同一 finally 块调用；error 路径 phase=error（诚实于 complete）.
     C3/G3：git 可用时载荷加 git_head（rev-parse HEAD，基线锚点）——git 不可用/失败时
     省略字段（schema 只增不改，可缺省；读者侧缺失语义 = "基线未锚定"）。成功/错误路径
     都记（git_head 是仓库事实，与 build 成败无关）。schema v2：complete 载荷不携带
-    指纹（以 rebuilding 载荷为准，与 schema 1 相同）；旧状态文件读取器只读共字段。"""
+    指纹（以 rebuilding 载荷为准，与 schema 1 相同）；旧状态文件读取器只读共字段。
+    R1：``source_count`` 与 ``source_max_mtime`` 为门控数据源（双写路径第 1 点），
+    None 则省略（门控退化为无条件，安全侧失败）。``source_max_mtime`` 是重建捕获语料
+    的 max mtime（与 count 同一次 collect_files 扫描），门控 stat-to-stat 比较用它——
+    消除仅凭 ``started`` 墙钟参照的 Windows 时钟量化 ±238ns 误报（票 03 顺序依赖修复）。
+    旧状态文件无该字段：门控回退 ``min(graph_mtime, started)``（spec §R1 I3 字面口径）。"""
     payload = {"schema": _STATE_SCHEMA, "phase": "error" if error else "complete",
                "started": started, "finished": time.time(),
                "last_duration": round(time.time() - started, 1),
                "project": str(root)}
+    if source_count is not None:
+        payload["source_count"] = source_count
+    if source_max_mtime is not None:
+        payload["source_max_mtime"] = source_max_mtime
     gh = _git_head(root)
     if gh is not None:
         payload["git_head"] = gh
@@ -355,11 +385,23 @@ def rebuild(project_root: Path, *, out_dir: Path | None = None,
     prev_git_head = _read_prev_git_head(root)   # C3：覆盖前缓存上一轮 git_head（变更摘要锚点）
     t0 = time.time()
     exc_happened = False
+    source_count: "int | None" = None       # R1 门控数据源（双写路径第 1 点）；extract 失败则 None
+    source_max_mtime: "float | None" = None  # R1 门控 stat-to-stat 参照（与 count 同一次扫描）
     try:
         # 新链路编排（Task 09 换源）：extract(增量) → build → to_json(事实层落盘) →
         # rebuild_fts(FTS 重投影)。skip_sync 为已废弃 no-op（codegraph sync 已退役，
         # 保留 CLI 兼容 watch.py 既有调用）。
         from fts_cache import rebuild_fts, fingerprint
+        # R1：source_count + source_max_mtime = collect_files 扫描统计（与
+        # serve_watcher._write_source_count 同口径双写，调用方在 _run_pipeline 的 extract
+        # 之前预取同一快照）。**必须早于 extract 捕获**：stat-to-stat 参照须"早于图内容
+        # 捕获点"——mid-rebuild 编辑（FB2 停机收敛自愈场景：编辑落在 extract 与落盘之间）
+        # 落在 extract 之后时使 max_mtime 前进超出预取值 → 门控判陈旧；若在 extract 后
+        # 扫描会把该编辑 mtime 记入参照 → 门控误判新鲜吞掉丢失编辑。fresh-mount 下未变
+        # 文件 mtime 两次 stat 严格相等（无墙钟量化——修复 spec I3 min(graph_mtime,
+        # started) 的 Windows 时钟 ±238ns 误报）。扫描失败 -> (None, None)（省略字段，
+        # 门控退化为无条件，安全侧失败）。
+        source_count, source_max_mtime = _collect_source_count(root)
         extraction = _extract_with_retry(root)
         extraction, seed_hyperedges = _merge_seed(extraction, out, semantic_seed,
                                                   semantic_refresh, root)
@@ -367,11 +409,16 @@ def rebuild(project_root: Path, *, out_dir: Path | None = None,
         # fingerprint 一次——不额外 stat；语义与旧 db_fingerprint 的"输入状态标记"对齐）。
         # N2: 继承上轮 last_duration（否则时效逃生 2x 项恒 0，设计静默失效）。
         f0 = fingerprint(out / "graph.json")
-        _write_state(root, lock, {
+        _state_rebuilding = {
             "schema": _STATE_SCHEMA, "phase": "rebuilding", "started": t0,
             "project": str(root),
             "graph_fingerprint": list(f0) if f0 else None,
-            "last_duration": _read_prev_duration(root)})
+            "last_duration": _read_prev_duration(root)}
+        if source_count is not None:
+            _state_rebuilding["source_count"] = source_count
+        if source_max_mtime is not None:
+            _state_rebuilding["source_max_mtime"] = source_max_mtime
+        _write_state(root, lock, _state_rebuilding)
         from graphify.build import build_from_json
         from graphify.export import to_json, attach_hyperedges
         from graphify.cluster import cluster
@@ -432,7 +479,8 @@ def rebuild(project_root: Path, *, out_dir: Path | None = None,
     finally:
         # A1a: 状态收尾必须在锁清理之前（_write_state 读锁 pid 判断 owner；锁没了则拒写）。
         # 写序不变量 E1：run() 落盘 graph.json 先于此处 complete 标记。
-        _finish_state(root, lock, t0, error=exc_happened)
+        _finish_state(root, lock, t0, error=exc_happened, source_count=source_count,
+                      source_max_mtime=source_max_mtime)
         # 误接管防御：若本进程超 _LOCK_STALE_S 被另进程接管，锁目录已含对方的 pid 文件，
         # 非空目录 rmdir 抛 OSError，会掩盖本进程的正常返回或原始异常。包 except 吞掉。
         # 修正（Task 13 E2E 发现）：先删本进程 pid 文件再 rmdir；pid 不匹配（已被接管）
