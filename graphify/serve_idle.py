@@ -47,9 +47,6 @@ class IdleTimeoutMonitor:
         """任何 HTTP 请求续命（middleware 调用）。"""
         self._last_activity = time.monotonic()
 
-    def last_activity(self) -> float:
-        return self._last_activity
-
     def start(self) -> None:
         t = threading.Thread(target=self._run, name="serve-idle-monitor", daemon=True)
         t.start()
@@ -82,21 +79,22 @@ def run_http(app, *, host: str, port: int, idle_timeout: float = 0.0,
              poll_interval: float | None = None) -> None:
     """uvicorn.run 的替代：Config+Server 持句柄，idle 超时优雅退出。
 
-    - ``idle_timeout`` <= 0（默认 0）禁用 idle 监视（纯 run，行为与 uvicorn.run 等价）。
+    - ``idle_timeout`` <= 0（默认 0）禁用 idle 监视（纯 run，行为与 uvicorn.run 等价，
+      不注入任何额外 Config 默认）。
     - ``idle_timeout`` > 0 时：app 外包 idle middleware（任何请求续命）+ daemon 监视器
       启动，超时置 ``server.should_exit=True`` → uvicorn 优雅退出
-      （``timeout_graceful_shutdown=30`` 安全带）→ lifespan finally → stop_all →
-      final flush（铁律 2）。
+      （``timeout_graceful_shutdown=30`` 安全带，仅 idle 启用时设置）→ lifespan finally
+      → stop_all → final flush（铁律 2）。
     - ``poll_interval`` 缺省从 GRAPHIFY_IDLE_POLL_INTERVAL 取（默认 60s，测试旋钮）。
     """
     import uvicorn
-    server = uvicorn.Server(uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        timeout_graceful_shutdown=30,
-    ))
-    if idle_timeout and idle_timeout > 0:
+    config_kwargs: dict = {"host": host, "port": port}
+    idle_on = bool(idle_timeout and idle_timeout > 0)
+    if idle_on:
+        # 优雅停机安全带仅 idle 退出需要（idle_timeout=0 保持 uvicorn.run 完全等价）。
+        config_kwargs["timeout_graceful_shutdown"] = 30
+    server = uvicorn.Server(uvicorn.Config(app, **config_kwargs))
+    if idle_on:
         monitor = IdleTimeoutMonitor(
             server,
             idle_timeout,

@@ -54,8 +54,8 @@ spec-source: V4（三轮 grill 裁决 + 用户三项补充发现定稿）→ V4.
 
 ### R3：idle 自杀 + 自愈闭环
 
-- **模块归属（用户发现 1）**：idle 监视器独立 **`graphify/serve_idle.py`**（ASGI middleware + daemon timer + uvicorn Config/Server 包装，~35 行全在此）；serve.py 触点 ≤5 行（import + 接线）——遵循 fts_cache.py / serve_watcher.py 分层先例
-- **参数**：`--idle-timeout` 默认 3600s；`GRAPHIFY_IDLE_TIMEOUT` 覆盖（argparse default 从 env 取，同 `--api-key` 模式）；0 禁用；**仅 http transport**（stdio 随 stdin 退出）
+- **模块归属（用户发现 1）**：idle 监视器独立 **`graphify/serve_idle.py`**（ASGI middleware + daemon timer + uvicorn Config/Server 包装，~35 行全在此）；serve.py 触点 ≤5 行（import + 接线）——遵循 fts_cache.py / serve_watcher.py 分层先例。**口径勘误（评审）**：触点预算指 idle 逻辑行（import + 接线），`_idle_timeout_default`/argparse/CLI 样板行不计。import 语义：http transport 恒 import serve_idle（stdlib 纯净 os/threading/time，无副作用零成本），idle 启用时才激活监视（激活非 import 门控）；stdio 路径零 import（随 stdin 退出）——"零 import"回归锁口径为 stdio/serve 路径不拉入
+- **参数**：`--idle-timeout` 默认 3600s；`GRAPHIFY_IDLE_TIMEOUT` 覆盖（argparse default 从 env 取，同 `--api-key` 模式）；0 禁用；**仅 http transport**（stdio 随 stdin 退出）；`timeout_graceful_shutdown=30` 安全带仅 idle 启用时设置（0 禁用保持与 uvicorn.run 完全等价）
 - **活动定义 = 任何 HTTP 请求**（/query + /health 等，ASGI middleware 记 last-activity）。/health 计入续命：本地单用户无外部监控可接受；**注记：未来接入外部监控时 /health 需排除续命**
 - **退出路径**：`uvicorn.run` 改 `Config+Server` 持句柄；daemon 线程每 60s 检查，超时置 `should_exit=True` → 优雅退出 → lifespan finally（serve.py:3756-3764）→ stop_all → **final flush 完整停机协议（铁律 2）**；`timeout_graceful_shutdown=30` 安全带
 - **ensure-server 自愈闭环**：

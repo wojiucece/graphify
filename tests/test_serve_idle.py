@@ -195,22 +195,26 @@ def _install_fake_uvicorn(monkeypatch):
 
 
 def test_run_http_zero_idle_disables_monitor(monkeypatch):
-    """0 禁用：idle_timeout<=0 → 不包 middleware、不启 monitor（纯 run 等价）。"""
+    """0 禁用：idle_timeout<=0 → 不包 middleware、不启 monitor、不注入优雅停机 Config
+    （纯 run 等价，兑现 docstring 承诺）。"""
     from graphify import serve_idle
     captured = _install_fake_uvicorn(monkeypatch)
     serve_idle.run_http("APP", host="127.0.0.1", port=1234, idle_timeout=0)
     assert captured["runs"] == 1
     assert captured["server"].config.app == "APP", "0 禁用时 app 不应被 middleware 包裹"
-    assert captured["configs"][0].get("timeout_graceful_shutdown") == 30
+    assert "timeout_graceful_shutdown" not in captured["configs"][0], \
+        "0 禁用时不应注入 timeout_graceful_shutdown（与 uvicorn.run 等价）"
 
 
 def test_run_http_idle_wraps_middleware_and_starts_monitor(monkeypatch):
-    """idle_timeout>0 → app 外包 middleware + monitor 启动（续命/超时链路接线）。"""
+    """idle_timeout>0 → app 外包 middleware + monitor 启动 + 优雅停机 Config（idle 需要）。"""
     from graphify import serve_idle
     captured = _install_fake_uvicorn(monkeypatch)
     serve_idle.run_http("APP", host="127.0.0.1", port=1234,
                         idle_timeout=1000, poll_interval=0.05)
     assert captured["runs"] == 1
+    assert captured["configs"][0].get("timeout_graceful_shutdown") == 30, \
+        "idle 启用时应注入 timeout_graceful_shutdown=30 安全带"
     wrapped = captured["server"].config.app
     assert isinstance(wrapped, serve_idle.IdleTimeoutMiddleware), \
         "idle 启用时 app 应被 IdleTimeoutMiddleware 包裹"
@@ -239,6 +243,15 @@ def test_cli_idle_timeout_defaults_from_env(monkeypatch):
     assert captured["idle_timeout"] == 123, "缺省应从 GRAPHIFY_IDLE_TIMEOUT 取"
     S._main(["g.json", "--transport", "http", "--idle-timeout", "0"])
     assert captured["idle_timeout"] == 0, "显式 --idle-timeout 应赢过 env"
+
+
+def test_idle_timeout_malformed_env_falls_back_3600(monkeypatch):
+    """M4：GRAPHIFY_IDLE_TIMEOUT 畸形值回退 3600（不因 hook 侧 env 脏值崩启动）。"""
+    import graphify.serve as S
+    monkeypatch.setenv("GRAPHIFY_IDLE_TIMEOUT", "not-a-number")
+    assert S._idle_timeout_default() == 3600.0
+    monkeypatch.setenv("GRAPHIFY_IDLE_TIMEOUT", "-5")
+    assert S._idle_timeout_default() == -5.0
 
 
 # === 验收 5（进程面）：--idle-timeout 2 静默 → 进程退出 + 停机协议 ===
