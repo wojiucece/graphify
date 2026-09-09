@@ -3816,6 +3816,7 @@ def serve_http(
     json_response: bool = False,
     stateless: bool = False,
     session_timeout: float | None = 3600.0,
+    idle_timeout: float = 3600.0,
 ) -> None:
     """Start the MCP server over Streamable HTTP (MCP spec 2025-03-26).
 
@@ -3830,6 +3831,11 @@ def serve_http(
 
     The built-in watcher (Task 10) is off by default; enable via ``--watch`` or
     the GRAPHIFY_WATCH env var.
+
+    ``idle_timeout`` (R3, serve-memory): exit after this many seconds with no
+    HTTP request (activity = any HTTP request, /query + /health; 0 disables).
+    Wired through serve_idle.run_http so the graceful-shutdown path runs
+    stop_all + final flush (铁律 2) before the process exits.
     """
     graph_path = graph_path or _default_graph_json()
     try:
@@ -3864,7 +3870,20 @@ def serve_http(
             "unauthenticated on the network. Set --api-key (or GRAPHIFY_API_KEY).",
             file=sys.stderr,
         )
-    uvicorn.run(app, host=host, port=port)
+    # R3（serve-memory）：uvicorn.run 改 Config+Server 持句柄——idle 超时（默认 3600s）
+    # 置 should_exit 优雅退出 → lifespan finally → stop_all → final flush（铁律 2）。
+    # idle_timeout<=0 纯 run（与 uvicorn.run 等价）；仅 http transport 生效（stdio 零影响）。
+    from graphify import serve_idle
+    serve_idle.run_http(app, host=host, port=port, idle_timeout=idle_timeout)
+
+
+def _idle_timeout_default() -> float:
+    """--idle-timeout 缺省：GRAPHIFY_IDLE_TIMEOUT env（同 --api-key 模式），畸形值回退 3600。"""
+    raw = os.environ.get("GRAPHIFY_IDLE_TIMEOUT", "3600")
+    try:
+        return float(raw)
+    except ValueError:
+        return 3600.0
 
 
 def _main(argv: list[str] | None = None) -> None:
@@ -3919,6 +3938,13 @@ def _main(argv: list[str] | None = None) -> None:
         help="Reap stateful sessions idle this many seconds (default: 3600; 0 disables)",
     )
     parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=_idle_timeout_default(),
+        help="Exit after this many seconds with no HTTP request (default: 3600; "
+             "0 disables; env: GRAPHIFY_IDLE_TIMEOUT)",
+    )
+    parser.add_argument(
         "--watch",
         action="store_true",
         help="Watch the project for changes and auto-rebuild the graph on save "
@@ -3943,6 +3969,7 @@ def _main(argv: list[str] | None = None) -> None:
             json_response=args.json_response,
             stateless=args.stateless,
             session_timeout=args.session_timeout,
+            idle_timeout=args.idle_timeout,
         )
     else:
         serve(graph_path)

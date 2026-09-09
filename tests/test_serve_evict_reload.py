@@ -272,7 +272,7 @@ def test_query_during_reload_returns_normally_after_reload_window(tmp_path):
         assert "result" in body and body["result"], f"并发 /query #{i} 空结果/异常：{body}"
 
 
-# === 验收 4：corrupt graph.json——pop 无 None-hit；恢复旧图；下查自愈 ===
+# === 验收 4：corrupt graph.json——pop 无 None-hit；G 停留 None；下查自愈 ===
 
 def test_reload_failure_pops_cache_no_none_hit_and_self_heals(tmp_path):
     """验收 4（缓存级）：重载失败（corrupt graph.json）→ pop entry，无 None-hit
