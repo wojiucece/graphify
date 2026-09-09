@@ -63,10 +63,50 @@ graphify serve 的查询侧已经是 per-project 的：`_GraphContextCache` 维�
 - **单开关不变**：`--watch`/`GRAPHIFY_WATCH` 门控一切 watcher 的存在；关闭时零 watcher（现状语义）。
 
 ### 挂载即无条件补齐（grilling Q15，自审二轮 P1 修正，三轮 P1 限定适用范围）
+【修订注记（serve-memory 票 03，2026-09-09）：本节"无条件补齐"已被 serve-memory R1 补齐
+门控取代——挂载仍无条件入队（廉价标志位），判定移到 watcher 线程的 flush 处理内执行。
+决策前提变化、mtime+count 算法、误报容忍论证见本节末尾修订注记块。】
 
 - **语义**：**查询驱动的惰性挂载**首次挂 watcher 时**无条件**入队一次全量重建（不判定陈旧）。**默认项目的 eager mount（启动时挂载）不补齐**——保持 Task 10 现状语义；默认项目即使无人查询也在服务，且其图由 SessionEnd/PreCompact hook 维护，启动即补齐会让单项目用户每次 serve 启动都触发分钟级全量重建，违反 US3 零回归。"冷项目没人查过，多半陈旧"的先验只在惰性挂载成立。
 - **无条件而非判定的理由**：已核实"图落后于语料"（改源码未重建）无法用现有指纹体系廉价检测——FTS meta 表指纹对比（graph.json 的 mtime_ns/size）只覆盖"缓存落后于图"这一维度（且后者已有 ensure_fts 惰性重建覆盖）；语料变化不动 graph.json，指纹判 fresh，补齐永不触发。精确判定（manifest hash vs 语料扫描）是秒到分钟级扫描，与"挂载不阻塞查询"矛盾；轻量启发式（max-mtime）有 touch 误报。无条件补齐语义诚实——承认无法廉价判定就全量收敛。
+  【修订（serve-memory 票 03）："精确判定与不阻塞查询矛盾"的裁决已消解——判定从挂载路径
+  （查询面）移到 **watcher 线程的 flush 处理内**（挂载仍无条件入队，查询路径不碰扫描），
+  秒级判定扫描落在非延迟敏感的 watcher 线程，不再与"挂载不阻塞查询"冲突。原"无条件而非
+  判定"裁决随决策前提变化被 R1 门控取代（无条件语义退化为逃生口 GRAPHIFY_BACKFILL=always），
+  详见本节末尾修订注记块。】
 - **成本控制**：per serve 进程 per 项目至多一次（每次挂载周期一次——LRU 逐出后重查视为新挂载周期，再触发一次）；补齐走全局信号量排队，不阻塞查询响应。
+
+---
+
+**修订注记（serve-memory 票 03，2026-09-09）——"挂载即无条件补齐"→"门控补齐"**
+
+- **决策前提变化**：原裁决依据"精确判定与挂载不阻塞查询矛盾 + max-mtime 有 touch 误报，
+  故无条件"。serve-memory R1 把判定从挂载路径（查询面）移到 **watcher 线程的 flush
+  处理内**——挂载仍无条件入队（廉价标志位，查询路径零新增延迟），判定扫描（秒级）落在
+  watcher 线程，非延迟敏感，矛盾消解。无条件语义退化为逃生口 `GRAPHIFY_BACKFILL=always`。
+- **算法（双条件覆盖三类陈旧，serve-memory-spec §R1 红线）**：纯补齐批次 flush 时跑
+  `_should_backfill(root, out_dir)`：`max(语料 mtime) ≤ 捕获参照 AND collect_files
+  计数 == 状态文件 source_count` → 跳过 pipeline（清 pending，零重建）；否则照常重建。
+  修改 = mtime / 新增+删除 = count（**纯 max-mtime 的删除盲区由 count 封死**——幽灵节点
+  是本仓反复回归类）。捕获参照优先取状态文件 `source_max_mtime`（重建/管线**在 extract
+  之前**与 count 同一次 collect_files 扫描记录的语料 max mtime，stat-to-stat 比较——
+  消除 Windows 时钟量化 ±238ns 误报；且必须早于图内容捕获点，mid-rebuild 编辑才在参照
+  之后被判陈旧）；旧状态文件（无该字段）回退 `captured_at = min(graph.json mtime,
+  状态文件 started)`——started 侧修正 mid-rebuild-edit 盲区（编辑落在 extract 与落盘之间
+  时 graph 落盘晚于编辑，纯 graph_mtime 判"新鲜"会漏修；FB2 停机收敛自愈场景暴露；
+  source_max_mtime 天然覆盖该场景）。
+- **数据源**：count 统一调 `extract.collect_files`（发现规则本体，零新面），rebuild_entry
+  重建完成 + serve_watcher._run_pipeline 末尾 **双写** 状态文件 source_count（均在锁内——
+  `_write_state` 读锁 pid 判 owner，锁外调用静默丢 count）。graph-derived（G 内 distinct
+  source_file）被实测否决（942 ≠ collect 口径，恒不等恒触发）。
+- **误报容忍论证**：门控判定"语料 ≠ 图"→ 重建。touch（mtime 前进无内容变化）判陈旧 →
+  冗余重建一次，文档化容忍（安全方向：宁可多重建不漏真实修改）；扫描超时（>2s）/异常/
+  文件数超限 → 回退无条件（安全侧失败，不静默漏）；收集规则分叉 → 计数恒不等 → 恒触发 →
+  退化无条件（漂移安全方向）。
+- **mixed batch 不门控**：补齐与挂载后编辑并入同批次时直接重建（编辑必然使语料变旧、
+  门控也会放行；显式跳过防实现者误将门控套到混合批次吞掉编辑）。
+- **职责边界**：门控只管 graph-behind-corpus；FTS-behind-graph 由既有 ensure_fts 惰性
+  重建覆盖，不得混淆。
 
 ### 跨进程互斥（自审 P1 / grilling Q14）
 
