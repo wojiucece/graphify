@@ -62,7 +62,10 @@ class IdleTimeoutMiddleware:
     """ASGI middleware：任何 HTTP 请求续命（记录 last-activity）。
 
     原始 ASGI 实现（非 BaseHTTPMiddleware，避免缓冲 SSE 流）——与 _ApiKeyMiddleware
-    同哲学，覆盖 /mcp /query /health 全部 HTTP 请求。
+    同哲学，覆盖 /mcp /query /health 全部 HTTP 请求。``lifespan.startup`` 也续命一次：
+    idle 时钟从 server 就绪（app 启动完成）起算，启动耗时不侵占静默窗口——慢机
+    （启动 > idle_timeout）时 monitor 不会在就绪轮询（/health）到达前误退（spec 验收 5
+    "启动慢也不误退"的进程面保证；注记在 test_cli_idle_timeout_exits_process 探活口径）。
     """
 
     def __init__(self, app, monitor: IdleTimeoutMonitor):
@@ -72,6 +75,15 @@ class IdleTimeoutMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             self._monitor.touch()
+        elif scope["type"] == "lifespan":
+            # uvicorn 生命周期：startup 完成即 server 就绪——续命一次（见 class docstring）。
+            async def _receive():
+                message = await receive()
+                if message.get("type") == "lifespan.startup":
+                    self._monitor.touch()
+                return message
+            await self.app(scope, _receive, send)
+            return
         await self.app(scope, receive, send)
 
 

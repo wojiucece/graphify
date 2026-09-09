@@ -132,6 +132,32 @@ def test_middleware_ignores_non_http_scope():
     assert mon.touched == 0, "websocket scope 不应续命"
 
 
+def test_middleware_touches_on_lifespan_startup():
+    """lifespan.startup 续命一次：idle 时钟从 server 就绪起算（启动耗时不侵占静默窗口，
+    防慢机 flake——启动 > idle_timeout 时 monitor 在 /health 就绪轮询前误退）。"""
+    from graphify import serve_idle
+    mon = _FakeMonitor()
+    seen = []
+
+    async def _lifespan_app(scope, receive, send):
+        msg = await receive()
+        seen.append(msg.get("type"))
+        if msg.get("type") == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+
+    async def _lifespan_receive():
+        return {"type": "lifespan.startup"}
+
+    async def _lifespan_send(msg):
+        pass
+
+    app = serve_idle.IdleTimeoutMiddleware(_lifespan_app, mon)
+    scope = {"type": "lifespan"}
+    asyncio.run(app(scope, _lifespan_receive, _lifespan_send))
+    assert seen == ["lifespan.startup"], f"lifespan 消息未透传: {seen}"
+    assert mon.touched == 1, "lifespan.startup 应续命一次（server 就绪即 idle 时钟起点）"
+
+
 # === 单元：monitor 超时置 should_exit ===
 
 def test_monitor_sets_should_exit_after_idle_timeout():
@@ -266,7 +292,11 @@ def test_cli_idle_timeout_exits_process(tmp_path):
     graph_path = root / "graphify-out" / "graph.json"
     _write_graph(graph_path, ["alpha"])
     port = _free_port()
-    env = dict(os.environ, GRAPHIFY_IDLE_POLL_INTERVAL="0.1")
+    # PYTHONPATH 注入 <worktree 根>：子进程不经安装态也能 import graphify（editable 环境
+    # 下无感；未安装环境下避免 ModuleNotFoundError → AssertionError 误报验收 5 失败）。
+    src_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ, GRAPHIFY_IDLE_POLL_INTERVAL="0.1",
+               PYTHONPATH=src_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     proc = subprocess.Popen(
         [sys.executable, "-m", "graphify.serve", str(graph_path),
          "--transport", "http", "--host", "127.0.0.1", "--port", str(port),
