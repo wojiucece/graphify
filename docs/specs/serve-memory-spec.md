@@ -98,7 +98,7 @@ R-E ‖ R3（并行，互不依赖）→ R1（收尾）
 | 1 | R-E 峰值 | load() 两次驱动，重载 tracemalloc 峰值砍 ≥ 一个图（~50MB） |
 | 2 | R-E 逐出红线 | 重载刷新不触发 on_evict（watcher 仍 alive） |
 | 3 | R-E 并发 | 重载窗口内并发 /query 阻塞 ≤2-4s 后正常返回，无 404/500 或空结果（见 R-E"阻塞窗口"条款） |
-| 4 | R-E 失败 | corrupt graph：当次恢复旧图可服务；cache pop 无 None-hit；下查自愈 |
+| 4 | R-E 失败 | corrupt graph：当次报错（G 停留 None）；cache pop 无 None-hit；下查自愈 |
 | 5 | R3 idle | `--idle-timeout 2` 静默 3s → 退出 + stop_all + final flush 落盘 |
 | 6 | R3 自愈 | server 死后 prompt 实测：首条本地回退 + ensure-server 恰一次；次条恢复 HTTP |
 | 7 | R1 门控 | 五路：新鲜跳过 / 陈旧执行 / touch 误报执行 / 删除触发（count）/ 超时回退 |

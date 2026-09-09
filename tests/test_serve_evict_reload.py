@@ -8,13 +8,13 @@ spec: docs/specs/serve-memory-spec.md §R-E（:45-53）与 §Testing 验收 1-4�
 - 验收 2（逐出红线）：重载刷新不触发 on_evict（缓存回调计数 + watcher 仍 alive）
 - 验收 3（并发）：重载窗口内并发 /query 阻塞 ≤2-4s 后正常返回，无 404/500 或空结果
   ——阻塞是预期行为（spec"阻塞窗口"条款），禁止为制造 None 可见窗口把置空移出锁外
-- 验收 4（失败）：corrupt graph.json 当次恢复旧图可服务；cache pop 无 None-hit；下查自愈
+- 验收 4（失败）：corrupt graph.json 当次报错（G 停留 None）；cache pop 无 None-hit；下查自愈
 
 实现红线（双引用点）：
 - cache 侧 load()：key 失配且 entry 存在 → 先 entry["G"]=None / entry["communities"]=None
   再 _load_entry()，完成后整体替换。不 pop、不触发 on_evict、保持 LRU 位（刷新≠容量逐出）。
-- 闭包侧 _select_graph：在 _load_ctx 前 G, communities = None, {}；失败恢复旧图
-  （except: G, communities = old; raise）。
+- 闭包侧 _select_graph：在 _load_ctx 前 G, communities = None, {}；失败 G 停留 None
+  （不可观测：G 消费者全在 _select_graph 成功后读，失败即 500/isError——I1 已删 old 恢复）。
 - 失败路径裁决：cache 侧重载失败 → pop entry（防 G=None+旧 key 命中返回 (None,None) 崩溃）。
 """
 import gc
