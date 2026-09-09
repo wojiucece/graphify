@@ -185,6 +185,10 @@ def _should_backfill(root: Path, out_dir: Path) -> bool:
     ref_max_mtime = state.get("source_max_mtime")
     if not isinstance(ref_max_mtime, (int, float)):
         ref_max_mtime = captured_at  # 旧状态无 source_max_mtime → 回退 captured_at
+    # μ2（用户终审）：读侧对称钳制——兜住写侧钳制（I1）落地前/测试写入的存量污染状态文件，
+    # 存量未来参照立即无害（参照恒 ≤ now+1s → 判陈旧冗余重建，安全侧），不须等墙钟越过
+    # 未来值后下轮重建才自愈。纯安全侧：只可能多判陈旧，不吞编辑。
+    ref_max_mtime = min(ref_max_mtime, time.time() + _MTIME_CLAMP_TOLERANCE_S)
     # 有界扫描：daemon 线程 + join 上界（超时/异常/超限 → 无条件，安全侧失败）。
     result: dict = {}
 
