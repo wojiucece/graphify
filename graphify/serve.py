@@ -169,7 +169,24 @@ class _GraphContextCache:
                     self._entries.move_to_end(resolved_path)
                 return entry["G"], entry["communities"]
 
-            entry = self._load_entry(resolved_path, key)
+            # R-E evict-before-reload（双引用点·cache 侧）：key 失配且旧 entry 仍在 →
+            # 先释放旧图引用再加载新图，避免重载瞬间旧图+新图双驻留（峰值砍约一个图）。
+            # 不 pop、不触发 on_evict、保持 LRU 位（刷新≠容量逐出）。全程持锁
+            # （stat→置空→加载→替换原子），get() 同锁（serve.py:193），时序 load 先于
+            # get → get 必见重载完成后的新 entry。
+            if entry is not None:
+                entry["G"] = None
+                entry["communities"] = None
+            try:
+                entry = self._load_entry(resolved_path, key)
+            except Exception:
+                # 失败路径裁决：pop 旧 entry——置空 entry 若原样留存（G=None + 旧 key），
+                # 下次 stat 同 key 缓存命中返回 (None, None) 崩溃；pop 语义 = "缓存只持有
+                # 确认新鲜的图"。corrupt 期间每查重试每查报错——与今日行为一致（今日 key
+                # 恒失配同样从不服务旧图）。
+                if entry is not None:
+                    entries.pop(resolved_path, None)
+                raise
             entries[resolved_path] = entry
             if not pinned:
                 self._entries.move_to_end(resolved_path)
@@ -2968,7 +2985,17 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
     def _select_graph(project_path) -> None:
         nonlocal G, communities, active_graph_path
         path = _resolve_graph_path(project_path)
-        G, communities = _load_ctx(path)
+        # R-E 闭包侧预释放（双引用点·闭包侧）：在 _load_ctx 前释放闭包对旧图的引用——
+        # cache 侧 load() 已同步释放 entry 引用，双引用点缺一不可（任一点残留都让旧图
+        # 在重载期间继续驻留）。失败恢复旧图：当次请求仍报错（corrupt 期间每查重试每查
+        # 报错，与今日一致），但闭包恢复陈旧但完整的旧图，进程内后续路径不会撞上 G=None。
+        old = G, communities
+        G, communities = None, {}
+        try:
+            G, communities = _load_ctx(path)
+        except Exception:
+            G, communities = old
+            raise
         active_graph_path = str(Path(path).resolve())
         # 惰性挂载：首次成功加载某项目图时自动挂该项目 watcher（与查询侧"用到即加载"
         # 对称）。(project_root, out_dir) 均来自查询侧解析链——out_dir = 查询目标的
