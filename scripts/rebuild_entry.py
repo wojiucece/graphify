@@ -30,6 +30,11 @@ from graphify.rebuild_lock import _LOCK_STALE_S, _acquire_lock, _lock_path
 EXIT_OK, EXIT_LOCK, EXIT_SYNC_FAIL = 0, 3, 4
 EXTRACT_RETRIES, EXTRACT_RETRY_WAIT_S = 3, 2.0   # 提取失败短退避重试（对齐旧 sync 3 次退避）
 _STATE_SCHEMA = 2                                  # 状态文件 schema v2（graph_fingerprint 字段）
+# I1（reviewer，与 serve_watcher._MTIME_CLAMP_TOLERANCE_S 同值）：未来时间戳粘性参照的
+# 钳制容差。source_max_mtime 记录时钳制 min(max_mtime, time.time()+1s)——参照恒 ≤ now+1s，
+# 秒级未来戳（touch +2s / NTP 回拨 / os.utime）被钳制 → 门控判陈旧（安全侧冗余重建，不吞
+# 真实编辑）；容差 1s >> 时钟源量化 ~238ns（合法新鲜文件不误剪，I3 flake 不回归）。
+_MTIME_CLAMP_TOLERANCE_S = 1.0
 
 
 def _log(msg: str) -> None:
@@ -69,7 +74,11 @@ def _collect_source_count(root: Path) -> "tuple[int | None, float | None]":
     try:
         from graphify.extract import collect_files
         files = collect_files(root, root=root)
-        return len(files), max((f.stat().st_mtime for f in files), default=0.0)
+        max_mtime = max((f.stat().st_mtime for f in files), default=0.0)
+        # I1：钳制到 now+容差——参照恒 ≤ now+1s，秒级未来戳（touch/NTP）被钳制 → 门控判
+        # 陈旧安全侧；容差内时钟源偏差（~238ns << 1s）被信任不剪（fresh-mount flake 不回归）。
+        max_mtime = min(max_mtime, time.time() + _MTIME_CLAMP_TOLERANCE_S)
+        return len(files), max_mtime
     except Exception:
         return None, None
 

@@ -353,3 +353,64 @@ def test_gate_fresh_fixture_adaptation_via_escape_hatch(polling, fast_watch, tmp
             "逃生口下新鲜夹具挂载补齐未触发"
     finally:
         registry.stop_all()
+
+
+# === I1（reviewer）：未来时间戳粘性参照——钳制 min(max_mtime, now+容差) =============
+
+def test_gate_future_timestamp_edit_not_swallowed(polling, fast_watch, tmp_path):
+    """I1（reviewer 实测）：未来时间戳污染参照——touch(+2s) 后重建把 source_max_mtime
+    记到未来；随后被监视期间的真实编辑（mtime=now < 未来值）在重挂时被门控判新鲜
+    **静默吞掉**（漏修，违反 §R1 漂移安全方向：spec 明文容忍的 touch 误报本应落在
+    安全方向=冗余重建，未来参照把它翻成漏修）。修复：快照记录时钳制
+    ``min(max_mtime, time.time() + _MTIME_CLAMP_TOLERANCE_S)``——参照恒 ≤ now+1s，
+    未来戳语料 max > 参照 → 判陈旧 → 退化安全侧（冗余重建，不吞真实编辑）。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    root = _mini_proj(tmp_path)
+    rebuild_entry.rebuild(root)
+    # 未来时间戳（touch +2s，秒级 > 1s 容差），重建把参照污染到未来
+    future = time.time() + 2
+    os.utime(root / "b.py", (future, future))
+    rebuild_entry.rebuild(root)
+    # 重建后被监视期间的真实编辑（mtime=now < 未来值）
+    (root / "a.py").write_text(
+        "import b\n\ndef foo():\n    return b.bar()\n\ndef real_sym():\n    return 1\n",
+        encoding="utf-8")
+    assert "real_sym()" not in _labels(root / "graphify-out"), "前置：图未含真实编辑"
+    # 直接断言门控判定（RED→GREEN 判别点，快）：未来参照不得吞真实编辑
+    assert W._should_backfill(root, root / "graphify-out") is True, \
+        "门控误判新鲜（未来时间戳参照吞真实编辑）"
+    # 行为面：重挂后真实编辑被拾取（执行重建）
+    registry = W.WatcherRegistry(_FakeCache(), debounce=0.1, poll_interval=0.2)
+    w, stats = _mount_and_count(registry, root, root / "graphify-out")
+    try:
+        assert _wait_for(lambda: "real_sym()" in _labels(root / "graphify-out"), timeout=40), \
+            "真实编辑被未来时间戳参照吞掉（门控判新鲜跳过重建）"
+        assert stats["pipeline"] >= 1, f"真实编辑未触发重建: {stats}"
+    finally:
+        registry.stop_all()
+
+
+def test_gate_clamp_tolerance_boundary(polling, tmp_path):
+    """容差边界（controller 裁决）：钳制容差 _MTIME_CLAMP_TOLERANCE_S=1s 内视为时钟源
+    偏差被信任（不剪）——文件 mtime now+0.5s → 快照参照保留该值（min(max_mtime, now+1s)
+    取前者）；秒级未来戳（touch/NTP，>1s）才被钳制到 ~now+1s。这是"信任容差内偏差、
+    钳制秒级未来戳"语义的落点断言。"""
+    import graphify.serve_watcher as W
+    import rebuild_entry
+    # case A: +3s（秒级未来戳）→ 钳到 ~now+1s（恒 ≤ now+1s）
+    rootA = _mini_proj(tmp_path / "a")
+    futureA = time.time() + 3
+    os.utime(rootA / "b.py", (futureA, futureA))
+    rebuild_entry.rebuild(rootA)
+    stA = json.loads((rootA / "graphify-out" / ".rebuild-state.json").read_text())
+    assert stA["source_max_mtime"] <= time.time() + W._MTIME_CLAMP_TOLERANCE_S + 0.05, \
+        f"+3s 秒级未来戳未被钳制: {stA['source_max_mtime']}"
+    # case B: +0.5s（容差内）→ 保留原值（信任时钟偏差，不剪）
+    rootB = _mini_proj(tmp_path / "b")
+    futureB = time.time() + 0.5
+    os.utime(rootB / "b.py", (futureB, futureB))
+    rebuild_entry.rebuild(rootB)
+    stB = json.loads((rootB / "graphify-out" / ".rebuild-state.json").read_text())
+    assert stB["source_max_mtime"] >= futureB - 1e-6, \
+        f"+0.5s 容差内时钟偏差被误剪: {stB['source_max_mtime']}"

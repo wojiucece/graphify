@@ -87,6 +87,13 @@ _FINAL_FLUSH_LOCK_RETRIES = 3  # 停机 final flush 锁忙有界重试（铁律 
 # 回退无条件重建（watcher 线程语境下防大仓 flush 停滞的卫生约束；spec §R1 红线 6）。
 _BACKFILL_SCAN_MAX_S = 2.0
 _BACKFILL_SCAN_MAX_FILES = 200000
+# I1（reviewer）：未来时间戳粘性参照的钳制容差。source_max_mtime 记录时钳制到
+# min(max_mtime, time.time() + _MTIME_CLAMP_TOLERANCE_S)——参照恒 ≤ now+1s，秒级未来戳
+# （touch +2s / NTP 回拨 / os.utime）使语料 max > 参照 → 判陈旧 → 退化安全侧（冗余重建，
+# 不吞真实编辑）。容差 1s 两头安全：>> 时钟源量化 ~238ns（合法新鲜文件永不误剪，I3 flake
+# 不回归）；<< touch/NTP 级未来戳（秒级，恒被剪）。剪后自愈：墙钟越过未来值后下轮重建拿
+# 干净参照，粘性打破。回退路径 captured_at 是过去值天然安全，无需钳。
+_MTIME_CLAMP_TOLERANCE_S = 1.0
 
 
 def _default_max_watchers() -> int:
@@ -734,7 +741,11 @@ class ServeWatcher:
         from graphify.extract import collect_files
         try:
             files = collect_files(self._root, root=self._root)
-            return len(files), max((f.stat().st_mtime for f in files), default=0.0)
+            max_mtime = max((f.stat().st_mtime for f in files), default=0.0)
+            # I1：钳制到 now+容差——参照恒 ≤ now+1s，秒级未来戳（touch/NTP）被钳制 → 判
+            # 陈旧安全侧；容差内时钟源偏差（~238ns << 1s）被信任不剪（fresh-mount flake 不回归）。
+            max_mtime = min(max_mtime, time.time() + _MTIME_CLAMP_TOLERANCE_S)
+            return len(files), max_mtime
         except Exception:
             return None, None
 
