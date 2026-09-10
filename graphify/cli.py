@@ -4113,6 +4113,9 @@ def dispatch_command(cmd: str) -> None:
             # 路径顶层直写 graph.json；clustered 路径经 build()/build_merge() → G.graph →
             # to_json 提升顶层。信号跨构建边界存活，ranked gap 通道才有源可消费。
             "failed_refs": list(ast_result.get("failed_refs") or []),
+            # 0.9.57 (#3411)：实际派发的源路径——build_merge / merge_raw_extraction
+            # 据此判断哪些文件被真实重提取（而非从 node["source_file"] 猜归属）。
+            "extracted_sources": list(ast_result.get("extracted_sources", [])),
         }
 
         # 07 票：failed_refs.file_path 相对化——extract 以 target 为根，节点 source_file
