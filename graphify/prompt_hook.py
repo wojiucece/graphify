@@ -251,6 +251,18 @@ def prompt_hook_main() -> None:
     v3 修订（审核优化 #3）：支持 --test "<prompt>" [cwd] CLI 调试参数，
     绕过 isatty() 检查，便于手动测试。
     """
+    # === CUSTOM: stdout 编码加固 begin ===
+    # 任何调用环境强制 UTF-8——.venv python 直跑时 stdout 默认 cp936，引导句的 →
+    # 会被编成 GBK 0xA1FA，Claude Code 按 UTF-8 解注入内容即失败。uv tool CLI 入口
+    # 的 python 恰好输出 UTF-8（当前真实链路正常），但依赖环境巧合属脆弱面，此处
+    # 显式钉死。reconfigure 失败（stdout 非 TextIOWrapper）静默跳过——hook 绝不因
+    # 自身问题崩（:4 哲学）。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    # === CUSTOM: stdout 编码加固 end ===
+
     # Kill switch
     if os.environ.get("GRAPHIFY_NO_PROMPT_HOOK") == "1":
         return
