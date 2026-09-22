@@ -17,7 +17,7 @@ Rules:
 ### 升级上游
 - **用 merge 策略**（非 rebase）：`git fetch upstream` -> `git merge upstream/v8 --no-edit`。保留 fork 定制提交 hash，可逆（`git reset --hard <备份tag>` 回退），fork 维护惯例
 - **禁跑 `scripts/sync.sh`**--它不是重装脚本，是完整同步：含 `git rebase upstream/v8`（与 merge 策略冲突，会抹掉 merge commit）+ `git push --force-with-lease`（未授权 outward 操作）。跑它会破坏 fork
-- 同步前打备份 tag：`git tag v8-custom-pre-sync-N v8-custom`，失败可秒回退
+- 同步前打备份 tag：`git tag v8-custom-pre-sync-N v8-custom`，失败可秒回退；**滚动只保留最近 2 个**——打新 tag（如 14）后即删最旧的一个（有 14 留 13/14，有 15 留 14/15），旧 tag 纯本地不进远端
 - 冲突时搜 `CUSTOM:` 标记找所有改动点
 - **上游重构搬文件时，fork 定制常量（`_PROMPT_HOOK`、`_OPENCODE_PLUGIN_JS`）易丢**--迁移要逐常量对比内容，不能只看函数签名相同就判定被吸收（`_OPENCODE_PLUGIN_JS` 方案C 就是这样漏过一次）
 - **升级前先验证 `graphify --version` 能跑**--venv 可能被清空（ModuleNotFoundError），重装 `uv tool install --editable ".[mcp,openai]" --force` 恢复
