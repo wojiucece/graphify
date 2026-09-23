@@ -43,8 +43,8 @@ echo "=== 新增文件存在性检查 ==="
 # per-project-watcher Task 02（WatcherRegistry + 双临时项目 E2E 基础）：graphify/serve_watcher.py WatcherRegistry 类（惰性挂载/幂等/全局信号量=1）+ tests/test_watcher_registry.py 注册表单测与双项目 E2E——上游 merge 丢弃时守护必须告警
 # per-project-watcher Task 04（挂载即无条件补齐 + 跨进程互斥接线）：tests/test_mount_backfill_lock.py 补齐/收敛/锁忙 E2E（挂载补齐、收敛跳过、双向互斥、final-flush 锁忙重试）——上游 merge 丢弃时守护必须告警
 # per-project-watcher Task 05（可观测性 + 嵌套边界 + 停机协议 + 收尾）：tests/test_watcher_finish.py 收尾验收（嵌套 E2E、停机 flush/信号量持有者优先 join、graph_stats watched_projects、observer 泄漏修复、LRU 逐出重入补齐、FB3 耗尽告警、merged batch freshness 标注）——上游 merge 丢弃时守护必须告警
-# per-project-watcher spec（全部五票的需求/决策/风险登记文档）：docs/specs/per-project-watcher-spec.md——上游 merge 丢弃时守护必须告警
 # serve-memory spec（R-E evict/R3 idle 自愈/R1 补齐门控三项内存优化的需求/决策/验收文档）：docs/specs/serve-memory-spec.md——上游 merge 丢弃时守护必须告警
+# 注：per-project-watcher-spec.md 已随 4e7487d 的 docs 清理删除，清单条目同步移除（否则假阳性让守护长期非零退出）
 # serve-memory Task 01（R-E evict-before-reload）：tests/test_serve_evict_reload.py 验收 1-4 测试（峰值/逐出红线/并发/失败自愈）——上游 merge 丢弃时守护必须告警
 # serve-memory Task 02（R3 idle 自杀 + 自愈闭环）：graphify/serve_idle.py idle 监视器
 # （ASGI middleware + daemon timer + uvicorn 包装）+ scripts/ensure-graphify-server.sh 共享
@@ -54,7 +54,7 @@ echo "=== 新增文件存在性检查 ==="
 # 不门控 + 锁 owner source_count 双写 + 逃生口；tests/test_serve_memory_accept.py 验收 9 特性级
 # 内存（单项目 ≤250MB / 多项目 5 轮换 ≤400MB 且新鲜重挂零重建，子进程 RSS 测量）——上游
 # merge 丢弃时守护必须告警
-for f in graphify/prompt_hook.py graphify/serve_idle.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/ensure-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh scripts/run_analysis.py scripts/split_semantic_seed.py scripts/rebuild_entry.py scripts/fts_cache.py scripts/symbol_utils.py graphify/serve_watcher.py graphify/rebuild_lock.py benchmarks/efficiency_benchmark.py tests/test_rebuild_state.py tests/test_response_envelope.py tests/test_redaction.py tests/test_session_snapshot.py tests/test_cache_gc.py tests/test_ranked_context.py tests/test_symbol_source.py tests/test_dispatch_trace.py tests/test_git_symbols.py tests/test_hotspots.py tests/test_structure_queries.py tests/test_schema_budget.py tests/test_efficiency_benchmark.py tests/test_resolved_by_and_gap_collector.py tests/test_fts_cache.py tests/test_get_node_fts.py tests/test_failed_refs_persistence.py tests/test_rebuild_entry.py tests/test_run_analysis.py tests/test_graph_diff_sync.py tests/test_serve_watcher.py tests/test_rebuild_lock.py tests/test_watcher_registry.py tests/test_mount_backfill_lock.py tests/test_watcher_finish.py tests/test_serve_evict_reload.py tests/test_serve_idle.py tests/test_prompt_hook_ensure_server.py tests/test_backfill_gate.py tests/test_serve_memory_accept.py docs/specs/per-project-watcher-spec.md docs/specs/serve-memory-spec.md tests/fixtures/mini-graph.json tests/fixtures/resolved_by/python/pkg/__init__.py tests/fixtures/resolved_by/python/pkg/callee.py tests/fixtures/resolved_by/python/pkg/caller.py tests/fixtures/resolved_by/python/pkg/orphan.py tests/fixtures/resolved_by/python/pkg/class_def.py tests/fixtures/resolved_by/python/pkg/class_use.py tests/fixtures/resolved_by/typescript/repo.ts tests/fixtures/resolved_by/typescript/use.ts tests/test_extraction_contract.py tests/fixtures/sample_native_fields.py tests/test_extraction_contract_languages.py tests/test_extraction_docstring.py tests/fixtures/sample_docstrings.py tests/fixtures/sample_docstrings.ts tests/fixtures/sample_docstrings.js; do
+for f in graphify/prompt_hook.py graphify/serve_idle.py scripts/sync.sh scripts/sessionstart-graphify-server.sh scripts/ensure-graphify-server.sh scripts/precompact-graphify-update.sh scripts/sessionend-graphify-update.sh scripts/check-custom.sh scripts/run_analysis.py scripts/split_semantic_seed.py scripts/rebuild_entry.py scripts/fts_cache.py scripts/symbol_utils.py graphify/serve_watcher.py graphify/rebuild_lock.py benchmarks/efficiency_benchmark.py tests/test_rebuild_state.py tests/test_response_envelope.py tests/test_redaction.py tests/test_session_snapshot.py tests/test_cache_gc.py tests/test_ranked_context.py tests/test_symbol_source.py tests/test_dispatch_trace.py tests/test_git_symbols.py tests/test_hotspots.py tests/test_structure_queries.py tests/test_schema_budget.py tests/test_efficiency_benchmark.py tests/test_resolved_by_and_gap_collector.py tests/test_fts_cache.py tests/test_get_node_fts.py tests/test_failed_refs_persistence.py tests/test_rebuild_entry.py tests/test_run_analysis.py tests/test_graph_diff_sync.py tests/test_serve_watcher.py tests/test_rebuild_lock.py tests/test_watcher_registry.py tests/test_mount_backfill_lock.py tests/test_watcher_finish.py tests/test_serve_evict_reload.py tests/test_serve_idle.py tests/test_prompt_hook_ensure_server.py tests/test_backfill_gate.py tests/test_serve_memory_accept.py docs/specs/serve-memory-spec.md tests/fixtures/mini-graph.json tests/fixtures/resolved_by/python/pkg/__init__.py tests/fixtures/resolved_by/python/pkg/callee.py tests/fixtures/resolved_by/python/pkg/caller.py tests/fixtures/resolved_by/python/pkg/orphan.py tests/fixtures/resolved_by/python/pkg/class_def.py tests/fixtures/resolved_by/python/pkg/class_use.py tests/fixtures/resolved_by/typescript/repo.ts tests/fixtures/resolved_by/typescript/use.ts tests/test_extraction_contract.py tests/fixtures/sample_native_fields.py tests/test_extraction_contract_languages.py tests/test_extraction_docstring.py tests/fixtures/sample_docstrings.py tests/fixtures/sample_docstrings.ts tests/fixtures/sample_docstrings.js; do
     if [ -f "$f" ]; then
         echo "✓ $f"
     else
@@ -207,6 +207,56 @@ if grep -q 'typeof output.output !== "string"' "$MAIN_PY" 2>/dev/null; then
 else
     echo "✗ after fail-open guard 缺失（output.output 非 string 时会崩）"
     FAILS=$((FAILS+1))
+fi
+
+echo ""
+echo "=== get_node 输出面与上游对齐检查（0.9.65 Attributes 尾巴防复现）==="
+# fork 的 get_node 是「实现替换」而非增量修改：闭包 _tool_get_node 薄转发到模块级
+# _get_node_tool，名片由 _format_node_card 产出。上游改动其内联函数体的任何一行，都会与
+# fork 的整段替换冲突（0.9.65 的 Attributes 行即此类）。此处比对两侧**输出面**，把每次
+# 升级的语义决策降级为机械确认，两个维度都须被 fork 覆盖：
+#   ① join 块内的字段字面量 f"  Xxx:"（上游新增一行静态字段）
+#   ② join 块内展开的变量 *xxx,（Attributes 走 attrs_line 动态构造——只看字面量会漏）
+# ⚠️ 不可扫全函数体：构造语句 `attrs_line = [f"  Attributes: ..."]` 本身就在函数体内，
+#    删掉 return 里的 `*attrs_line,` 后字符串仍在 → 静默假阴性（v1 版守护即此缺陷）。
+# upstream/v8 非 HEAD 祖先（GFW 下未 fetch 或 ref 陈旧）时跳过，避免假阳性。
+missing_in() {  # $1=上游序列 $2=fork 序列 → 输出上游有而 fork 无的项
+    # 两端都补 | ：$(...) 剥尾部换行，末项后无分隔符会误判缺失
+    local joined="|$(printf '%s' "$2" | tr '\n' '|')|" miss=""
+    while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        case "$joined" in
+            *"|$item|"*) ;;
+            *) miss="$miss $item" ;;
+        esac
+    done <<< "$1"
+    printf '%s' "$miss"
+}
+if git merge-base --is-ancestor upstream/v8 HEAD 2>/dev/null; then
+    # CRLF 归一：仓库为 CRLF，awk 行尾锚点与 grep 的 $ 模式须先剥 \r
+    UP_JOIN=$(git show upstream/v8:graphify/serve.py 2>/dev/null | tr -d '\r' | \
+        awk '/^    def _tool_get_node\(/{f=1} f&&/join\(\[/{j=1} j{print} j&&/^[ \t]*\]\)/{exit}' || true)
+    FORK_JOIN=$(tr -d '\r' < graphify/serve.py | \
+        awk '/^def _format_node_card\(/{f=1} f&&/join\(\[/{j=1} j{print} j&&/^[ \t]*\]\)/{exit}' || true)
+    if [ -z "$UP_JOIN" ]; then
+        echo "✗ 上游 _tool_get_node 的 join 块解析为空（上游改了函数形状？先修脚本模式）"
+        FAILS=$((FAILS+1))
+    else
+        UP_LIT=$(printf '%s' "$UP_JOIN" | grep -oE 'f"(Node|  [A-Za-z][A-Za-z ]*):' | sed 's/^f"//; s/:$//; s/^  //' || true)
+        FORK_LIT=$(printf '%s' "$FORK_JOIN" | grep -oE 'f"(Node|  [A-Za-z][A-Za-z ]*):' | sed 's/^f"//; s/:$//; s/^  //' || true)
+        UP_UNPACK=$(printf '%s' "$UP_JOIN" | grep -oE '\*[a-z_]+,[ \t]*$' | tr -d ' *,\t' || true)
+        FORK_UNPACK=$(printf '%s' "$FORK_JOIN" | grep -oE '\*[a-z_]+,[ \t]*$' | tr -d ' *,\t' || true)
+        MISSING="$(missing_in "$UP_LIT" "$FORK_LIT")$(missing_in "$UP_UNPACK" "$FORK_UNPACK")"
+        if [ -z "$MISSING" ]; then
+            echo "✓ get_node 输出面覆盖上游（字段: $(printf '%s' "$UP_LIT" | tr '\n' ' ')｜展开: $(printf '%s' "$UP_UNPACK" | tr '\n' ' '))"
+        else
+            echo "✗ get_node 输出面落后上游:$MISSING"
+            echo "  处置：同步进 graphify/serve.py 的 _format_node_card（保持与上游逐字同构）"
+            FAILS=$((FAILS+1))
+        fi
+    fi
+else
+    echo "· 跳过（upstream/v8 不是 HEAD 祖先：未 fetch 或 ref 陈旧）"
 fi
 
 echo ""

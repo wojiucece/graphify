@@ -169,6 +169,34 @@ def test_none_mode_card_is_pre_extension_anchor():
     assert "Signature:" not in card and "Doc:" not in card and "Code:" not in card
 
 
+def test_node_card_includes_attributes_line():
+    """名片携带 Attributes 行（上游 0.9.65 同步）：json.dumps(sort_keys=True) 逐字入卡。
+    Terraform 资源块的直接属性（extractors/terraform.py 唯一写入点）由此可见。"""
+    import networkx as nx
+    from graphify.serve import _format_node_card
+    G = nx.Graph()
+    G.add_node("t1", label="aws_s3_bucket.b", source_file="main.tf", source_location="L3",
+               file_type="terraform", community_name="c1",
+               attributes={"bucket": "my-bucket", "acl": "private"})
+    card = _format_node_card(G, "t1", G.nodes["t1"])
+    assert '  Attributes: {"acl": "private", "bucket": "my-bucket"}' in card
+
+
+def test_node_card_truncates_long_attributes():
+    """attributes JSON 超 1000 字符 → 前 997 + '...'（token 放大护栏，与上游同值）。"""
+    import networkx as nx
+    from graphify.serve import _format_node_card
+    G = nx.Graph()
+    big = {f"k{i:03d}": "v" * 40 for i in range(30)}      # json.dumps 后约 1590 字符
+    G.add_node("t1", label="big_res", source_file="m.tf", source_location="L1",
+               file_type="terraform", attributes=big)
+    card = _format_node_card(G, "t1", G.nodes["t1"])
+    line = next(ln for ln in card.splitlines() if ln.startswith("  Attributes: "))
+    payload = line[len("  Attributes: "):]
+    assert payload.endswith("...")
+    assert len(payload) == 1000                            # 997 + "..."
+
+
 def test_card_short_name_strips_native_call_suffix():
     """_card_short_name：原生 label `target_fn()`/`.fetch()` → 裸名（def 重构/切片校验用）；
     qualified_name `Class::method` → 末段；旧链路 dotted → 末段。"""

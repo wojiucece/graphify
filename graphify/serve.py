@@ -2569,8 +2569,18 @@ def _blast_radius_lines(DG, nid, direction, depth, top_k, rel_filter,
 
 
 def _format_node_card(G, nid, d) -> str:
-    """B2 get_node 名片正文（none 档回归锚点——与扩展前逐字节一致，勿加字段）。
-    名片增强（Signature:/Doc:）由 get_node 在非 none 档追加于本卡尾部。"""
+    """B2 get_node 名片正文（none 档回归锚点；Attributes 行同步上游 0.9.65）。
+    名片增强（Signature:/Doc:）由 get_node 在非 none 档追加于本卡尾部。
+    Attributes 属**条件输出**——只有 terraform.py 写该字段的资源节点可见；无条件节点
+    输出与扩展前逐字节一致（锚点 test_none_mode_card_is_pre_extension_anchor 锁定）。
+    与上游 serve._tool_get_node 的内联名片逐字同构，升级时按同一处比对。"""
+    attrs = d.get("attributes")
+    attrs_line = []
+    if isinstance(attrs, dict) and attrs:
+        raw_attrs = json.dumps(attrs, sort_keys=True)
+        if len(raw_attrs) > 1000:
+            raw_attrs = raw_attrs[:997] + "..."
+        attrs_line = [f"  Attributes: {_CONTROL_CHAR_RE.sub('', raw_attrs)}"]
     return "\n".join([
         f"Node: {sanitize_label(d.get('label', nid))}",
         f"  ID: {sanitize_label(nid)}",
@@ -2581,6 +2591,7 @@ def _format_node_card(G, nid, d) -> str:
         f"  Type: {sanitize_label(str(d.get('file_type', '')))}",
         f"  Community: {sanitize_label(str(d.get('community_name') or d.get('community', '')))}",
         f"  Degree: {G.degree(nid)}",
+        *attrs_line,
     ])
 # === CUSTOM: B2 end ===========================================================
 
@@ -3245,10 +3256,9 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         # (text, found, scanned, verdict_override)——末元是工具侧诚实自评（R3-3）。
         # 06 票换源实现在模块级 _get_node_tool（元数据点查走 FTS 缓存、字节精确切片、
         # __cg 回退删除）——此处只做闭包状态转发（_shortest_path_text 先例）。
-        # ⚠️ MERGE TODO（0.9.65）：上游为旧内联实现新增了 Attributes 显示行
-        # （d["attributes"] → `  Attributes: ...`，>1000 字符截断），本处保留 fork 的
-        # 换源实现；该显示待按分档语义移植（_format_node_card 标"勿加字段"是 none 档
-        # 逐字节锚点，须加在 none 档 return 之后）。
+        # 0.9.65 同步：上游为旧内联实现新增的 Attributes 显示行已对齐进
+        # _format_node_card（条件输出 + 1000 字符截断，与上游逐字同构）——本处只做
+        # 换源转发，无需再补。
         return _get_node_tool(G, active_graph_path, arguments)
 
     def _tool_get_neighbors(arguments: dict) -> tuple:  # CUSTOM: N1 三元组
