@@ -2385,6 +2385,7 @@ def _scan_python_nested_function_declarations(
     local_bound_names: dict | None, function_bodies: list,
     scope_parents: dict[str, str] | None = None,
     lexical_nids_by_scope: dict[str, dict[str, str]] | None = None,
+    qname_chain: tuple = (),
 ) -> None:
     """Emit a node + `contains` edge for every function lexically nested inside
     *container_node*, scoped under *parent_nid*, track its body, and record lexical
@@ -2413,7 +2414,32 @@ def _scan_python_nested_function_declarations(
             if func_name and normalize_id(func_name):
                 line = target.start_point[0] + 1
                 nested_nid = _make_id(parent_nid, func_name)
-                add_node(nested_nid, f"{func_name}()", line)
+                # CUSTOM: #3405（0.9.65）的嵌套函数节点漏传契约字段——只传 (nid, label,
+                # line)，缺 col/end_line/end_byte/signature/qualified_name。后果不止"字段不
+                # 齐"：fork 的 get_node 换源链路三级降级（字节精确 → 行级 → fuzzy ±40），
+                # 缺 end_byte+end_line 会跳过前两级落到 fuzzy，而 fuzzy 按 `name in ln` **子串**
+                # 匹配首个 def/class —— 同名前缀函数更早出现时返回完全无关的函数体，且
+                # ok=True/override=None 静默报成功。此处按普通函数路径（本文件 :5197-5216
+                # 同款）补齐五字段，使嵌套函数节点回到字节精确切片。
+                extra = {}
+                if config.signature_enabled:
+                    extra["col"] = target.start_point[1] + 1
+                    extra["end_line"] = target.end_point[0] + 1
+                    extra["end_byte"] = target.end_byte
+                    extra["qualified_name"] = _qualified_name(qname_chain, func_name)
+                    if config.signature_fn is not None:
+                        # 嵌套函数是自由函数，不持有隐式 self/cls（与方法的
+                        # drop_self=bool(parent_class_nid) 不同）。
+                        extra["signature"] = config.signature_fn(
+                            target, source, drop_self=False
+                        )
+                    else:
+                        extra["signature"] = _generic_field_signature(
+                            target, source,
+                            params_field=config.params_field,
+                            return_field=config.return_field,
+                        )
+                add_node(nested_nid, f"{func_name}()", line, **extra)
                 add_edge(parent_nid, nested_nid, "contains", line)
                 if callable_def_nids is not None:
                     callable_def_nids.add(nested_nid)
@@ -2435,6 +2461,7 @@ def _scan_python_nested_function_declarations(
                         function_bodies=function_bodies,
                         scope_parents=scope_parents,
                         lexical_nids_by_scope=lexical_nids_by_scope,
+                        qname_chain=qname_chain + (func_name,),
                     )
         else:
             _scan_python_nested_function_declarations(
@@ -2445,6 +2472,7 @@ def _scan_python_nested_function_declarations(
                 function_bodies=function_bodies,
                 scope_parents=scope_parents,
                 lexical_nids_by_scope=lexical_nids_by_scope,
+                qname_chain=qname_chain,
             )
 
 
@@ -5639,6 +5667,9 @@ def _extract_generic(
                         function_bodies=function_bodies,
                         scope_parents=scope_parents,
                         lexical_nids_by_scope=lexical_nids_by_scope,
+                        # 入口处补当前函数名：qname_chain 只装**类名段**（:3907），
+                        # 嵌套函数的作用域链须含宿主函数（UserService::fetch::helper）。
+                        qname_chain=qname_chain + (func_name,),
                     )
                 if config.ts_module == "tree_sitter_kotlin":
                     # #2347: Kotlin anonymous objects (`object : Foo { … }`,

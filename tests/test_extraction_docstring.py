@@ -108,10 +108,13 @@ def test_python_first_statement_rule_rejects_non_docstrings():
     assert docs[".local()"] is None                  # first statement is `def inner`
 
 
-def test_python_local_function_never_a_node_or_field():
+def test_python_local_function_is_node_but_no_docstring_field():
+    """0.9.65 #3405：本地函数现在提取为节点（原契约「never a node」作废）；但它的
+    prose 仍不进任何节点的 docstring 字段——嵌套节点只补契约字段（col/end_line/
+    end_byte/signature/qualified_name），docstring 走另一条路径，不在补集内。"""
     result = extract_python(PY_FIXTURE)
     labels = {n["label"] for n in result["nodes"]}
-    assert "inner()" not in labels
+    assert "inner()" in labels
     # No docstring field anywhere carries the local function's prose.
     assert not any("inner is never a node" in (n.get("docstring") or "")
                    for n in result["nodes"])

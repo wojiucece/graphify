@@ -114,7 +114,10 @@ echo "=== graphify 安装位置检查（确保所有 graphify.exe 都是 fork �
 GRAPHIFY_FOUND=0
 while IFS= read -r f; do
     GRAPHIFY_FOUND=1
-    ver=$("$f" --version 2>&1 | head -1)
+    # `|| true`：set -euo pipefail 下 `cmd | head -1` 会在写方还有输出时关闭管道
+    # → SIGPIPE(141) → pipefail 判整条管道失败 → set -e 终止整个脚本（实测：uv 那个
+    # exe 输出 2 行 warning 时必现，脚本停在安装位置检查节，末尾守护全跑不到）。
+    ver=$("$f" --version 2>&1 | head -1 || true)
     case "$ver" in
         *+fork*)
             echo "✓ $f -> $ver"
@@ -141,7 +144,7 @@ if [ "$GRAPHIFY_FOUND" = "0" ]; then
 fi
 
 # 全局命令版本（PATH 解析到的）
-global_ver=$(graphify --version 2>&1 | head -1)
+global_ver=$(graphify --version 2>&1 | head -1 || true)  # 同上：防 SIGPIPE 中断
 case "$global_ver" in
     *+fork*) echo "✓ 全局 graphify（PATH 解析）-> $global_ver" ;;
     *)

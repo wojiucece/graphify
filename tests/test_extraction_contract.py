@@ -84,25 +84,23 @@ def test_qualified_name_shapes():
     assert qn[".fetch()"] == "UserService::fetch"
     assert qn["Nested"] == "UserService::Nested"            # nested class chains
     assert qn[".inner()"] == "UserService::Nested::inner"
+    assert qn["helper()"] == "UserService::fetch::helper"   # nested fn chains host fn
     assert qn["Empty"] == "Empty"
 
 
-# ⚠️ 0.9.65 已知差异（升级报告已记，待决策）：上游 #3405 让嵌套函数提取为节点，
-# 与 fork 契约「本地函数不提取」冲突 → 下面三个测试预期失败（xfail，非 strict）。
-@pytest.mark.xfail(
-    reason="上游 0.9.65 #3405：嵌套函数现在提取为节点，与 fork 旧契约冲突",
-    strict=False,
-)
-def test_local_function_is_not_extracted():
-    # `helper` is defined inside `fetch`; local functions never become nodes.
-    labels = [n["label"] for n in _extract()["nodes"]]
-    assert "helper()" not in labels
+# 0.9.65 #3405：嵌套函数现在提取为节点（上游有意为之——让调用解析到词法作用域内的
+# 本地定义，而不是落到语料级解析）。原 fork 契约「本地函数不提取」由此作废。
+# 注意上游只传了 (nid, label, line)，契约五字段是 fork 补的（engine.py 的 CUSTOM 段）——
+# 缺字段会让 get_node 落到 fuzzy 兜底并可能返回错误函数体。
+def test_local_function_is_extracted_as_scope_chain():
+    """`helper` 定义在 `fetch` 体内，现在是节点，且 qualified_name 含宿主函数链。"""
+    result = _extract()
+    labels = [n["label"] for n in result["nodes"]]
+    assert "helper()" in labels
+    helper = _by_label(result["nodes"], "helper()")[0]
+    assert helper["qualified_name"] == "UserService::fetch::helper"
 
 
-@pytest.mark.xfail(
-    reason="上游 0.9.65 #3405：嵌套函数节点缺 :C / end_line（同源差异）",
-    strict=False,
-)
 def test_source_location_symbol_vs_file_vs_edge():
     result = _extract()
     file_node = _by_label(result["nodes"], FIXTURE.name)[0]
@@ -114,10 +112,6 @@ def test_source_location_symbol_vs_file_vs_edge():
         assert ":" not in e["source_location"]  # edges stay line-only
 
 
-@pytest.mark.xfail(
-    reason="上游 0.9.65 #3405：嵌套函数节点缺 end_line / end_byte（同源差异）",
-    strict=False,
-)
 def test_symbol_nodes_carry_end_line_and_end_byte_integers():
     for n in _symbol_nodes(_extract()["nodes"]):
         assert isinstance(n.get("end_line"), int), n["label"]
