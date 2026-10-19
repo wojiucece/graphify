@@ -6430,6 +6430,18 @@ def _extract_generic(
                         ruby_body, source
                     ):
                         metadata["ruby_lookup_unsafe"] = True
+            if config.ts_module == "tree_sitter_python":
+                # Only a bare-name base becomes an `inherits` edge (below). A base
+                # the edge list cannot show (`mod.Base`, `Generic[T]`, a call) still
+                # sits in the MRO, so the cross-file inherited-method walk must not
+                # read this class's edges as its complete base list.
+                _py_bases = node.child_by_field_name("superclasses")
+                if _py_bases is not None and any(
+                    c.is_named and c.type not in ("identifier", "keyword_argument", "comment")
+                    for c in _py_bases.children
+                ):
+                    metadata = dict(metadata or {})
+                    metadata["python_opaque_bases"] = True
             if config.signature_enabled:
                 # Class nodes carry the depth fields minus `signature` (import
                 # and class get no signature per the contract). Ruby's
@@ -8313,6 +8325,10 @@ def _extract_generic(
                         # 嵌套函数的作用域链须含宿主函数（UserService::fetch::helper）。
                         qname_chain=qname_chain + (func_name,),
                     )
+                if config.ts_module == "tree_sitter_php":
+                    # Manually walk the body to find nested closures, passing the
+                    # body node itself so `walk()` visits its children.
+                    walk(body, parent_class_nid=parent_class_nid)
                 if config.ts_module == "tree_sitter_kotlin":
                     # #2347: Kotlin anonymous objects (`object : Foo { … }`,
                     # node type `object_literal`). The function branch never

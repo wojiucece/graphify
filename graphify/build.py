@@ -2658,28 +2658,6 @@ def build_merge(
     )
 
     # Prune nodes and edges from deleted source files
-    if prune_sources:
-        # Source-less nodes that are ALREADY isolated before this prune. They are
-        # not this prune's doing, so they must survive it — the sweep below is
-        # scoped to the ones it orphans itself.
-        _isolated_before = {
-            n for n, d in G.nodes(data=True)
-            if not d.get("source_file") and G.degree(n) == 0
-        }
-        to_remove = [
-            n for n, d in G.nodes(data=True)
-            if _prune_match(d.get("source_file"))
-        ]
-        G.remove_nodes_from(to_remove)
-        n_nodes = len(to_remove)
-
-        edges_to_remove = [
-            (u, v) for u, v, d in G.edges(data=True)
-            if _prune_match(d.get("source_file"))
-        ]
-        if edges_to_remove:
-            G.remove_edges_from(edges_to_remove)
-
     # Runs after every merge, not only under prune_sources: re-extraction strands
     # placeholders too, e.g. per-file stubs re-pointed at a shared node (#4247)
     # or a type whose last reference was edited away (#4399).
