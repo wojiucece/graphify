@@ -339,64 +339,8 @@ _EXTERNAL_STUB_RELATIONS: frozenset[str] = frozenset(
 )
 
 
-def _mint_external_stub(G: "nx.Graph", node_set: set, nid: str) -> None:
-    """Add a leaf node for an external import target so the edge is not dangling.
-
-    The node is tagged ``external`` (and ``file_type='concept'`` so the schema
-    validator and community/report code treat it as a non-source concept rather
-    than warning on a missing ``file_type``). ``merge-graphs`` reads the
-    ``external`` flag to keep these ids global instead of namespacing them per
-    repo, so the same stdlib/dependency module unifies across repos (#2873).
-    """
-    if nid in node_set:
-        return
-    G.add_node(
-        nid,
-        label=nid,
-        file_type="concept",
-        type="external",
-        external=True,
-        source_file="",
-    )
-    node_set.add(nid)
 
 
-def mint_external_stubs_in_data(data: dict) -> None:
-    """Mint external stub nodes for import-family links with an undeclared target.
-
-    The ``--no-cluster`` / incremental write path serializes the raw merged
-    extraction directly rather than going through :func:`build_from_json`, so it
-    needs the same stubbing to keep the on-disk graph.json free of undeclared
-    edge endpoints (#2873). Idempotent: a graph already carrying its stubs (from
-    a prior run or the clustered path) is left unchanged.
-    """
-    nodes = data.get("nodes")
-    links = data.get("links")
-    if not isinstance(links, list):
-        links = data.get("edges")
-    if not isinstance(nodes, list) or not isinstance(links, list):
-        return
-    declared = {n.get("id") for n in nodes if isinstance(n, dict)}
-    minted: set[str] = set()
-    for e in links:
-        if not isinstance(e, dict) or e.get("relation") not in _EXTERNAL_STUB_RELATIONS:
-            continue
-        src, tgt = e.get("source"), e.get("target")
-        if (
-            src in declared
-            and isinstance(tgt, str)
-            and tgt not in declared
-            and tgt not in minted
-        ):
-            nodes.append({
-                "id": tgt,
-                "label": tgt,
-                "file_type": "concept",
-                "type": "external",
-                "external": True,
-                "source_file": "",
-            })
-            minted.add(tgt)
 
 # Language interop families, keyed by extension, for the cross-language phantom-edge
 # guard in the edge loop below. Families group by REAL interop (JS/TS share a module

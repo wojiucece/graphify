@@ -186,52 +186,6 @@ def _rust_use_bindings(node, source: bytes, prefix: str = "", self_path: str = "
 
 
 
-def _rust_simple_generic_impl_key(node, source: bytes) -> str | None:
-    """Return a stable owner/arity key for a deliberately narrow impl shape."""
-    if node.child_by_field_name("trait") is not None:
-        return None
-    parameters = node.child_by_field_name("type_parameters")
-    owner_type = node.child_by_field_name("type")
-    if parameters is None or owner_type is None or owner_type.type != "generic_type":
-        return None
-    if any(child.type == "where_clause" for child in node.named_children):
-        return None
-
-    parameter_names: list[str] = []
-    for parameter in parameters.named_children:
-        if parameter.type != "type_parameter":
-            return None
-        named = parameter.named_children
-        if len(named) != 1 or named[0].type != "type_identifier":
-            return None
-        name = _read_text(named[0], source)
-        if not name or name in parameter_names:
-            return None
-        parameter_names.append(name)
-    if not parameter_names:
-        return None
-
-    owner = owner_type.child_by_field_name("type")
-    if owner is None or owner.type != "type_identifier":
-        return None
-    arguments = next(
-        (child for child in owner_type.named_children if child.type == "type_arguments"),
-        None,
-    )
-    if arguments is None:
-        return None
-    argument_names = [
-        _read_text(argument, source)
-        for argument in arguments.named_children
-        if argument.type == "type_identifier"
-    ]
-    if len(argument_names) != len(arguments.named_children):
-        return None
-    if argument_names != parameter_names:
-        return None
-
-    owner_name = _read_text(owner, source)
-    return f"{owner_name}/{len(parameter_names)}" if owner_name else None
 
 
 _RUST_TRAIT_METHOD_BLOCKLIST: frozenset[str] = frozenset({

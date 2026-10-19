@@ -7499,243 +7499,8 @@ def _resolve_elixir_import_targets(
         e["target"] = target_nid
 
 
-def _resolve_kotlin_member_calls(
-    per_file: list[dict],
-    all_nodes: list[dict],
-    all_edges: list[dict],
-) -> None:
-    """Resolve Kotlin object/class-qualified member calls across files (#1698).
-
-    ``Receiver.method()`` (exactly two navigation segments, a capitalized
-    receiver — an object singleton or a class/companion member) resolves
-    in-file through the engine's own bare-name lookup, so a call reaches
-    ``raw_calls`` here only when that lookup already failed: the receiver and
-    the callee are declared in different files. The shared cross-file pass
-    skips every ``is_member_call`` unconditionally (a bare method name like
-    ``log`` collides across the corpus and inflates god-nodes, #543/#1219),
-    and Kotlin deliberately never stamps ``member_receiver`` for this shape
-    either (see ``extractors/engine.py``), so nothing else can ever answer it.
-
-    Guarded by exactly-one-candidate at both steps, the same god-node guard
-    ``_resolve_kotlin_qualified_calls`` uses just above: a receiver name
-    matching 2+ declared types, or a method name matching 2+ methods of the
-    matched type, yields no edge. The receiver names the type explicitly in
-    source, so a unique match is EXTRACTED (mirrors the type-qualified case
-    in ``_resolve_swift_member_calls``, #1356).
-    """
-    raw = [
-        rc
-        for result in per_file
-        for rc in result.get("raw_calls", [])
-        if rc.get("lang") == "kotlin" and rc.get("kotlin_object_receiver")
-        and rc.get("callee") and rc.get("caller_nid")
-    ]
-    if not raw:
-        return
-
-    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
-    methods_by_type: dict[str, list[str]] = {}
-    for e in all_edges:
-        if e.get("relation") == "method":
-            methods_by_type.setdefault(e.get("source"), []).append(e.get("target"))
-
-    # Receiver name -> declaring type node ids, scoped to Kotlin-sourced
-    # definitions only (a same-named type in another language must not
-    # answer a Kotlin call). len != 1 is the god-node guard.
-    types_by_name: dict[str, list[str]] = {}
-    for n in all_nodes:
-        if not n.get("_callable_class"):
-            continue
-        sf = str(n.get("source_file") or "")
-        if not sf.endswith((".kt", ".kts")):
-            continue
-        name = str(n.get("label", ""))
-        if name:
-            types_by_name.setdefault(name, []).append(n["id"])
-
-    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
-    for rc in raw:
-        receiver = rc["kotlin_object_receiver"]
-        callee = rc["callee"]
-        caller = rc["caller_nid"]
-        type_nids = types_by_name.get(receiver, [])
-        if len(type_nids) != 1:
-            continue
-        wanted = f".{callee}"
-        candidates = [
-            m for m in methods_by_type.get(type_nids[0], [])
-            if str(node_by_id.get(m, {}).get("label", "")).strip("()") == wanted
-        ]
-        if len(candidates) != 1:
-            continue
-        tgt = candidates[0]
-        if tgt == caller or (caller, tgt) in existing_pairs:
-            continue
-        existing_pairs.add((caller, tgt))
-        all_edges.append({
-            "source": caller,
-            "target": tgt,
-            "relation": "calls",
-            "context": "call",
-            "confidence": "EXTRACTED",  # the receiver names the type explicitly in source
-            "confidence_score": 1.0,
-            "source_file": rc.get("source_file", ""),
-            "source_location": rc.get("source_location"),
-            "weight": 1.0,
-        })
 
 
-def _resolve_rust_self_member_calls(
-    per_file: list[dict],
-    all_nodes: list[dict],
-    all_edges: list[dict],
-) -> None:
-    """Resolve cross-file Rust `self.method()` calls (#2234).
-
-    The shared cross-file pass drops every is_member_call — a bare method name
-    (``log``) has no import evidence and collides with any top-level function
-    named ``log`` in the corpus (#543/#1219). Rust is the only member-call-heavy
-    language with no recovery pass behind that guard: `self.apply_block()`
-    inside `impl Foo { .. }` types the receiver as `Foo` syntactically, no
-    inference needed, but nothing used that signal. rust.py now records that
-    type on each self-call raw_call as `rust_self_type`; this pass matches it.
-
-    Unlike the Kotlin/Swift equivalents, this does NOT require the type name to
-    resolve to exactly one node: Rust routinely splits `impl Foo { .. }` across
-    as many files as it likes (one struct can have a dozen impl blocks scattered
-    through a crate), and rust.py mints a SEPARATE graph node per (file, type
-    name) pair rather than merging them, so requiring a single node would
-    refuse the exact split-impl-block shape this issue is about. Instead,
-    every node carrying the type's bare label pools its methods together, and
-    a call resolves only when exactly one method across the WHOLE pool matches
-    the callee name — two impl blocks (however many files apart) defining the
-    same method name still bail, a real ambiguity rather than a false one.
-
-    Pooling across every same-labeled node is only safe when they are all
-    impl blocks for ONE real type; it must not also fire when the bare name is
-    shared by two UNRELATED types, which would link a call to a method that
-    only exists on the wrong one (concretely: one type overrides a trait
-    method the other relies on the default for, so only the override gets an
-    explicit method node). A struct/enum/trait DECLARATION gets a `contains`
-    edge from its file; an impl block never does. So the type name itself is
-    treated as ambiguous, and pooling skipped entirely, whenever 2+ nodes
-    sharing the bare label are real declarations rather than impl blocks.
-
-    Only `self.` receivers are handled: a non-self receiver needs local type
-    inference this pass does not attempt, left for a future extension.
-
-    Simple unbounded generic impls use a persisted owner/arity marker instead
-    of their parameter-spelling-sensitive labels (`Bucket<T>` vs `Bucket<U>`).
-    That path additionally requires exactly one bare declaration and never
-    falls back to bare-label pooling when marker context is missing.
-    """
-    raw = [
-        rc
-        for result in per_file
-        for rc in result.get("raw_calls", [])
-        if rc.get("rust_self_type") and rc.get("callee") and rc.get("caller_nid")
-    ]
-    if not raw:
-        return
-
-    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
-    nids_by_label: dict[str, list[str]] = {}
-    nids_by_rust_impl_key: dict[str, list[str]] = {}
-    for n in all_nodes:
-        if str(n.get("source_file") or "").endswith(".rs"):
-            nids_by_label.setdefault(n.get("label", ""), []).append(n.get("id"))
-            impl_key = n.get("_rust_impl_key")
-            if isinstance(impl_key, str) and impl_key:
-                nids_by_rust_impl_key.setdefault(impl_key, []).append(n.get("id"))
-
-    # Pooling methods across every same-labeled node is safe when they are all
-    # impl blocks for ONE real type spread across files, but not when the bare
-    # name is shared by two UNRELATED types (#2234 follow up) -- pooling would
-    # then link a call to a method on the wrong one whenever the caller's own
-    # type happens to lack that method (a trait default the caller relies on
-    # but never overrides, most concretely). The two shapes differ in exactly
-    # one place: a struct/enum/trait DECLARATION gets a `contains` edge from
-    # its file, an impl block never does (rust.py adds a node for the impl's
-    # type but no such edge). So 2+ declarations sharing a bare name means the
-    # name itself is genuinely ambiguous; 0 or 1 means every same-labeled node
-    # -- however many files its impl blocks are spread across -- is safe to
-    # pool, which is the split-impl-block shape this pass exists for.
-    declared_type_count: dict[str, int] = {}
-    generic_declared_type_count: dict[str, int] = {}
-    contains_targets = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
-    for label, nids in nids_by_label.items():
-        declared_type_count[label] = sum(1 for nid in nids if nid in contains_targets)
-        generic_declared_type_count[label] = sum(
-            count
-            for nid in nids
-            if isinstance(
-                count := node_by_id.get(nid, {}).get("_rust_declaration_count"),
-                int,
-            )
-            and not isinstance(count, bool)
-            and count > 0
-        )
-
-    # (impl/type node id, bare method name) -> method node id(s), from `method`
-    # edges. A set, not a single overwritten value: two distinct method nodes
-    # sharing both a source and a stripped label (however unlikely) must still
-    # surface as an ambiguity below rather than silently keeping whichever one
-    # was seen last.
-    method_index: dict[tuple[str, str], set[str]] = {}
-    for e in all_edges:
-        if e.get("relation") != "method":
-            continue
-        src, tgt = e.get("source"), e.get("target")
-        tnode = node_by_id.get(tgt)
-        if tnode is not None:
-            name = str(tnode.get("label", "")).strip("()").lstrip(".")
-            method_index.setdefault((src, name), set()).add(tgt)
-
-    # Scoped to `calls`: a caller that already has a DIFFERENT relation to the
-    # same target (e.g. a `references` edge from also naming the type in a
-    # parameter) says nothing about whether a call to it was resolved, and
-    # must not suppress one.
-    existing_pairs = {
-        (e.get("source"), e.get("target"))
-        for e in all_edges
-        if e.get("relation") == "calls"
-    }
-    for rc in raw:
-        caller = rc["caller_nid"]
-        callee = rc["callee"]
-        self_type = rc["rust_self_type"]
-        impl_key = rc.get("rust_self_impl_key")
-        if isinstance(impl_key, str) and impl_key:
-            # A generic owner/arity marker proves family identity only with one
-            # declaration in the corpus. Never fall back to bare-label pooling
-            # when persisted marker context is absent or ambiguous.
-            if generic_declared_type_count.get(self_type, 0) != 1:
-                continue
-            owner_nids = nids_by_rust_impl_key.get(impl_key, [])
-        else:
-            if declared_type_count.get(self_type, 0) >= 2:
-                continue  # two unrelated types share this bare name
-            owner_nids = nids_by_label.get(self_type, [])
-        candidates: set[str] = set()
-        for nid in owner_nids:
-            candidates |= method_index.get((nid, callee), set())
-        if len(candidates) != 1:  # zero or ambiguous -> no edge (god-node guard)
-            continue
-        tgt = next(iter(candidates))
-        if tgt == caller or (caller, tgt) in existing_pairs:
-            continue
-        existing_pairs.add((caller, tgt))
-        all_edges.append({
-            "source": caller,
-            "target": tgt,
-            "relation": "calls",
-            "context": "call",
-            "confidence": "EXTRACTED",  # `self` inside `impl Foo` types it explicitly
-            "confidence_score": 1.0,
-            "source_file": rc.get("source_file", ""),
-            "source_location": rc.get("source_location"),
-            "weight": 1.0,
-        })
 
 
 def _resolve_go_member_calls(
@@ -7838,76 +7603,6 @@ def _resolve_go_member_calls(
         })
 
 
-def _resolve_elixir_import_targets(
-    per_file: list[dict],
-    all_nodes: list[dict],
-    all_edges: list[dict],
-) -> None:
-    """Resolve Elixir cross-file alias/import/require/use edges (#2556).
-
-    extract_elixir mints a module's own node id with the defining file's stem
-    (``_make_id(stem, module_name)``) but an alias/import/require/use target
-    with just the bare module name (``_make_id(module_name)``) — the two can
-    only ever match when a module refers to itself, so almost every
-    cross-file reference was silently dropped as dangling at build time
-    (13% of edges on a real 900-file project).
-
-    Exact match only, per the issue's own finding: id-suffix matching
-    (``application`` latching onto ``..._oauthapplications_update_application``)
-    produced wrong resolutions in testing on a real corpus; matching a
-    module's own id (already exact, since both sides run through the same
-    ``_make_id``) needs no heuristics. A name matching zero modules is left
-    exactly as extracted — the generic external-reference handling already
-    turns an unresolved bare id into a leaf stub, the correct outcome for a
-    genuinely external (stdlib/hex) name. A name matching 2+ modules (e.g.
-    two files each defining the same module name, most likely a genuine
-    corpus oddity) also leaves the edge alone rather than guessing.
-    """
-    # Index only top-level modules. extract_elixir marks them with
-    # `_elixir_module`; a nested `defmodule` (labeled with its bare inner name)
-    # is left unmarked so it cannot capture an unrelated `use <Name>` from
-    # another file (#3603 follow-up). The marker is carried across incremental
-    # rebuilds via the resolution-context allow-list in watch.py / cli.py, so
-    # this gate keeps working on the `graphify update` / watch path.
-    node_by_id: dict[str, dict] = {}
-    module_nids_by_bare_id: dict[str, list[str]] = {}
-    for n in all_nodes:
-        node_by_id[n["id"]] = n
-        if not n.get("_elixir_module"):
-            continue
-        label = str(n.get("label") or "")
-        if not label:
-            continue
-        module_nids_by_bare_id.setdefault(_make_id(label), []).append(n["id"])
-    if not module_nids_by_bare_id:
-        return
-
-    node_ids = set(node_by_id)
-    for e in all_edges:
-        if (
-            e.get("relation") != "imports"
-            or e.get("context") != "import"
-            or not str(e.get("source_file") or "").endswith((".ex", ".exs"))
-        ):
-            continue
-        tgt = e.get("target")
-        if tgt in node_ids:
-            continue  # already resolves (e.g. a module referring to itself)
-        candidates = module_nids_by_bare_id.get(tgt, [])
-        if len(candidates) != 1:
-            continue
-        target_nid = candidates[0]
-        # A module aliasing/importing another module defined in the SAME file
-        # would retarget the `file -> target` import edge onto a node the file
-        # already `contains`, and the non-multi graph keeps one edge per pair,
-        # silently overwriting the structural `contains` edge (#3603 follow-up).
-        # Leave those alone.
-        target_node = node_by_id.get(target_nid)
-        if target_node is not None and str(target_node.get("source_file") or "") == str(
-            e.get("source_file") or ""
-        ):
-            continue
-        e["target"] = target_nid
 
 
 def _resolve_elixir_qualified_calls(
@@ -11123,6 +10818,25 @@ def extract(
             "file_path": rc.get("source_file", ""),
         })
 
+    # Enum members (case_of) and fields/properties (defines) are never what a
+    # C# new X() constructs (#3815); without this a new List<T>() binds to an
+    # enum member named List.
+    _member_nids = {
+        e.get("target") for e in all_edges if e.get("relation") in ("case_of", "defines")
+    }
+    # Top-level Elixir module names per file, for scoping unqualified Elixir
+    # calls below. Read from resolution_nodes so an unchanged file modules
+    # stay visible on an incremental rebuild (_elixir_module is carried by the
+    # resolution-context allow-list).
+    _elixir_modules_by_file: dict[str, set[str]] = {}
+    for n in resolution_nodes:
+        if n.get("_elixir_module") and n.get("source_file"):
+            _elixir_modules_by_file.setdefault(str(n["source_file"]), set()).add(
+                str(n.get("label", ""))
+            )
+    _csharp_stub_resolver = None  # built on first use
+    _csharp_method_owner = None  # method nid -> type nid, built on first use
+    _csharp_outer_type = None  # nested type nid -> outer type label, built on first use
     for rc in all_raw_calls:
         if rc.get("_ambiguous_python_import"):
             continue
