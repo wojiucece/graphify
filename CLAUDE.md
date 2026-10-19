@@ -39,6 +39,7 @@ Rules:
     - **修法**：给 `_scan_python_nested_function_declarations` 加 `qname_chain` 参数（入口与递归均传 `qname_chain + (func_name,)`——`qname_chain` 只装**类名段**（见 `walk` 里它的注释块），故须补宿主函数名）+ 按 `walk` 普通函数分支同款补 `extra` 五字段。结果：`helper()` → `L10:C9` / end_line 11 / end_byte 246 / `(x)` / `UserService::fetch::helper`。**验证：16 → 12 失败，修复 4 新增 0**（差额恰为契约测试数）
     - **同类风险持续存在**：每次升级后做上一条的失败集合 diff，且 diff 结果要能区分"真契约变更"与"上游遗漏"——后者改测试等于掩盖
 - **get_node 输出面须与上游对齐**（0.9.65）：fork 把 `_tool_get_node` 从**内联实现**改成**薄转发**（闭包转发到模块级 `_get_node_tool`，名片由 `_format_node_card` 产出），上游对其内联函数体的**任何**改动都撞上 fork 的整段替换——0.9.65 的 `Attributes` 行即此类（上游纯插入 7+1 行）。fork **不可能**保留上游函数体（数据源已分叉：fork 走 FTS 缓存拿 `end_byte`/`signature`/`docstring`，上游直读图节点属性），故**结构性冲突无法根除**，只能把冲突解决从"语义决策"降级为"机械确认"：上游输出行同步进 `_format_node_card`（逐字同构；`Attributes` 是条件输出，无该字段的节点输出不变，逐字节锚点 `test_none_mode_card_is_pre_extension_anchor` 不受影响）。`check-custom.sh` 已加守护：比对两侧 join 块的字段字面量 `f"  Xxx:"` 与展开变量 `*xxx,`，上游有而 fork 无即告警（`upstream/v8` 非 HEAD 祖先时跳过，避免 GFW 下 ref 陈旧假阳性）
+- **整段替换上游函数的次生损失**（0.9.92 实测）：fork 替换 `_tool_get_neighbors` 正文后，上游修复的**平行边渲染**（#4500：`edge_datas` 复数逐条输出，`edge_data` 只取首条）没有传导——`_neighbors_lines` 仍用单数版，MultiDiGraph 下静默丢边；merge 带回的上游 `_neighbor_lines` 却**无调用点**（死代码），对应测试也只测死代码，形成"测试全绿但生产缺功能"。判据：整段替换的函数要逐次比对**新增行为**而非仅新增输出行；删并函数后用 `grep -rn` 确认测试目标与生产调用点是同一符号。已修：`_neighbors_lines` 改用 `edge_datas` 双循环（保留 `resolved_by` 与无向分支），删除死代码 `_neighbor_lines`，测试改指 `_neighbors_lines`
 - **merge 缺陷的五种形态与检测层次**（0.9.92 实测，全部不报错、只能主动对比上游发现）：
     1. **重复函数/类定义**（本次 7 处）—— Python 后者**静默覆盖**前者。检测：`scripts/check_dup_defs.py` 的**名字层**（模块级同名定义 + 上游定义计数；上游 1 处 = merge 造成，上游本身多处 = 原样保留，如 `detect.py` 的 `_nfc` 是两个同名不同用途的上游函数）
     2. **重复复合语句块**（prune 块、sql 的 `create_index` 分支）—— 重复执行，计数/消息被静默改变。检测：同一脚本的**内容层**（`if/for/while/with/try` 源码哈希 + 上游 1 份判据）；**注意部分重叠的块抓不到**（prune 两处前半相同、后半不同 → 整块 hash 不同）
@@ -153,6 +154,7 @@ adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
   跳过新鲜重挂零重建）
 - `ensure-graphify-server.sh`：自愈闭环共享脚本（sessionstart/prompt_hook 单一事实源），
   端口单一事实源 `GRAPHIFY_MCP_PORT`（默认 8765）
+- **禁止对同一项目同时开 `serve --watch` 与 `graphify watch`**：两者驱动不同且**锁与管线都不互通**——`serve_watcher` 走 `rebuild_entry`（extract→build→to_json→rebuild_fts）+ `%TEMP%/graphify-rebuild-*.lock`（mkdir 原子锁）；`graphify watch` 走上游增量 `_rebuild_code` + `<out>/.rebuild.lock`（flock/msvcrt）。同时跑可能并发重建同一 graph.json、FTS 缓存刷新不一致。serve 内置 watcher 默认关，需要常驻时二选一
 
 上游补丁（最小 diff，提 PR 后若被接受则移除）：
 - `graphify/analyze.py` 的 `_is_file_node` 加 `kind='file'` 短路（0.9.92 后约 :75）

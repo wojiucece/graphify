@@ -15,7 +15,7 @@ from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap, _CONTROL_CHAR_RE
-from graphify.build import edge_data, edge_datas, has_parallel_links
+from graphify.build import edge_datas, has_parallel_links
 from graphify.paths import default_graph_json as _default_graph_json
 
 try:
@@ -2727,8 +2727,9 @@ def _neighbors_lines(G, nid, rel_filter=""):
         rb = d.get("resolved_by")
         return f" [resolved_by={sanitize_label(str(rb))}]" if rb else ""
 
-    # 生产 G 是 _load_graph 强制 directed:True 的 DiGraph（有向边逐一存储）——
-    # 保持 successors/predecessors 双循环逐字节不变；无向 Graph（缺省锚点测试的
+    # _read_graph 会在 links 含平行边时强制 multigraph:True（#4500），故生产 G 可能是
+    # MultiDiGraph——必须用 edge_datas（复数）逐条渲染，edge_data 只取首条会静默丢关系。
+    # 有向图保持 successors/predecessors 双循环；无向 MultiGraph（缺省锚点测试的
     # 逻辑无向形态）退化为 neighbors 双扫，双向输出本就同集合（_top_neighbor_ids 同款）。
     if G.is_directed():
         succ_iter, pred_iter = G.successors(nid), G.predecessors(nid)
@@ -2736,25 +2737,25 @@ def _neighbors_lines(G, nid, rel_filter=""):
         nb = list(G.neighbors(nid))
         succ_iter, pred_iter = nb, nb
     for nb in succ_iter:
-        d = edge_data(G, nid, nb)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-            f"{_edge_rb(d)}{_edge_at(d)}"
-        )
+        for d in edge_datas(G, nid, nb):
+            rel = d.get("relation", "")
+            if rel_filter and rel_filter not in rel.lower():
+                continue
+            lines.append(
+                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f"{_edge_rb(d)}{_edge_at(d)}"
+            )
     for nb in pred_iter:
-        d = edge_data(G, nb, nid)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-            f"{_edge_rb(d)}{_edge_at(d)}"
-        )
+        for d in edge_datas(G, nb, nid):
+            rel = d.get("relation", "")
+            if rel_filter and rel_filter not in rel.lower():
+                continue
+            lines.append(
+                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
+                f"{_edge_rb(d)}{_edge_at(d)}"
+            )
     return lines
 
 
@@ -3384,42 +3385,6 @@ def _all_tool_schemas() -> list[dict]:
         _s["inputSchema"].setdefault("properties", {})["project_path"] = _copy.deepcopy(_PROJECT_PATH_PROP)
         schemas.append(_s)
     return schemas
-
-
-def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
-    """One output line per relationship incident to ``nid``.
-
-    Parallel edges between the same pair each render as their own line with
-    their own metadata (#4500); ``edge_data()`` would return only the first.
-    """
-    def _edge_at(d: dict) -> str:
-        # Edge location = the relation SITE (call/import line) in the source
-        # node's file, not a def line (#BUG1).
-        loc = str(d.get("source_location") or "")
-        return (
-            f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
-            if loc else ""
-        )
-    lines: list[str] = []
-    for nb in G.successors(nid):
-        for d in edge_datas(G, nid, nb):
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
-    for nb in G.predecessors(nid):
-        for d in edge_datas(G, nb, nid):
-            rel = d.get("relation", "")
-            if rel_filter and rel_filter not in rel.lower():
-                continue
-            lines.append(
-                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
-            )
-    return lines
 
 
 def _build_server(graph_path: str, *, watch: bool | None = None):

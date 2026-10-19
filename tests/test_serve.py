@@ -34,7 +34,7 @@ from graphify.serve import (
     _subgraph_to_text,
     _cut_lines_to_budget,
     _load_graph,
-    _neighbor_lines,
+    _neighbors_lines,
     _community_header,
     _search_tokens,
     _shortest_path_text,
@@ -2121,21 +2121,23 @@ def test_load_graph_keeps_simple_graph_simple(tmp_path):
     assert G.number_of_edges() == 1
 
 
-def test_neighbor_lines_shows_every_parallel_relationship(tmp_path):
+def test_neighbors_lines_shows_every_parallel_relationship(tmp_path):
     G = _load_graph(_parallel_edge_graph_json(tmp_path))
-    lines = _neighbor_lines(G, "src_app_app")
-    assert len(lines) == 2, lines
-    assert any("[contains]" in l and "App.tsx:80" in l for l in lines), lines
-    assert any("[calls]" in l and "App.tsx:163" in l for l in lines), lines
+    lines = _neighbors_lines(G, "src_app_app")
+    edge_lines = [l for l in lines if l.startswith(("  -->", "  <--"))]
+    assert len(edge_lines) == 2, lines
+    assert any("[contains]" in l and "App.tsx:80" in l for l in edge_lines), lines
+    assert any("[calls]" in l and "App.tsx:163" in l for l in edge_lines), lines
     # each relationship keeps its own metadata: no combined/merged edge
-    assert len({l for l in lines}) == 2
+    assert len(set(edge_lines)) == 2
 
 
-def test_neighbor_lines_relation_filter_applies_per_edge(tmp_path):
+def test_neighbors_lines_relation_filter_applies_per_edge(tmp_path):
     G = _load_graph(_parallel_edge_graph_json(tmp_path))
-    lines = _neighbor_lines(G, "src_app_app", rel_filter="calls")
-    assert len(lines) == 1, lines
-    assert "[calls]" in lines[0]
+    lines = _neighbors_lines(G, "src_app_app", rel_filter="calls")
+    edge_lines = [l for l in lines if l.startswith(("  -->", "  <--"))]
+    assert len(edge_lines) == 1, lines
+    assert "[calls]" in edge_lines[0]
 
 
 def test_subgraph_to_text_renders_every_parallel_edge(tmp_path):
