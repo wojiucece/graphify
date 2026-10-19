@@ -420,54 +420,6 @@ def resolve_ruby_member_calls(
             matches[0]["confidence"] = "EXTRACTED"
             matches[0]["confidence_score"] = 1.0
 
-    def _inherited_method(owner: str, name: str, kind: str) -> str | None:
-        """Find one nearest same-kind method on one safe, acyclic base chain."""
-        current = owner
-        seen: set[str] = set()
-        first = True
-        while current not in seen:
-            seen.add(current)
-            node = node_by_id.get(current)
-            label = str(node.get("label", "")) if node else ""
-            if (
-                current not in ruby_class_nids
-                or len(class_labels.get(label, set())) != 1
-                or _ruby_lookup_unsafe(node)
-                or _has_external_method_owner(label)
-            ):
-                return None
-            if (current, name) in ambiguous_method_names:
-                return None
-            candidates = methods_by_kind.get((current, name, kind), set())
-            if candidates:
-                if first or len(candidates) != 1:
-                    return None
-                return next(iter(candidates))
-            bases = inheritance.get(current, set())
-            if len(bases) != 1:
-                return None
-            current = next(iter(bases))
-            first = False
-        return None
-
-    def _promote_inferred(caller: str, target: str, callee: str, rc: dict) -> None:
-        """Promote exactly one matching edge in place; never create or repoint."""
-        matches = [
-            edge
-            for edge in all_edges
-            if edge.get("source") == caller
-            and edge.get("target") == target
-            and edge.get("relation") == "calls"
-            and edge.get("context") == "call"
-            and edge.get("confidence") == "INFERRED"
-            and edge.get("source_file") == rc.get("source_file", "")
-            and edge.get("source_location") == rc.get("source_location")
-            and _method_name(node_by_id.get(target, {}).get("label")) == callee
-        ]
-        if len(matches) == 1:
-            matches[0]["confidence"] = "EXTRACTED"
-            matches[0]["confidence_score"] = 1.0
-
     # `include`/`extend`/`prepend <Const>` mixins (#1668): resolve the module
     # reference lexically, the way Ruby constant lookup works (#2302) — try the
     # reference under each enclosing scope of the including class, innermost
