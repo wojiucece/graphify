@@ -17,7 +17,7 @@ Rules:
 ### 升级上游
 - **用 merge 策略**（非 rebase）：`git fetch upstream` -> `git merge upstream/v8 --no-edit`。保留 fork 定制提交 hash，可逆（`git reset --hard <备份tag>` 回退），fork 维护惯例
 - **禁跑 `scripts/sync.sh`**--它不是重装脚本，是完整同步：含 `git rebase upstream/v8`（与 merge 策略冲突，会抹掉 merge commit）+ `git push --force-with-lease`（未授权 outward 操作）。跑它会破坏 fork
-- 同步前打备份 tag：`git tag v8-custom-pre-sync-N v8-custom`，失败可秒回退；**滚动只保留最近 2 个**——打新 tag（如 14）后即删最旧的一个（有 14 留 13/14，有 15 留 14/15），旧 tag 纯本地不进远端
+- 同步前打备份 tag：`git tag v8-custom-pre-sync-N v8-custom`，失败可秒回退；**滚动只保留最近 2 个**——打新 tag（如 16）后即删最旧的一个（当前 15，打 16 后留 15/16），旧 tag 纯本地不进远端
 - 冲突时搜 `CUSTOM:` 标记找所有改动点
 - **上游重构搬文件时，fork 定制常量（`_PROMPT_HOOK`、`_OPENCODE_PLUGIN_JS`）易丢**--迁移要逐常量对比内容，不能只看函数签名相同就判定被吸收（`_OPENCODE_PLUGIN_JS` 方案C 就是这样漏过一次）
 - **升级前先验证 `graphify --version` 能跑**--venv 可能被清空（ModuleNotFoundError），重装 `uv tool install --editable ".[mcp,openai]" --force` 恢复
@@ -26,7 +26,7 @@ Rules:
 - **命令分离**（上游 0.9.13 重构后）：`graphify install claude`（装用户级 skill `~/.claude/skills/`）vs `graphify claude install`（注入项目级 hooks `.claude/settings.json`，含 UserPromptSubmit）。要刷新某项目 hooks 在该项目目录跑后者
 - **升级后跑 `bash scripts/check-custom.sh` 确认守护有效**（exit 0、无 ✗）。本次 0.9.20 同步发现 check-custom.sh grep 路径过时（查 `__main__.py` 但定制 0.9.13 已迁 `install.py`），5 个假阳性 ✗ 且 exit 0 使守护静默失效--已修路径 + fail-on-✗，但每次升级仍要跑一遍确认无假阳性
 - **merge 前先无副作用预演**（0.9.24 同步经验）：`git merge-tree --write-tree --name-only HEAD upstream/v8` 只读三路合并，不碰工作树。0.9.24 批次（104 文件 +4210 行）预演仅 `pyproject.toml` 冲突，install.py 自动合并--因上游 #2062 改 uninstall 路径（新增 `_remove_marker_section`），fork 定制在 install 路径（hook 注入），**两区域不重叠故 git 能自动合并**（区别于 0.9.20 那次要手动解冲突块）。预演零冲突/单冲突可直接 merge，多冲突再逐文件核
-- **Auto-merging 成功≠定制完整**（0.9.24）：git 只保证文本拼上不保证语义，install.py 自动合并通过后仍 grep 确认 24 处 fork 标记（`_PROMPT_HOOK`/`UserPromptSubmit`/`_OPENCODE_PLUGIN_JS`/`remindedAfter`/`TARGET_TOOLS`/`_claude_pretooluse_hooks`）一个不少
+- **Auto-merging 成功≠定制完整**（0.9.24）：git 只保证文本拼上不保证语义，install.py 自动合并通过后仍 grep 确认关键 fork 标记一个不少（`_PROMPT_HOOK`/`UserPromptSubmit`/`_OPENCODE_PLUGIN_JS`/`remindedAfter`/`TARGET_TOOLS`/`_claude_pretooluse_hooks`）；全仓 `CUSTOM:` 现 **112 处**——按文件计数（serve 69 / install 11 / watch 9）比单一数字更能发现整块丢失
 - **旧图谱兼容新版本 query 无需重建**（0.9.24）：0.9.17 生成的 graph.json 被 0.9.24 query 成功读取（exit 0，195 nodes）。graph.json 是 networkx 标准格式（keys=directed/multigraph/graph/nodes/links/hyperedges，无 version 字段），向后兼容。重建要调 LLM 有费用，升级版本不必重建，代码变了跑 `graphify update .`（AST 增量无费用）即可
 - **GFW 间歇封 github:443**（0.9.24）：push 报 `Could not connect to server`（TCP 握不上，21s 超时）区别于 `Connection reset`（握手后被重置）。前者重试基本无效需换出口/开代理，后者重试能成。探测用 `timeout 12 curl -sI https://github.com`，失败也可能只是当前窗口期，git push 仍可能碰上开放窗口成功
 - **认证部署根治**（0.9.47）：Windows 上 GCM + gh 组合，push 不再弹窗认证。根因是**所有层级 `credential.helper` 全空**（`git config --show-origin --get-all credential.helper` 无输出），GCM 虽在 PATH（/mingw64/bin）但未注册为 helper，每次 push 现场要凭证且后台 Bash 无 TTY → `could not read Username`。部署两步：①`git config --global credential.helper manager` 注册 GCM；②`gh auth login -h github.com`（浏览器 OAuth，token 存 Windows keyring）+ 必要时 `gh auth setup-git`。GCM 2.8+ 检测到 gh 已认证时**委托 gh 取 token**（Windows Credential Manager 无条目时回退），故 git push 自动复用 gh 凭证。验证链路：`printf 'protocol=https\nhost=github.com\n\n' | git credential fill` 应返回 username+password
@@ -34,18 +34,25 @@ Rules:
 - **gh CLI 替代 GCM 弹窗**（0.9.47）：`gh auth status` 显示 `The token in keyring is invalid` 时重跑 `gh auth login -h github.com`（浏览器 OAuth 最稳，全程无需输 PAT）。`gh auth setup-git` 在已有 `credential.helper=manager` 时可能不重复配置（helper 链仍只显示 manager）——但 GCM 委托 gh 的机制使该组合已可用，无需手动把 `gh auth git-credential` 加进 helper 链。gh 的 `push_files`/MCP 只能单文件内容级操作，**无法推送完整 merge commit**（多文件+祖先链+message），merge 必须本地 git
 - **GFW 下用 GitHub API 重建 git 对象**（0.9.65）：`git fetch` 被 TCP 封锁 + `ssh.github.com` DNS 污染、本地无代理端口时，`api.github.com` 仍常通。绕行链：`gh api repos/OWNER/REPO/git/trees/<sha>?recursive=1` 取全树 → 本地缺失的 blob 逐个 `gh api .../git/blobs/<sha>` 拉 base64 后 `git hash-object -w` 写入（字节一致 → sha 精确）→ 自底向上 `git mktree` 构造 tree（与 API 给的 tree sha **逐一校验**）→ `git commit-tree`（parent=本地分叉点）。因 merge 只依赖 base/ours/theirs 三棵树的**内容**，重建 commit 与真 fetch **merge 语义完全等价**（验证：`git diff <分叉点> <重建commit>` 统计须与 compare API 的 files/additions/deletions 逐项一致）。脚本 `.scratch/upstream-probe/rebuild_upstream_objects.py` 可复用。两个坑：`git/commits` 端点**只吃完整 sha**（短 sha 返 404）；列表推导里误用外层残留变量（`[os.path.basename(p) for e in entries if "/" not in p]` 的 `p` 不是循环变量）会**静默丢条目**
 - **升级后必须做基线对照**（0.9.65）：只看 merge 后的失败数会误判——本次 merge 后 103 failed，实际**仅 3 个是新增**，其余 100 个 merge 前就有（Windows GBK 编码、fork 禁用 PreToolUse 的固有结果等）。方法：`git checkout --detach HEAD^`（merge 前）跑同样文件并把 `.pytest_cache/v/cache/lastfailed` 另存，切回后跑同样文件，**diff 两个失败集合**即得「新增/修复」
-- **上游行为变更会撞 fork 契约测试**（0.9.65，**已处置**）：上游 #3405 让**嵌套函数提取为节点**（`engine._scan_python_nested_function_declarations`），撞 fork 独有的 `tests/test_extraction_contract.py` 三个断言。**先分两类再决定动作**：①「本地函数不提取」是**真契约变更**（上游有意——让调用解析到词法作用域内的本地定义）→ **改测试**；②「缺 `:C` / `end_line` / `end_byte`」是**上游遗漏**（`engine.py:2416` 的 `add_node(nested_nid, label, line)` 只传 3 参，普通路径传 `**extra` 五字段）→ **补代码**，改测试等于掩盖
+- **上游行为变更会撞 fork 契约测试**（0.9.65，**已处置**）：上游 #3405 让**嵌套函数提取为节点**（`engine._scan_python_nested_function_declarations`），撞 fork 独有的 `tests/test_extraction_contract.py` 三个断言。**先分两类再决定动作**：①「本地函数不提取」是**真契约变更**（上游有意——让调用解析到词法作用域内的本地定义）→ **改测试**；②「缺 `:C` / `end_line` / `end_byte`」是**上游遗漏**（`_scan_python_nested_function_declarations` 里的 `add_node(nested_nid, label, line)` 只传 3 参，`walk` 的普通函数分支传 `**extra` 五字段）→ **补代码**，改测试等于掩盖
     - **②的后果远不止字段不齐**：get_node 三级降级（字节精确 → 行级 → fuzzy ±40）在缺 `end_byte`+`end_line` 时**跳过前两级落到 fuzzy**，而 fuzzy 按 `name in ln` **子串**匹配首个 `def/class`——同名前缀函数更早出现时返回**完全无关的函数体**，且 `ok=True`/`override=None` **静默报成功**。实测：目标 L602、`helper_util` 在 L401 → 返回 L361-441 共 82 行填充代码，**目标不在其中**
-    - **修法**：给 `_scan_python_nested_function_declarations` 加 `qname_chain` 参数（入口与递归均传 `qname_chain + (func_name,)`——`qname_chain` 只装**类名段**（`:3907`），故须补宿主函数名）+ 按 `:5197-5216` 同款补 `extra` 五字段。结果：`helper()` → `L10:C9` / end_line 11 / end_byte 246 / `(x)` / `UserService::fetch::helper`。**验证：16 → 12 失败，修复 4 新增 0**（差额恰为契约测试数）
+    - **修法**：给 `_scan_python_nested_function_declarations` 加 `qname_chain` 参数（入口与递归均传 `qname_chain + (func_name,)`——`qname_chain` 只装**类名段**（见 `walk` 里它的注释块），故须补宿主函数名）+ 按 `walk` 普通函数分支同款补 `extra` 五字段。结果：`helper()` → `L10:C9` / end_line 11 / end_byte 246 / `(x)` / `UserService::fetch::helper`。**验证：16 → 12 失败，修复 4 新增 0**（差额恰为契约测试数）
     - **同类风险持续存在**：每次升级后做上一条的失败集合 diff，且 diff 结果要能区分"真契约变更"与"上游遗漏"——后者改测试等于掩盖
 - **get_node 输出面须与上游对齐**（0.9.65）：fork 把 `_tool_get_node` 从**内联实现**改成**薄转发**（闭包转发到模块级 `_get_node_tool`，名片由 `_format_node_card` 产出），上游对其内联函数体的**任何**改动都撞上 fork 的整段替换——0.9.65 的 `Attributes` 行即此类（上游纯插入 7+1 行）。fork **不可能**保留上游函数体（数据源已分叉：fork 走 FTS 缓存拿 `end_byte`/`signature`/`docstring`，上游直读图节点属性），故**结构性冲突无法根除**，只能把冲突解决从"语义决策"降级为"机械确认"：上游输出行同步进 `_format_node_card`（逐字同构；`Attributes` 是条件输出，无该字段的节点输出不变，逐字节锚点 `test_none_mode_card_is_pre_extension_anchor` 不受影响）。`check-custom.sh` 已加守护：比对两侧 join 块的字段字面量 `f"  Xxx:"` 与展开变量 `*xxx,`，上游有而 fork 无即告警（`upstream/v8` 非 HEAD 祖先时跳过，避免 GFW 下 ref 陈旧假阳性）
-- **merge 后跑重复定义扫描**（0.9.92）：merge 时同一段代码可能被插入**两次**（上游定义数均为 1），Python 允许同模块重复定义、后者**静默覆盖**前者——不报错不告警。本次 7 处（6 对内容相同 + `_resolve_kotlin_member_calls` 1 对**不同**：84 行旧版 vs 92 行上游新版，旧版若在后就会吃掉上游的跨仓 park 功能）已在 `d0bfb94` 修复。**判据**：AST 扫模块级同名函数/类 → 与 `upstream/v8` 的定义计数对比——上游 1 处 = merge 造成；上游本身多处 = 原样保留（`detect.py` 的 `_nfc` 是两个同名不同用途的上游函数）。已固化为 `scripts/check_dup_defs.py` + `check-custom.sh` 一节（无 upstream ref 时跳过）。**这类问题比测试失败更早暴露 merge 质量**——重复定义不报错，只是让文件变长、让后续 patch 的上下文更难匹配
+- **merge 缺陷的五种形态与检测层次**（0.9.92 实测，全部不报错、只能主动对比上游发现）：
+    1. **重复函数/类定义**（本次 7 处）—— Python 后者**静默覆盖**前者。检测：`scripts/check_dup_defs.py` 的**名字层**（模块级同名定义 + 上游定义计数；上游 1 处 = merge 造成，上游本身多处 = 原样保留，如 `detect.py` 的 `_nfc` 是两个同名不同用途的上游函数）
+    2. **重复复合语句块**（prune 块、sql 的 `create_index` 分支）—— 重复执行，计数/消息被静默改变。检测：同一脚本的**内容层**（`if/for/while/with/try` 源码哈希 + 上游 1 份判据）；**注意部分重叠的块抓不到**（prune 两处前半相同、后半不同 → 整块 hash 不同）
+    3. **重复嵌套函数块**（ruby 的 `_inherited_method` + `_promote_inferred`）—— 名字层扫不到（不在 `tree.body`）、内容层会**误报**（`_edge_at` 在两个不同外层函数里合法重复）。**已知盲区**，需人工 AST diff
+    4. **丢失标记**（`python_opaque_bases`）—— 语法合法、行为变化（跨文件继承多解析一条边）。检测：失败测试 + AST **函数级** diff
+    5. **丢失调用**（PHP 的 `if tree_sitter_php: walk(body, ...)`）—— 方法级闭包不创建、闭包内调用不捕获。同上
+    - **统一判据**：与 `upstream/v8` 对比——上游 1 份/有该标记 = merge 造成；上游本身多份/无该概念 = 原样保留或 fork 独有
+    - **AST 函数级 diff 是第 4/5 类的唯一高效定位法**：`ast.walk` 找**最大的同名函数**（同名嵌套会出现多个，取行数最多者），`ast.get_source_segment` 提取后 `difflib` 对比。本次 `walk` 函数 2410 vs 2333 行、229 行 diff 里只筛 `closure/body/walk(child` 三个关键词就定位到缺失的 3 行——**大函数里找缺失，不要从下往上猜，要整函数 diff**
+    - 已固化：`scripts/check_dup_defs.py`（名字层 + 内容层，无 upstream ref 时跳过）+ `check-custom.sh` 一节；**新守护必须双向验证**（正反向，见下条）
 - **比对类守护的两个假阴性陷阱**（0.9.65 实测踩中）：① **提取范围必须限定到实际输出表达式**（join 块），不可扫全函数体——`attrs_line = [f"  Attributes: ..."]` 这类**构造语句本身就在函数体内**，删掉 return 里的 `*attrs_line,` 展开后字符串仍在，守护静默通过（v1 版守护正是这样失效的）；② `$(...)` 命令替换会**剥掉尾部换行**，拼接的分隔符串须**两端都补**（`"|$(...)|"`，不可只补左侧），否则末项无尾随分隔符被误判缺失。**新守护必须做负向验证**——临时破坏目标代码看它是否告警，只验正向等于没验
 ### 版本号约定
 - `pyproject.toml` version 必须带 `+fork.N` 后缀（PEP 440 local version，区分上游 graphifyy）
 - 上游升 0.9.8 时本地改 `0.9.8+fork.N`，不要去掉 `+fork`
-- `uv.lock` 里 graphifyy version 带 `+fork.N`（uv 新版 local version 已进 lock，lock:1093 可见
-  `0.9.56+fork.1`）——与 pyproject 同步即可，非"不进 lock"的旧表述（reviewer Minor 5 勘误）
+- `uv.lock` 里 graphifyy 条目带 `+fork.N`（uv 新版 local version 已进 lock，搜 `name = "graphifyy"` 的下一行）——与 pyproject 同步即可，非"不进 lock"的旧表述（reviewer Minor 5 勘误）。改完 pyproject 必须跑一次 `uv lock
 
 ### Hook 配置
 - `_install_claude_hook`（graphify/install.py，0.9.13 从 __main__.py 迁入）的 PreToolUse 注入已注释--与 context-mode 的 Read/Bash hook 冲突，勿恢复。上游 0.9.20 #1986 把 PreToolUse 触发面扩到 `Bash|Grep`，双重触发更严重，禁用理由增强
@@ -61,7 +68,7 @@ Rules:
 - 查图谱（query/path/explain/prompt-hook）不调 LLM，纯词法 + 图遍历
 
 ### prompt-hook 引导句（三层分流，26 token）
-- `prompt_hook.py:252` 的 note 是 fork 核心，每次 UserPromptSubmit 注入
+- `prompt_hook.py` 的 `note` 变量是 fork 核心（0.9.92 后约 :320），每次 UserPromptSubmit 注入
 - 当前文案：`graphify pre-query: symbols→file+line here; strings/patterns→grep; large output→sandbox not context.`
 - 三层分流对应完整分工链：符号定位→graphify（给 file+line）/ 字符串模式→grep（graphify 不索引任意字符串）/ 大输出→sandbox 不进 context（context-mode 兜底）
 - 写 `sandbox` 不写 `ctx_execute`——解耦，靠 SessionStart 注入的工具栈让模型自己关联，context-mode 卸载/改名 nudge 不过时
@@ -70,7 +77,7 @@ Rules:
 - 原方案 `graphify graph pre-query. Use directly, skip grep/read.`（13 token）留在 `prompt_hook.py` 注释里作回退参考，缺点是 `skip grep` 过度承诺
 
 ### OpenCode 引导句（三层分流，纯 ASCII，28 token）
-- `graphify/install.py:1381` 的 `_OPENCODE_PLUGIN_JS` 里 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）
+- `_OPENCODE_PLUGIN_JS`（`graphify/install.py`，0.9.92 后约 :1681）里的 echo 字符串，OpenCode `tool.execute.before` 首次 bash 触发一次（`reminded = true` 后不再触发）
 - 当前文案：`[graphify] pre-query: symbols get file+line here; strings/patterns need grep; large output to sandbox not context.`
 - 跟 prompt-hook 同一套三层分流哲学，但纯 ASCII（OpenCode TUI 渲染零风险，纯 ASCII 字符集本身保证；`→` 在 TUI 未验证故不用）
 - echo 文案硬约束：双引号内禁 backticks/`$()`/裸双引号/反斜杠（触发 bash 命令替换）；分号在双引号内是字面字符安全，双引号外的 ` ; ` 才分隔命令
@@ -91,7 +98,7 @@ Rules:
 - **check-custom.sh 守护**：检查 before + after 都存在 + after 用 run 非 try + fail-open guard 存在（rebase 丢失 after 时告警，非 bash 工具会静默不提醒）
 
 ### graphify vs context-mode 分工框架（判断 PreToolUse 是否重启用）
-- **graphify 解决"去哪找"（定位阶段）**：query/explain/path 返回子图，AST 提取的符号节点带 `loc=L<行>` 精确行号（存储键 `source_location`，`extract.py:520` 赋值，serve 展示为 `loc=`），文件级节点 `loc=L1` 是占位非真行号
+- **graphify 解决"去哪找"（定位阶段）**：query/explain/path 返回子图，AST 提取的符号节点带 `loc=L<行>` 精确行号（存储键 `source_location`，由提取层赋值，serve 展示为 `loc=`），文件级节点 `loc=L1` 是占位非真行号
 - **context-mode 解决"怎么读"（提取阶段）**：大输出走 sandbox（ctx_execute/ctx_batch_execute），字节不进上下文
 - **Read 场景：接力关系**——graphify 给行号 → Read offset 小段 → 输出小不触发 context-mode；graphify 的 `loc=` 越准，context-mode 越少被触发
 - **grep 场景：竞争关系**——grep 的定位+提取是同一动作，两个 hook 抢主导权；graphify 只覆盖 A 类（符号查找），B/C/D 类（字符串/模式/验证）无能为力；`loc=` 行号优势在 grep 用不上（grep 要匹配行不是符号定义行）
@@ -127,7 +134,7 @@ adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
 - run_analysis.py -- analysis-only 编排器（graph.json 直读；cluster/analyze/report/wiki +
   knowledge-gaps sidecar 从 graph.json failed_refs 派生；不写图）
 - split_semantic_seed.py -- 旧图 semantic 种子拆分（默认种子路径 <out>/semantic-seed.json 的
-  发现点在 rebuild_entry.py:275 `_merge_seed`）
+  发现点在 `rebuild_entry._merge_seed`）
 - graphify/serve_watcher.py -- serve 内置 watcher（默认关，--watch / GRAPHIFY_WATCH 显式
   开启；防抖/退避常量移植 codegraph 算法；watchdog 软依赖降级 mtime 轮询）
 - graphify/rebuild_lock.py -- 跨进程重建互斥（mkdir 原子锁 + stale 接管；rebuild_entry 与
@@ -148,7 +155,7 @@ adapter.py（codegraph DB 只读适配器）已随运行时退役删除。
   端口单一事实源 `GRAPHIFY_MCP_PORT`（默认 8765）
 
 上游补丁（最小 diff，提 PR 后若被接受则移除）：
-- graphify/analyze.py:63 _is_file_node 加 kind='file' 短路
+- `graphify/analyze.py` 的 `_is_file_node` 加 `kind='file'` 短路（0.9.92 后约 :75）
 
 Phase 3 拓扑切换（三触发面单入口；.codegraph 判别已退役恒 False）：
 - graphify/watch.py flush 路由统一走 rebuild_entry（extract→build→to_json→rebuild_fts）：
