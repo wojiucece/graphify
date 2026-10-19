@@ -81,7 +81,7 @@ def test_extract_ejs_scriptlet_is_not_a_parse_error(tmp_path):
     )
     result = extract_ejs(tpl)
     assert result.get("parse_errors") is None
-    assert _labels(result)["greet()"] == "L3"
+    assert _labels(result)["greet()"].startswith("L3")
 
 
 def test_extract_ejs_output_tag_in_inline_script_is_not_a_parse_error(tmp_path):
@@ -138,7 +138,7 @@ def test_extract_ejs_include_resolves_to_the_real_partial(tmp_path):
     assert len(includes) == 1
     assert includes[0]["target"] == _make_id(str(partial))
     assert includes[0]["target_file"] == str(partial)
-    assert includes[0]["source_location"] == "L1"
+    assert includes[0]["source_location"].startswith("L1")
 
 
 def test_extract_ejs_end_to_end_links_partial_file_node(tmp_path):

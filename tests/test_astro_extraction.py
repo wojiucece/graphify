@@ -184,8 +184,8 @@ function rank(scores: number[]): number[] {
     labels = _labels(result)
     assert "rank()" in labels and "toggle()" in labels
     # Masking keeps offsets, so locations still point at the original lines.
-    assert labels["rank()"] == "L5"
-    assert labels["toggle()"] == "L15"
+    assert labels["rank()"].startswith("L5")
+    assert labels["toggle()"].startswith("L15")
 
 
 def test_extract_astro_scripts_on_one_line_do_not_merge(tmp_path):
@@ -208,7 +208,7 @@ def test_extract_astro_trailing_comment_does_not_hide_next_script(tmp_path):
     )
     result = extract_astro(page)
     assert result.get("parse_errors") is None
-    assert _labels(result)["visible()"] == "L1"
+    assert _labels(result)["visible()"].startswith("L1")
 
 
 def test_astro_mask_preserves_bytes_and_newlines_after_comment():

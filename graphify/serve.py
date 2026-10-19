@@ -2530,7 +2530,7 @@ def _get_node_tool(G, active_graph_path, arguments: dict) -> tuple[str, bool, in
     短连接 + ensure_fts os.replace 锁重试退避（Task 05 ⚠️③ checklist 接线决策）。
     返回 (text, found, scanned, verdict_override)（B2 四元组，末元工具侧诚实自评 R3-3）。"""
     import sqlite3 as _sqlite3
-    label = arguments["label"].lower()
+    label = _node_arg(arguments).lower()
     include_source = arguments.get("include_source", "signature")
     nid, err = _resolve_single_node(G, label)
     if err:
@@ -3386,6 +3386,42 @@ def _all_tool_schemas() -> list[dict]:
     return schemas
 
 
+def _neighbor_lines(G: nx.Graph, nid: str, rel_filter: str = "") -> list[str]:
+    """One output line per relationship incident to ``nid``.
+
+    Parallel edges between the same pair each render as their own line with
+    their own metadata (#4500); ``edge_data()`` would return only the first.
+    """
+    def _edge_at(d: dict) -> str:
+        # Edge location = the relation SITE (call/import line) in the source
+        # node's file, not a def line (#BUG1).
+        loc = str(d.get("source_location") or "")
+        return (
+            f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(loc)}"
+            if loc else ""
+        )
+    lines: list[str] = []
+    for nb in G.successors(nid):
+        for d in edge_datas(G, nid, nb):
+            rel = d.get("relation", "")
+            if rel_filter and rel_filter not in rel.lower():
+                continue
+            lines.append(
+                f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+            )
+    for nb in G.predecessors(nid):
+        for d in edge_datas(G, nb, nid):
+            rel = d.get("relation", "")
+            if rel_filter and rel_filter not in rel.lower():
+                continue
+            lines.append(
+                f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
+                f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]{_edge_at(d)}"
+            )
+    return lines
+
+
 def _build_server(graph_path: str, *, watch: bool | None = None):
     """Build the configured low-level MCP Server (shared by every transport).
 
@@ -3560,7 +3596,7 @@ def _build_server(graph_path: str, *, watch: bool | None = None):
         return _get_node_tool(G, active_graph_path, arguments)
 
     def _tool_get_neighbors(arguments: dict) -> tuple:  # CUSTOM: N1 三元组
-        label = arguments["label"].lower()
+        label = _node_arg(arguments).lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         nid, err = _resolve_single_node(G, label)
         if err:

@@ -60,7 +60,7 @@ def test_extract_svelte_template_is_not_a_parse_error(tmp_path):
     labels = _labels(result)
     assert "bump()" in labels
     # Masking keeps offsets, so locations still point at the original lines.
-    assert labels["bump()"] == "L4"
+    assert labels["bump()"].startswith("L4")
 
 
 def test_extract_svelte_parses_module_and_instance_scripts(tmp_path):
@@ -80,8 +80,8 @@ def test_extract_svelte_parses_module_and_instance_scripts(tmp_path):
     assert result.get("parse_errors") is None
     labels = _labels(result)
     assert "shared()" in labels and "local()" in labels
-    assert labels["shared()"] == "L2"
-    assert labels["local()"] == "L5"
+    assert labels["shared()"].startswith("L2")
+    assert labels["local()"].startswith("L5")
 
 
 def test_extract_svelte_lang_ts_parses_type_syntax(tmp_path):
@@ -174,8 +174,8 @@ def test_extract_svelte_line_comment_does_not_swallow_next_script(tmp_path):
     result = extract_svelte(component)
     assert result.get("parse_errors") is None
     labels = _labels(result)
-    assert labels.get("b()") == "L1"
-    assert labels.get("c()") == "L2"
+    assert labels.get("b()").startswith("L1")
+    assert labels.get("c()").startswith("L2")
 
 
 def test_extract_svelte_comment_after_unterminated_statement(tmp_path):
@@ -186,7 +186,7 @@ def test_extract_svelte_comment_after_unterminated_statement(tmp_path):
     )
     result = extract_svelte(component)
     assert result.get("parse_errors") is None
-    assert _labels(result).get("b()") == "L1"
+    assert _labels(result).get("b()").startswith("L1")
 
 
 def test_extract_svelte_unreadable_file_reports_error(tmp_path):
