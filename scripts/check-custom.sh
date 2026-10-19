@@ -263,6 +263,24 @@ else
 fi
 
 echo ""
+echo "=== merge 重复定义检查（模块级同名函数/类，上游仅 1 处而本地多处）==="
+# 0.9.92 merge 时同一段代码被插入两次，Python 后者**静默覆盖**前者——不报错不告警。
+# 判据见 scripts/check_dup_defs.py：上游 1 处 = merge 造成（报错）；上游本身多处
+# = 原样保留（如 detect.py 的 _nfc 是两个同名不同用途的上游函数）；无 ref 时跳过。
+PY_BIN=".venv/Scripts/python.exe"
+[ -x "$PY_BIN" ] || PY_BIN="python"
+if git rev-parse --verify -q upstream/v8 >/dev/null 2>&1; then
+    if "$PY_BIN" scripts/check_dup_defs.py; then
+        echo "✓ 无 merge 遗留重复定义"
+    else
+        echo "✗ 发现 merge 遗留重复定义（见上）"
+        FAILS=$((FAILS+1))
+    fi
+else
+    echo "· 跳过（无 upstream/v8 ref）"
+fi
+
+echo ""
 echo "=== 汇总 ==="
 if [ "$FAILS" = "0" ]; then
     echo "✓ 所有 fork 定制检查通过"
